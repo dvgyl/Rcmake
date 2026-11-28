@@ -672,10 +672,14 @@ def suite_environment(env, root):
     if "HOME" in env:
         result["CTEST_REAL_HOME"] = env["HOME"]
     if os.name == "nt":
+        appdata = home / "AppData" / "Roaming"
+        local_appdata = home / "AppData" / "Local"
+        appdata.mkdir(parents=True, exist_ok=True)
+        local_appdata.mkdir(parents=True, exist_ok=True)
         result.update(USERPROFILE=str(home), HOMEDRIVE=home.drive,
                       HOMEPATH=str(home)[len(home.drive):],
-                      APPDATA=str(home / "AppData" / "Roaming"),
-                      LOCALAPPDATA=str(home / "AppData" / "Local"))
+                      APPDATA=str(appdata),
+                      LOCALAPPDATA=str(local_appdata))
     return result
 
 
@@ -704,7 +708,12 @@ def evaluate(
     results = report["suites"]
     inventory = report["suite_inventory"]
     # Use the physical path. CMake and some checks canonicalize /tmp on macOS.
-    with tempfile.TemporaryDirectory(prefix="runcmake-eval-", dir=None if os.name == "nt" else "/tmp") as temporary:
+    # On Windows, keep sandbox prefixes short to stay below MAX_PATH / CMAKE_OBJECT_PATH_MAX.
+    temp_base = os.environ.get("RCMAKE_EVAL_TEMP_DIR") or (None if os.name == "nt" else "/tmp")
+    if temp_base is not None:
+        Path(temp_base).mkdir(parents=True, exist_ok=True)
+    temp_prefix = "rc-" if os.name == "nt" else "runcmake-eval-"
+    with tempfile.TemporaryDirectory(prefix=temp_prefix, dir=temp_base) as temporary:
         work = Path(temporary).resolve()
         temp = work / "tmp"
         temp.mkdir()
@@ -743,16 +752,21 @@ def evaluate(
         relative_source = source.relative_to(source.parents[1])
         lanes = (("oracle", driver), ("rcmake", candidate))
         tools = {}
+
+        def lane_root(lane):
+            return work / (("o" if lane == "oracle" else "r") if os.name == "nt" else lane)
+
         for lane, target in lanes:
-            (work / lane).mkdir()
+            base = lane_root(lane)
+            base.mkdir()
             if jobs == 1:
                 shutil.copytree(
-                    source.parents[1], work / lane / "source", symlinks=True,
+                    source.parents[1], base / "source", symlinks=True,
                     ignore=shutil.ignore_patterns("._*", ".git"),
                 )
-                (work / lane / "build" / relative_source).mkdir(parents=True)
+                (base / "build" / relative_source).mkdir(parents=True)
             if modern:
-                tools[lane] = target_tools(driver, target, work / lane / "bin")
+                tools[lane] = target_tools(driver, target, base / "bin")
 
         def run_lane(suite, lane, target):
             if suite in legacy:
@@ -773,10 +787,12 @@ def evaluate(
                         "Upstream CMake did not register this suite with the selected generators and tools.",
                     ],
                 }
+            base = lane_root(lane)
             if jobs == 1:
-                return run_at(work / lane, env)
+                return run_at(base, env)
             # Some upstream suites modify source fixtures. Give each worker its own copy.
-            with tempfile.TemporaryDirectory(prefix=f"{suite}-", dir=work / lane) as directory:
+            worker_prefix = "w-" if os.name == "nt" else f"{suite}-"
+            with tempfile.TemporaryDirectory(prefix=worker_prefix, dir=base) as directory:
                 root = Path(directory)
                 shutil.copytree(source.parents[1], root / "source", symlinks=True,
                                 ignore=shutil.ignore_patterns("._*", ".git"))

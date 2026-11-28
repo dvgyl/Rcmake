@@ -31,7 +31,6 @@ name: Ecosystem parity
 
 permissions:
   contents: read
-  actions: read
 
 defaults:
   run:
@@ -46,12 +45,11 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 95
-    permissions:
-      contents: read
-      actions: write
+    timeout-minutes: 10
     outputs:
-      run_id: ${{ steps.binary.outputs.run_id }}
+      build_linux: ${{ steps.matrix.outputs.build_linux }}
+      build_macos: ${{ steps.matrix.outputs.build_macos }}
+      build_windows: ${{ steps.matrix.outputs.build_windows }}
       shards: ${{ steps.matrix.outputs.shards }}
       large_projects: ${{ steps.matrix.outputs.large_projects }}
     steps:
@@ -62,6 +60,7 @@ jobs:
       - name: Select matrix entries
         id: matrix
         env:
+          ECOSYSTEM_LANE: ${{ inputs.lane || 'all' }}
           SHARD_COUNT: ${{ inputs.vcpkg_shard_count }}
           SHARD_INDEX: ${{ inputs.vcpkg_shard_index }}
         run: |
@@ -71,6 +70,14 @@ jobs:
           import os
           import tomllib
 
+          lane = os.environ["ECOSYSTEM_LANE"] or "all"
+          build_oses = {
+              "runcmake-windows": ["windows-2025"],
+              "runcmake-linux": ["ubuntu-24.04"],
+              "runcmake-macos": ["macos-15"],
+              "runcmake": ["ubuntu-24.04", "macos-15", "windows-2025"],
+              "all": ["ubuntu-24.04", "macos-15", "windows-2025"],
+          }.get(lane, ["ubuntu-24.04"])
           count = int(os.environ["SHARD_COUNT"] or "64")
           index = int(os.environ["SHARD_INDEX"] or "-1")
           if not 1 <= count <= 128 or not -1 <= index < count:
@@ -79,127 +86,111 @@ jobs:
               projects = tomllib.load(stream)["project"]
           large_projects = [project["name"] for project in projects if project["l1"]]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("build_linux=" + ("true" if "ubuntu-24.04" in build_oses else "false"), file=output)
+              print("build_macos=" + ("true" if "macos-15" in build_oses else "false"), file=output)
+              print("build_windows=" + ("true" if "windows-2025" in build_oses else "false"), file=output)
               print("shards=" + json.dumps(list(range(count)) if index == -1 else [index]), file=output)
               print("large_projects=" + json.dumps(large_projects), file=output)
           PY
-      - name: Find the CI binaries for this commit
-        id: binary
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ECOSYSTEM_LANE: ${{ inputs.lane || 'all' }}
+
+  build-release-linux:
+    name: Build release binary on ubuntu-24.04
+    if: needs.prepare.outputs.build_linux == 'true'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUSTUP_TOOLCHAIN: "1.99.1"
+    steps:
+      - *checkout
+      - &rust_toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ecosystem-release-ubuntu-24.04
+      - &build_release_posix
+        name: Build and stage release binary (POSIX)
         run: |
-          source env/env.sh
-          python3 - <<'PY'
-          import datetime as dt
-          import json
-          import os
-          import subprocess
-          import time
+          RCMAKE_STAGE_PROFILE=release scripts/stage.sh
+          target/stage/bin/rcmake --version
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rcmake-release-ubuntu-24.04
+          path: target/stage/bin/rcmake
+          if-no-files-found: error
+          retention-days: 3
 
-          repo = f"repos/{os.environ['GITHUB_REPOSITORY']}"
-          workflow = f"{repo}/actions/workflows/ci.yml"
-          sha = os.environ["GITHUB_SHA"]
-          ref = os.environ["GITHUB_REF_NAME"]
-          lane = os.environ["ECOSYSTEM_LANE"]
-          systems = {
-              "runcmake-windows": ["windows-2025"],
-              "runcmake-linux": ["ubuntu-24.04"],
-              "runcmake-macos": ["macos-15"],
-              "runcmake": ["ubuntu-24.04", "macos-15", "windows-2025"],
-              "all": ["ubuntu-24.04", "macos-15", "windows-2025"],
-          }.get(lane, ["ubuntu-24.04"])
-          artifacts = {f"rcmake-ci-{system}" for system in systems}
-          deadline = time.monotonic() + 5200
+  build-release-macos:
+    name: Build release binary on macos-15
+    if: needs.prepare.outputs.build_macos == 'true'
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUSTUP_TOOLCHAIN: "1.99.1"
+    steps:
+      - *checkout
+      - *rust_toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ecosystem-release-macos-15
+      - *build_release_posix
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rcmake-release-macos-15
+          path: target/stage/bin/rcmake
+          if-no-files-found: error
+          retention-days: 3
 
-          def pause(seconds):
-              remaining = deadline - time.monotonic()
-              if remaining <= 0:
-                  raise SystemExit(f"::error::Timed out waiting for CI artifacts at {sha}.")
-              time.sleep(min(seconds, remaining))
-
-          def api(path, *args, method="GET", attempts=3):
-              for attempt in range(attempts):
-                  remaining = deadline - time.monotonic()
-                  if remaining <= 0:
-                      pause(0)
-                  try:
-                      result = subprocess.run(
-                          ["gh", "api", "--method", method, "-H", "X-GitHub-Api-Version: 2026-03-10",
-                           path, *args], timeout=min(30, remaining), check=True,
-                          text=True, stdout=subprocess.PIPE)
-                      return json.loads(result.stdout) if result.stdout.strip() else None
-                  except (subprocess.SubprocessError, OSError, ValueError) as error:
-                      if attempt + 1 == attempts:
-                          raise SystemExit(f"::error::GitHub API request failed for {path}. {error}")
-                      pause(2 ** attempt)
-
-          def runs():
-              return api(f"{workflow}/runs", "-f", f"head_sha={sha}", "-F", "per_page=50")["workflow_runs"]
-
-          def available(run_id):
-              rows = api(f"{repo}/actions/runs/{run_id}/artifacts", "-F", "per_page=100")["artifacts"]
-              return artifacts <= {row["name"] for row in rows if not row["expired"]}
-
-          def publish(run_id):
-              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-                  print(f"run_id={run_id}", file=output)
-
-          initial = runs()
-          candidates = [run for run in initial
-                        if run["event"] in ("push", "workflow_dispatch") and run["head_sha"] == sha]
-          for candidate in candidates:
-              if candidate["conclusion"] == "success" and available(candidate["id"]):
-                  publish(candidate["id"])
-                  raise SystemExit(0)
-
-          pending = next((run for run in candidates if run["status"] != "completed"), None)
-          if pending:
-              run_id = pending["id"]
-          else:
-              ref_sha = api(f"{repo}/commits/{ref}")["sha"]
-              if ref_sha != sha:
-                  raise SystemExit("::error::The selected ref moved before CI published the binary.")
-              previous = {run["id"] for run in initial}
-              dispatched = (
-                  dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-                  - dt.timedelta(seconds=60)
-              )
-              # A dispatch can succeed even if the client loses the response.
-              # Do not retry the POST. The next run can detect an existing run.
-              response = api(f"{workflow}/dispatches", "-f", f"ref={ref}", method="POST", attempts=1)
-              run_id = (response or {}).get("workflow_run_id")
-              while run_id is None:
-                  candidates = [run for run in runs()
-                                if run["id"] not in previous and run["event"] == "workflow_dispatch"
-                                and run["head_branch"] == ref and run["head_sha"] == sha
-                                and dt.datetime.fromisoformat(run["created_at"]) >= dispatched]
-                  if len(candidates) > 1:
-                      raise SystemExit("::error::More than one CI run matches the dispatch.")
-                  if candidates:
-                      run_id = candidates[0]["id"]
-                  else:
-                      if api(f"{repo}/commits/{ref}")["sha"] != sha:
-                          raise SystemExit("::error::The selected ref moved before CI published the binary.")
-                      pause(15)
-
-          while True:
-              run = api(f"{repo}/actions/runs/{run_id}")
-              if run["head_sha"] != sha:
-                  raise SystemExit(f"::error::CI run {run_id} uses {run['head_sha']}. Expected {sha}.")
-              if run["status"] == "completed":
-                  if run["conclusion"] != "success":
-                      raise SystemExit(f"::error::CI run {run_id} concluded with {run['conclusion']}.")
-                  if not available(run_id):
-                      raise SystemExit(f"::error::CI run {run_id} did not publish {sorted(artifacts)}.")
-                  publish(run_id)
-                  break
-              pause(30)
-          PY
+  build-release-windows:
+    name: Build release binary on windows-2025
+    if: needs.prepare.outputs.build_windows == 'true'
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUSTUP_TOOLCHAIN: "1.99.1"
+    steps:
+      - *checkout
+      - *rust_toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ecosystem-release-windows-2025
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build and stage release binaries (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release -p rcmake-cli --bin rcmake -p rcmake-shim --bin rcmake-shim --target-dir target
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path target/stage/bin -Force | Out-Null
+          Copy-Item target/release/rcmake.exe target/stage/bin/rcmake.exe
+          Copy-Item target/release/rcmake-shim.exe target/stage/bin/rcmake-shim.exe
+          foreach ($tool in 'cmake', 'ctest', 'cpack', 'rcmake-lsp') {
+            Copy-Item target/release/rcmake-shim.exe "target/stage/bin/$tool.exe"
+          }
+          & target/stage/bin/rcmake.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rcmake-release-windows-2025
+          path: |
+            target/stage/bin/rcmake.exe
+            target/stage/bin/rcmake-shim.exe
+          if-no-files-found: error
+          retention-days: 3
 
   vcpkg:
     name: vcpkg shard ${{ matrix.shard }}
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'vcpkg'
-    needs: prepare
+    needs: [prepare, build-release-linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 345
     strategy:
@@ -224,10 +215,8 @@ jobs:
       - &binary
         uses: actions/download-artifact@v7
         with:
-          name: rcmake-ci-ubuntu-24.04
+          name: rcmake-release-ubuntu-24.04
           path: target/stage/bin
-          run-id: ${{ needs.prepare.outputs.run_id }}
-          github-token: ${{ github.token }}
       - &stage
         name: Stage the Rcmake tools and data
         run: |
@@ -475,7 +464,7 @@ jobs:
   conan:
     name: Conan CMakeToolchain and CMakeDeps
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'conan'
-    needs: prepare
+    needs: build-release-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -604,7 +593,7 @@ jobs:
   large-projects:
     name: Large-project parity / ${{ matrix.project }}
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'large-projects'
-    needs: prepare
+    needs: [prepare, build-release-linux]
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.large_projects_full && 350 || 75 }}
     strategy:
@@ -977,7 +966,7 @@ jobs:
   runcmake-linux-shards:
     name: Full RunCMake on Linux (shard ${{ matrix.shard }}/3)
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-linux'
-    needs: prepare
+    needs: build-release-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
@@ -985,8 +974,8 @@ jobs:
       matrix:
         shard: [1, 2, 3]
     env:
-      CI_BINARY: rcmake-ci-ubuntu-24.04
-      CI_BINARY_RUN_ID: ${{ needs.prepare.outputs.run_id }}
+      CI_BINARY: rcmake-release-ubuntu-24.04
+      CI_BINARY_RUN_ID: ${{ github.run_id }}
       RUNCMAKE_PROFILE: linux
       RUNCMAKE_SHARD: ${{ matrix.shard }}/3
       RUNCMAKE_REPORT: runcmake-linux-shard-${{ matrix.shard }}.json
@@ -998,8 +987,6 @@ jobs:
         with:
           name: ${{ env.CI_BINARY }}
           path: target/stage/bin
-          run-id: ${{ needs.prepare.outputs.run_id }}
-          github-token: ${{ github.token }}
       - name: Install Linux build tools
         run: |
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
@@ -1024,7 +1011,7 @@ jobs:
             if [[ -f target/stage/bin/rcmake-shim.exe ]]; then
               alias_src=target/stage/bin/rcmake-shim.exe
             fi
-            for tool in cmake ctest cpack; do
+            for tool in cmake ctest cpack rcmake-lsp; do
               cp "$alias_src" "target/stage/bin/$tool.exe"
             done
             cp -R modules/cmake-4.5 target/stage/share/
@@ -1050,6 +1037,21 @@ jobs:
             msvc_bin="$(cygpath -u "${VCToolsInstallDir%\\}/bin/Hostx64/x64")"
             export PATH="$msvc_bin:$PATH"
             command -v cl.exe link.exe nmake.exe ninja
+            eval_temp=""
+            for candidate in "D:/t" "C:/t"; do
+              probe_dir="$(cygpath -u "$candidate")"
+              if mkdir -p "$probe_dir" 2>/dev/null \
+                 && probe_file="$(mktemp "$probe_dir/.probe.XXXXXX" 2>/dev/null)"; then
+                rm -f "$probe_file"
+                eval_temp="$candidate"
+                break
+              fi
+            done
+            if [[ -n "$eval_temp" ]]; then
+              export RCMAKE_EVAL_TEMP_DIR="$eval_temp"
+            elif fallback_dir="$(mktemp -d 2>/dev/null)"; then
+              export RCMAKE_EVAL_TEMP_DIR="$(cygpath -am "$fallback_dir")"
+            fi
           fi
           options=()
           if [[ "$RUNNER_OS" == Linux ]]; then
@@ -1098,7 +1100,7 @@ jobs:
   runcmake-macos-shards:
     name: Full RunCMake on macOS (shard ${{ matrix.shard }}/3)
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-macos'
-    needs: prepare
+    needs: build-release-macos
     runs-on: macos-15
     timeout-minutes: 180
     strategy:
@@ -1106,8 +1108,8 @@ jobs:
       matrix:
         shard: [1, 2, 3]
     env:
-      CI_BINARY: rcmake-ci-macos-15
-      CI_BINARY_RUN_ID: ${{ needs.prepare.outputs.run_id }}
+      CI_BINARY: rcmake-release-macos-15
+      CI_BINARY_RUN_ID: ${{ github.run_id }}
       RUNCMAKE_PROFILE: all-macos
       RUNCMAKE_SHARD: ${{ matrix.shard }}/3
       RUNCMAKE_REPORT: runcmake-macos-shard-${{ matrix.shard }}.json
@@ -1163,20 +1165,20 @@ jobs:
           if-no-files-found: ignore
 
   runcmake-windows-shards:
-    name: Full RunCMake on Windows (shard ${{ matrix.shard }}/3)
+    name: Full RunCMake on Windows (shard ${{ matrix.shard }}/6)
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-windows'
-    needs: prepare
+    needs: build-release-windows
     runs-on: windows-2025
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5, 6]
     env:
-      CI_BINARY: rcmake-ci-windows-2025
-      CI_BINARY_RUN_ID: ${{ needs.prepare.outputs.run_id }}
+      CI_BINARY: rcmake-release-windows-2025
+      CI_BINARY_RUN_ID: ${{ github.run_id }}
       RUNCMAKE_PROFILE: windows
-      RUNCMAKE_SHARD: ${{ matrix.shard }}/3
+      RUNCMAKE_SHARD: ${{ matrix.shard }}/6
       RUNCMAKE_REPORT: runcmake-windows-shard-${{ matrix.shard }}.json
     steps:
       - *checkout
@@ -1255,7 +1257,7 @@ jobs:
         run: |
           python3 tools/measure/runcmake_eval.py \
             --merge runcmake-shards/runcmake-windows-shard-*.json \
-            --expected-shards 3 --require-provenance --min-pass-rate 99.0 --json "$RUNCMAKE_REPORT"
+            --expected-shards 6 --require-provenance --min-pass-rate 99.0 --json "$RUNCMAKE_REPORT"
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -1266,7 +1268,7 @@ jobs:
   conformance:
     name: CLI and differential conformance
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'conformance'
-    needs: prepare
+    needs: build-release-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 65
     steps:
@@ -1314,7 +1316,7 @@ jobs:
   linux-extended:
     name: Linux extended conformance
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'toolchains'
-    needs: prepare
+    needs: build-release-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
@@ -1346,7 +1348,7 @@ jobs:
   qt:
     name: Linux Qt 6 AUTOGEN
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'qt'
-    needs: prepare
+    needs: build-release-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -1363,7 +1365,7 @@ jobs:
   toolchains:
     name: Linux T2 toolchains
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'toolchains'
-    needs: prepare
+    needs: build-release-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:

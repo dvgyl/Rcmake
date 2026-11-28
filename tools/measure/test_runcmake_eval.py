@@ -529,6 +529,18 @@ class ShardingAndMergeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
                 runcmake_eval.load_strict_json(dup)
 
+    def test_merge_shard_reports_merges_six_shards_cleanly(self):
+        expected = [f"WinSuite{i:03d}" for i in range(367)]
+        reports = [self._make_shard_report(expected, k, 6, passed_per_suite=5, profile="windows") for k in (6, 2, 4, 1, 5, 3)]
+        for rep in reports:
+            rep["provenance"]["ci_binary_run_id"] = "999"
+        merged = runcmake_eval.merge_shard_reports(reports, expected_shards=6, require_provenance=True)
+        self.assertEqual(list(merged["suites"].keys()), expected)
+        self.assertEqual([s["index"] for s in merged["shards"]], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(sum(s["suites"] for s in merged["shards"]), 367)
+        self.assertEqual(merged["totals"]["passed"], 367 * 5)
+        self.assertEqual(merged["pass_rate_percent"], 100.0)
+
     def test_defer_pass_rate_allows_ordinary_failures_but_rejects_missing_case(self):
         with TemporaryDirectory() as temporary:
             work = Path(temporary)

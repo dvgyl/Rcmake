@@ -590,23 +590,50 @@ class EcosystemWorkflowParityTests(unittest.TestCase):
         receipt = next(path for path in self.uploads["conan"][1] if path.endswith("/conan.json"))
         self.assertIn(f'--out-json "{receipt.replace("${{ runner.temp }}", "$RUNNER_TEMP")}"', job)
 
-    def test_runcmake_jobs_shard_three_ways_and_merge_with_99_percent_gate(self) -> None:
-        for os_name, artifact in (
-            ("linux", "runcmake-linux-full"),
-            ("macos", "runcmake-macos-full"),
-            ("windows", "runcmake-windows"),
+    def test_runcmake_jobs_shard_and_merge_with_99_percent_gate(self) -> None:
+        for os_name, artifact, shard_count in (
+            ("linux", "runcmake-linux-full", 3),
+            ("macos", "runcmake-macos-full", 3),
+            ("windows", "runcmake-windows", 6),
         ):
             with self.subTest(os=os_name):
                 shard_job = self.jobs[f"runcmake-{os_name}-shards"]
-                self.assertIn("shard: [1, 2, 3]", shard_job)
+                expected_matrix = f"shard: [{', '.join(str(i) for i in range(1, shard_count + 1))}]"
+                self.assertIn(expected_matrix, shard_job)
+                self.assertIn(f"RUNCMAKE_SHARD: ${{{{ matrix.shard }}}}/{shard_count}", shard_job)
                 self.assertIn(f"name: runcmake-{os_name}-shard-${{{{ matrix.shard }}}}", shard_job)
                 merge_job = self.jobs[f"runcmake-{os_name}"]
                 self.assertIn(f"needs: runcmake-{os_name}-shards", merge_job)
                 self.assertIn("--merge", merge_job)
-                self.assertIn("--expected-shards 3", merge_job)
+                self.assertIn(f"--expected-shards {shard_count}", merge_job)
                 self.assertIn("--min-pass-rate 99.0", merge_job)
                 self.assertEqual(self.uploads[artifact][0], f"runcmake-{os_name}")
         self.assertIn("ccmake", ECOSYSTEM_YML.read_text(encoding="utf-8"))
+
+    def test_ecosystem_builds_and_consumes_release_binaries(self) -> None:
+        linux_build = self.jobs["build-release-linux"]
+        macos_build = self.jobs["build-release-macos"]
+        windows_build = self.jobs["build-release-windows"]
+        self.assertIn("RCMAKE_STAGE_PROFILE=release scripts/stage.sh", linux_build)
+        self.assertIn("*build_release_posix", macos_build)
+        self.assertIn(
+            "cargo build --locked --release -p rcmake-cli --bin rcmake -p rcmake-shim --bin rcmake-shim",
+            windows_build,
+        )
+        self.assertIn("rcmake-lsp", windows_build)
+        self.assertEqual(self.uploads["rcmake-release-ubuntu-24.04"][0], "build-release-linux")
+        self.assertEqual(self.uploads["rcmake-release-macos-15"][0], "build-release-macos")
+        self.assertEqual(self.uploads["rcmake-release-windows-2025"][0], "build-release-windows")
+        workflow_text = ECOSYSTEM_YML.read_text(encoding="utf-8")
+        self.assertNotIn("rcmake-ci-", workflow_text)
+        self.assertIn("name: rcmake-release-ubuntu-24.04", workflow_text)
+        self.assertIn("needs: build-release-linux", self.jobs["runcmake-linux-shards"])
+        self.assertIn("needs: build-release-macos", self.jobs["runcmake-macos-shards"])
+        self.assertIn("needs: build-release-windows", self.jobs["runcmake-windows-shards"])
+        self.assertIn("for tool in cmake ctest cpack rcmake-lsp; do", self.jobs["runcmake-linux-shards"])
+        self.assertIn("CI_BINARY: rcmake-release-ubuntu-24.04", self.jobs["runcmake-linux-shards"])
+        self.assertIn("CI_BINARY: rcmake-release-macos-15", self.jobs["runcmake-macos-shards"])
+        self.assertIn("CI_BINARY: rcmake-release-windows-2025", self.jobs["runcmake-windows-shards"])
 
 
 if __name__ == "__main__":
