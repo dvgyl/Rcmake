@@ -104,6 +104,7 @@ pub(super) fn ctest_submit(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult 
                     .map(|value| value.as_slice()),
                 cx.limits().wall_budget,
             );
+            transport.debug = debug() && !quiet;
             transport.retries =
                 retry_option(cx, args.value(b"RETRY_COUNT"), b"CTEST_SUBMIT_RETRY_COUNT").min(10);
             transport.delay = Duration::from_secs(u64::from(

@@ -1,7 +1,8 @@
 //! Byte-stream transports between the adapter and one debugger client.
 //!
 //! The transport is a process-level side channel that the CLI opens. It is not part of
-//! the `rcmake_host::Host` contract. [`unix`] is the only operating-system boundary of
+//! the `rcmake_host::Host` contract. The `unix` module (an `AF_UNIX` socket) and the
+//! `windows` module (a named pipe, ADR-050) are the only operating-system boundaries of
 //! this crate. Tests use [`memory`].
 
 use std::io::{self, Read, Write};
@@ -9,6 +10,9 @@ use std::io::{self, Read, Write};
 pub mod memory;
 #[cfg(unix)]
 pub mod unix;
+// The pipe-name check of `windows` has no Win32 calls, so its tests also run on Unix.
+#[cfg(any(windows, test))]
+pub mod windows;
 
 /// One accepted client connection.
 pub trait Connection: Send + Sync {

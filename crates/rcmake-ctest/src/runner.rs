@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rcmake_base::BString;
@@ -68,12 +68,18 @@ pub(crate) fn run_tests_with_dashboard(
     )?;
     let instrument =
         instrumentation::Recorder::open(host.as_ref(), &run.dir, options.config.as_ref())?;
-    let run_sample = instrument
-        .as_ref()
-        .map(instrumentation::Recorder::start_test);
+    let run_sample = Mutex::new(
+        instrument
+            .as_ref()
+            .map(instrumentation::Recorder::start_test),
+    );
     let run_start = host.monotonic();
     let record_run = |exit_code, show_only, interrupt_signal| {
-        if let Some((instrument, sample)) = instrument.as_ref().zip(run_sample)
+        let sample = run_sample
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((instrument, sample)) = instrument.as_ref().zip(sample)
             && !invocation.command.is_empty()
         {
             instrument.ctest(
@@ -138,7 +144,45 @@ pub(crate) fn run_tests_with_dashboard(
             ..TestRunOutcome::default()
         });
     }
-    run.execute(&plan, &report, deadline, dashboard, junit, record_run)
+    let guarded = rcmake_instrument::interrupt::guard_and_flush(
+        instrument.is_some(),
+        |signal| record_run(8, false, Some(signal)),
+        || run.execute_body(&plan, &report, deadline, dashboard, junit),
+    );
+    if let Some(signal) = guarded.signal {
+        rcmake_instrument::interrupt::raise(signal);
+        return Ok(TestRunOutcome {
+            outcome: CtestOutcome {
+                exit_code: 128_i32.saturating_add(signal),
+                ..CtestOutcome::default()
+            },
+            ..TestRunOutcome::default()
+        });
+    }
+    if rcmake_instrument::interrupt::is_interrupted() {
+        return Ok(TestRunOutcome {
+            outcome: CtestOutcome {
+                exit_code: 8,
+                ..CtestOutcome::default()
+            },
+            ..TestRunOutcome::default()
+        });
+    }
+    let outcome = guarded.value?;
+    record_run(outcome.outcome.exit_code, false, None);
+    for hook in [
+        rcmake_instrument::Hook::PrepareForCDash,
+        rcmake_instrument::Hook::PostCTest,
+    ] {
+        let Err(error) = rcmake_instrument::hooks::run_hook(host.as_ref(), &run.dir, hook) else {
+            continue;
+        };
+        host.write_out(
+            Stream::Stderr,
+            format!("CTest instrumentation error: {error}\n").as_bytes(),
+        );
+    }
+    Ok(outcome)
 }
 
 enum DashboardTarget<'a> {
@@ -197,7 +241,11 @@ impl TestRun<'_> {
             Err(error @ CtestError::Load(_)) if show_project && !json_only && !options.quiet => {
                 host.write_out(
                     Stream::Stdout,
-                    format!("Test project {}\n", dir.display()).as_bytes(),
+                    format!(
+                        "Test project {}\n",
+                        rcmake_host::path::from_native_cmake(dir)
+                    )
+                    .as_bytes(),
                 );
                 return Err(error);
             }
@@ -214,7 +262,11 @@ impl TestRun<'_> {
                     if !options.quiet {
                         host.write_out(
                             Stream::Stdout,
-                            format!("Test project {}\n", dir.display()).as_bytes(),
+                            format!(
+                                "Test project {}\n",
+                                rcmake_host::path::from_native_cmake(dir)
+                            )
+                            .as_bytes(),
                         );
                     }
                     return Err(error);
@@ -230,14 +282,13 @@ impl TestRun<'_> {
         Ok(plan)
     }
 
-    fn execute(
+    fn execute_body(
         &self,
         plan: &selection::Plan,
         report: &reporting::Report<'_>,
         deadline: Option<Duration>,
         dashboard: DashboardTarget<'_>,
         junit: Option<&BString>,
-        record_run: impl FnOnce(i32, bool, Option<i32>),
     ) -> Result<TestRunOutcome, CtestError> {
         let host = self.host.as_ref();
         let dir = &self.dir;
@@ -269,9 +320,21 @@ impl TestRun<'_> {
             .unwrap_or(&configuration.coverage_tool);
         let custom = discovery::custom_commands(Arc::clone(self.host), dir)?;
         run_custom_commands(host, dir, custom.before, options.quiet)?;
-        let _debug_environment = self.debug_environment(dashboard.is_some());
+        let (interactive_debugging, _debug_environment) =
+            self.debug_environment(dashboard.is_some());
         report.check_dependency_graph();
-        let results = schedule::run(host, dir, invocation, plan, report, deadline, coverage_tool)?;
+        let results = schedule::run(
+            host,
+            dir,
+            invocation,
+            plan,
+            report,
+            &schedule::RunConfig {
+                deadline,
+                coverage_tool,
+                interactive_debugging,
+            },
+        )?;
         let elapsed = host.monotonic().saturating_sub(started);
         report.summary(
             plan,
@@ -291,21 +354,7 @@ impl TestRun<'_> {
             elapsed,
             output: &invocation.output,
         };
-        let outcome = self.finish(&reports, dashboard, junit)?;
-        record_run(outcome.outcome.exit_code, false, None);
-        for hook in [
-            rcmake_instrument::Hook::PrepareForCDash,
-            rcmake_instrument::Hook::PostCTest,
-        ] {
-            let Err(error) = rcmake_instrument::hooks::run_hook(host, dir, hook) else {
-                continue;
-            };
-            host.write_out(
-                Stream::Stderr,
-                format!("CTest instrumentation error: {error}\n").as_bytes(),
-            );
-        }
-        Ok(outcome)
+        self.finish(&reports, dashboard, junit)
     }
 
     fn configuration(&self) -> Result<dart::Configuration, CtestError> {
@@ -353,9 +402,9 @@ impl TestRun<'_> {
         })
     }
 
-    fn debug_environment(&self, dashboard: bool) -> Option<PresetEnvironment<'_>> {
+    fn debug_environment(&self, dashboard: bool) -> (bool, Option<PresetEnvironment<'_>>) {
         if !self.full_selection {
-            return None;
+            return (false, None);
         }
         let invocation = self.invocation;
         let interactive = invocation
@@ -375,7 +424,10 @@ impl TestRun<'_> {
         } else {
             BTreeMap::from([("DASHBOARD_TEST_FROM_CTEST".into(), Some(BString::default()))])
         };
-        Some(PresetEnvironment::apply(self.host.as_ref(), &environment))
+        (
+            interactive,
+            Some(PresetEnvironment::apply(self.host.as_ref(), &environment)),
+        )
     }
 
     fn finish(

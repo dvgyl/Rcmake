@@ -155,6 +155,7 @@ fn json_property(key: &[u8], value: &BString) -> Value {
 }
 
 pub(crate) fn show_json(host: &dyn Host, plan: &Plan, options: &CtestOptions, raw: bool) {
+    let windows = host.system().sysname.starts_with(b"Windows");
     let mut graph = BacktraceGraph::default();
     let tests = plan
         .tests
@@ -163,10 +164,11 @@ pub(crate) fn show_json(host: &dyn Host, plan: &Plan, options: &CtestOptions, ra
         .map(|test| {
             let mut fields = BTreeMap::from([("name".into(), Value::string(test.name.clone()))]);
             if let Some(command) = resolved_command(host, test, options) {
+                let program = normalize_cmake_path(&command.program, windows);
                 fields.insert(
                     "command".into(),
                     Value::Array(
-                        std::iter::once(command.program)
+                        std::iter::once(program)
                             .chain(command.args)
                             .map(Value::string)
                             .collect(),
@@ -181,7 +183,7 @@ pub(crate) fn show_json(host: &dyn Host, plan: &Plan, options: &CtestOptions, ra
             }
             fields.insert(
                 "properties".into(),
-                Value::Array(json_properties(test, raw)),
+                Value::Array(json_properties(test, raw, windows)),
             );
             Value::Object(fields)
         })
@@ -236,13 +238,33 @@ const JSON_PROPERTIES: &[&[u8]] = &[
     b"WORKING_DIRECTORY",
 ];
 
-fn json_properties(test: &PlannedTest, raw: bool) -> Vec<Value> {
-    let working_directory = path::from_native(&test.directory);
+fn normalize_cmake_path(raw: &[u8], windows: bool) -> BString {
+    if !windows {
+        return raw.into();
+    }
+    raw.iter()
+        .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+        .collect::<Vec<u8>>()
+        .into()
+}
+
+fn json_properties(test: &PlannedTest, raw: bool, windows: bool) -> Vec<Value> {
+    let working_directory =
+        normalize_cmake_path(&path::from_native_cmake(&test.directory), windows);
     let properties = JSON_PROPERTIES.iter().filter_map(|&key| {
-        let source = test
-            .properties
-            .get(key)
-            .or_else(|| (key == b"WORKING_DIRECTORY").then_some(&working_directory))?;
+        if windows && matches!(key, b"TIMEOUT_SIGNAL_NAME" | b"TIMEOUT_SIGNAL_GRACE_PERIOD") {
+            return None;
+        }
+        let normalized_wd;
+        let source = if key == b"WORKING_DIRECTORY" {
+            normalized_wd = test.properties.get(key).map_or_else(
+                || working_directory.clone(),
+                |value| normalize_cmake_path(value, windows),
+            );
+            &normalized_wd
+        } else {
+            test.properties.get(key)?
+        };
         let typed = json_property(key, source);
         let present = match (&typed, key) {
             (Value::Bool(on), _) => *on,

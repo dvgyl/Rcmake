@@ -38,9 +38,10 @@ use transport::{Connection, Listener};
 
 /// Whether this platform has a native debugger pipe transport.
 ///
-/// Windows named pipes need a vetted safe wrapper crate (a future ADR). Until then the
-/// Windows build reports `"debugger": false` and rejects the `--debugger*` options.
-pub const TRANSPORT_SUPPORTED: bool = cfg!(unix);
+/// Unix uses an `AF_UNIX` socket (`transport::unix`). Windows uses a named pipe
+/// through the safe Tokio wrapper (`transport::windows`, ADR-050). Other platforms
+/// report `"debugger": false` and reject the `--debugger*` options.
+pub const TRANSPORT_SUPPORTED: bool = cfg!(any(unix, windows));
 
 /// Time that shutdown waits for the writer and reader threads.
 const SHUTDOWN_LIMIT: Duration = Duration::from_secs(5);

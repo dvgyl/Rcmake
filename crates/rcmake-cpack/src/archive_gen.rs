@@ -263,7 +263,7 @@ impl ArchiveGenerator {
                 cx.staging_dir,
                 &canon_staging,
                 &[],
-                crate::source::SymlinkPolicy::PreserveContained,
+                crate::source::SymlinkPolicy::PreserveLiteral,
                 false,
             )?;
             let (base, inputs) = if header.is_none()
@@ -639,7 +639,7 @@ fn write_component_archive(
             root,
             &canon_root,
             &start,
-            crate::source::SymlinkPolicy::PreserveContained,
+            crate::source::SymlinkPolicy::PreserveLiteral,
             false,
         )?;
         Ok(children(cx.host, &start)?
@@ -740,7 +740,7 @@ fn check_recorded(
             root,
             canon_root,
             member,
-            crate::source::SymlinkPolicy::PreserveContained,
+            crate::source::SymlinkPolicy::PreserveLiteral,
             false,
         )?;
         if kind == FileKind::Dir {

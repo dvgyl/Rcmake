@@ -485,8 +485,7 @@ fn syntax_warning(
         && let Some(column) = message
             .strip_prefix("Syntax Warning in cmake code at column ")
             .and_then(|message| {
-                message
-                    .strip_suffix("\n\nArgument not separated from preceding token by whitespace.")
+                message.strip_suffix("\nArgument not separated from preceding token by whitespace.")
             })
             .and_then(|column| column.parse().ok())
     {

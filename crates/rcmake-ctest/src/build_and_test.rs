@@ -244,6 +244,7 @@ fn execute(
                 stderr: Output::Inherit,
                 timeout: Some(timeout),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

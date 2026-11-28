@@ -56,6 +56,7 @@ fn run_command(
                 stderr: Output::Capture,
                 timeout: Some(Duration::from_secs(30 * 60)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )
@@ -126,7 +127,7 @@ pub(crate) fn build_failure(
     command: &[BString],
     output: &rcmake_host::RunOutput,
 ) {
-    let (_, exit) = process_exit(&output.results);
+    let (_, exit) = build_process_exit(&output.results, &output.stdout, &output.stderr);
     let (stdout, _) = diagnostic_output(&output.stdout);
     let (stderr, _) = diagnostic_output(&output.stderr);
     xml.push_str("<Failure type=\"Error\">\n<Action/>\n");
@@ -135,18 +136,20 @@ pub(crate) fn build_failure(
     xml.push_str("</Failure>\n");
 }
 
+fn signal_exit_condition(signal: i32) -> String {
+    let reason = match signal {
+        2 => "User interrupt",
+        9 => "Subprocess killed",
+        15 => "Subprocess terminated",
+        _ => "Subprocess received a signal",
+    };
+    format!("Terminated abnormally: {reason}")
+}
+
 fn process_exit(results: &[ProcessResult]) -> (i32, String) {
     match results {
         [ProcessResult::Exited(code)] => (*code, code.to_string()),
-        [ProcessResult::Signaled(signal)] => {
-            let reason = match signal {
-                2 => "User interrupt",
-                9 => "Subprocess killed",
-                15 => "Subprocess terminated",
-                _ => "Subprocess received a signal",
-            };
-            (1, format!("Terminated abnormally: {reason}"))
-        }
+        [ProcessResult::Signaled(signal)] => (1, signal_exit_condition(*signal)),
         [ProcessResult::SpawnFailed(error)] => (
             1,
             format!(
@@ -156,6 +159,48 @@ fn process_exit(results: &[ProcessResult]) -> (i32, String) {
         ),
         _ => (1, "Child process timeout".into()),
     }
+}
+
+/// Classify the outer build command result when `ctest --launch` did not record a failure XML.
+///
+/// Direct `ctest --launch` invocations receive [`ProcessResult::Signaled`] directly via
+/// [`process_exit`]. When an outer build tool such as Ninja runs a rule under `/bin/sh -c`
+/// without a launcher wrapper, the shell translates a fatal signal `S` into exit status `128 + S`
+/// and prints `FAILED: [code=N]` / shell termination text. Only classify Unix exit codes in
+/// `129..=192` as abnormal signal termination when the captured build output corroborates a
+/// signal-killed build rule, avoiding false positives on normal `exit(143)`.
+fn build_process_exit(results: &[ProcessResult], stdout: &[u8], stderr: &[u8]) -> (i32, String) {
+    if let [ProcessResult::Exited(code)] = results
+        && cfg!(unix)
+        && (129..=192).contains(code)
+        && output_shows_signal_termination(*code, stdout, stderr)
+    {
+        return (*code, signal_exit_condition(*code - 128));
+    }
+    process_exit(results)
+}
+
+fn output_shows_signal_termination(code: i32, stdout: &[u8], stderr: &[u8]) -> bool {
+    let ninja_marker = format!("FAILED: [code={code}]");
+    let signal = code - 128;
+    let signal_line_markers: &[&str] = match signal {
+        2 => &["Interrupt"],
+        6 => &["Aborted", "Abort trap"],
+        9 => &["Killed"],
+        11 => &["Segmentation fault"],
+        15 => &["Terminated"],
+        _ => &["Signal "],
+    };
+    let check = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        text.contains(&ninja_marker)
+            && text.lines().any(|line| {
+                signal_line_markers
+                    .iter()
+                    .any(|marker| line.contains(marker))
+            })
+    };
+    check(stdout) || check(stderr)
 }
 
 fn write_command<'a>(xml: &mut String, cwd: &[u8], args: impl IntoIterator<Item = &'a BString>) {
@@ -236,4 +281,68 @@ pub(crate) fn diagnostics(host: &dyn Host, build: &Path, since: FileTime) -> Str
         }
     }
     xml
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_exit_uses_signaled_directly_without_guessing_normal_exits() {
+        assert_eq!(
+            process_exit(&[ProcessResult::Exited(143)]),
+            (143, "143".into())
+        );
+        assert_eq!(
+            process_exit(&[ProcessResult::Signaled(15)]),
+            (1, "Terminated abnormally: Subprocess terminated".into())
+        );
+    }
+
+    #[test]
+    fn build_failure_classifies_ninja_signal_exit_without_misreporting_normal_exit() {
+        let mut normal_xml = String::new();
+        let normal_output = rcmake_host::RunOutput {
+            stdout: b"build script exited normally with status 143\n".to_vec(),
+            results: vec![ProcessResult::Exited(143)],
+            ..rcmake_host::RunOutput::default()
+        };
+        build_failure(
+            &mut normal_xml,
+            Path::new("/work/build"),
+            &["cmake".into(), "--build".into(), ".".into()],
+            &normal_output,
+        );
+        assert!(
+            normal_xml.contains("<ExitCondition>143</ExitCondition>"),
+            "{normal_xml}"
+        );
+
+        let mut signal_xml = String::new();
+        let signal_output = rcmake_host::RunOutput {
+            stdout: b"[1/1] Generating signal.out\nFAILED: [code=143] signal.out\nTerminated\n"
+                .to_vec(),
+            results: vec![ProcessResult::Exited(143)],
+            ..rcmake_host::RunOutput::default()
+        };
+        build_failure(
+            &mut signal_xml,
+            Path::new("/work/build"),
+            &["cmake".into(), "--build".into(), ".".into()],
+            &signal_output,
+        );
+        if cfg!(unix) {
+            assert!(
+                signal_xml.contains(
+                    "<ExitCondition>Terminated abnormally: Subprocess terminated</ExitCondition>"
+                ),
+                "{signal_xml}"
+            );
+        } else {
+            assert!(
+                signal_xml.contains("<ExitCondition>143</ExitCondition>"),
+                "{signal_xml}"
+            );
+        }
+    }
 }

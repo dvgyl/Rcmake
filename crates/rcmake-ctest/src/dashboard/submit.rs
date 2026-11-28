@@ -117,6 +117,7 @@ pub(crate) struct Transport {
     pub delay: Duration,
     pub log: bool,
     pub verbose: bool,
+    pub debug: bool,
     timeout: Option<Duration>,
 }
 
@@ -153,6 +154,7 @@ impl Transport {
             delay: Duration::ZERO,
             log,
             verbose,
+            debug: false,
             timeout,
         }
     }
@@ -165,7 +167,11 @@ impl Transport {
             .push_header(header.as_slice())
             .map_err(|error| format!("Invalid ctest_submit HTTPHEADER: {error}"))?;
         if self.verbose {
-            let display = redact_header(header.as_slice());
+            let display = if self.debug {
+                String::from_utf8_lossy(header.as_slice()).into_owned()
+            } else {
+                redact_sensitive_header(header.as_slice())
+            };
             host.write_out(
                 Stream::Stdout,
                 format!("Add HTTP Header: \"{display}\"\n").as_bytes(),
@@ -183,13 +189,14 @@ impl Transport {
         let curl = path::executable_on_absolute_path(host, "curl")
             .ok_or_else(|| "Cannot find curl for HTTP submission.".to_owned())?;
         let mut args = self.flags.clone();
+        let mut post_body: Option<&[u8]> = None;
         let url = match transfer {
             Transfer::Put(file, url) => {
                 args.extend(["--upload-file".into(), path::from_native(file)]);
                 url
             }
             Transfer::Post(fields, url) => {
-                args.extend(["--data-raw".into(), fields.into()]);
+                post_body = Some(fields.as_bytes());
                 url
             }
         };
@@ -197,6 +204,11 @@ impl Transport {
         config
             .push(CurlOption::Url, &[url.as_bytes()])
             .map_err(|error| format!("Invalid ctest_submit URL: {error}"))?;
+        let mut stdin_bytes = config.into_bytes();
+        if let Some(fields) = post_body {
+            push_curl_config_option(&mut stdin_bytes, b"data-raw", fields)
+                .map_err(|byte| format!("Invalid ctest_submit POST data: byte 0x{byte:02x}"))?;
+        }
         args.extend(["--config".into(), "-".into()]);
         host.run_bounded(
             &RunRequest {
@@ -206,11 +218,12 @@ impl Transport {
                 }],
                 cwd: dir.to_path_buf(),
                 env: host.env_all(),
-                stdin: Input::Bytes(config.into_bytes()),
+                stdin: Input::Bytes(stdin_bytes),
                 stdout: Output::Capture,
                 stderr: Output::Capture,
                 timeout: self.timeout,
                 tee: false,
+                default_error_mode: false,
             },
             1024 * 1024,
         )
@@ -333,12 +346,12 @@ pub(crate) fn submit(
         }
         destination.push_str(&format!("&MD5={md5}"));
         if transport.verbose {
-            let display_url = redact_url(&destination);
+            let display_url = redact_debug_url(&destination);
             host.write_out(
                 Stream::Stdout,
                 format!(
                     "Upload file: {} to {display_url} Size: {}\n",
-                    file.display(),
+                    path::from_native_cmake(&file),
                     host.metadata(&file, Follow::Yes)
                         .map_err(|error| error.to_string())?
                         .len
@@ -355,7 +368,8 @@ pub(crate) fn submit(
                 .split_once(") ")
                 .map_or(message.trim(), |(_, detail)| detail);
             host.write_out(Stream::Stderr, format!(
-                "Error when uploading file: {}\nError message was: {message}\n   Problems when submitting via HTTP\n", file.display(),
+                "Error when uploading file: {}\nError message was: {message}\n   Problems when submitting via HTTP\n",
+                path::from_native_cmake(&file),
             ).as_bytes());
             result.code = -1;
             break;
@@ -519,12 +533,113 @@ fn http_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
-fn redact_header(header: &[u8]) -> String {
+fn push_curl_config_option(buf: &mut Vec<u8>, option: &[u8], value: &[u8]) -> Result<(), u8> {
+    if let Some(&bad) = value.iter().find(|&&byte| matches!(byte, 0x00 | 0x1A)) {
+        return Err(bad);
+    }
+    buf.extend_from_slice(option);
+    buf.extend_from_slice(b" = \"");
+    for &byte in value {
+        match byte {
+            b'\\' => buf.extend_from_slice(b"\\\\"),
+            b'"' => buf.extend_from_slice(b"\\\""),
+            b'\t' => buf.extend_from_slice(b"\\t"),
+            b'\n' => buf.extend_from_slice(b"\\n"),
+            b'\r' => buf.extend_from_slice(b"\\r"),
+            0x0B => buf.extend_from_slice(b"\\v"),
+            _ => buf.push(byte),
+        }
+    }
+    buf.extend_from_slice(b"\"\n");
+    Ok(())
+}
+
+fn is_sensitive_header_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+    ) || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("api-key")
+        || lower.contains("apikey")
+}
+
+fn redact_sensitive_header(header: &[u8]) -> String {
     let text = String::from_utf8_lossy(header);
     match text.split_once(':') {
-        Some((name, _)) => format!("{}: <redacted>", name.trim()),
+        Some((name, _)) if is_sensitive_header_name(name) => {
+            format!("{}: <redacted>", name.trim())
+        }
+        Some(_) => text.into_owned(),
         None => "<redacted>".to_owned(),
     }
+}
+
+fn is_public_cdash_param(key: &str) -> bool {
+    matches!(
+        key,
+        "FileName"
+            | "build"
+            | "site"
+            | "stamp"
+            | "subproject"
+            | "MD5"
+            | "project"
+            | "type"
+            | "filename"
+            | "buildid"
+    )
+}
+
+fn redact_debug_url(url: &str) -> String {
+    let (without_frag, frag) = match url.split_once('#') {
+        Some((before, after)) => (before, Some(after)),
+        None => (url, None),
+    };
+    let (base, query) = match without_frag.split_once('?') {
+        Some((before, after)) => (before, Some(after)),
+        None => (without_frag, None),
+    };
+    let mut out = if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path_part) = match rest.split_once('/') {
+            Some((auth, path)) => (auth, Some(path)),
+            None => (rest, None),
+        };
+        if let Some((_, host_port)) = authority.rsplit_once('@') {
+            match path_part {
+                Some(path) => format!("{scheme}://<redacted>@{host_port}/{path}"),
+                None => format!("{scheme}://<redacted>@{host_port}"),
+            }
+        } else {
+            base.to_owned()
+        }
+    } else {
+        base.to_owned()
+    };
+    if let Some(query) = query {
+        out.push('?');
+        for (index, param) in query.split('&').enumerate() {
+            if index > 0 {
+                out.push('&');
+            }
+            if let Some((key, value)) = param.split_once('=') {
+                out.push_str(key);
+                out.push('=');
+                if is_public_cdash_param(key) {
+                    out.push_str(value);
+                } else {
+                    out.push_str("<redacted>");
+                }
+            } else if !param.is_empty() {
+                out.push_str("<redacted>");
+            }
+        }
+    }
+    if frag.is_some() {
+        out.push_str("#<redacted>");
+    }
+    out
 }
 
 pub(crate) fn redact_url(url: &str) -> String {
@@ -700,8 +815,17 @@ mod tests {
                         .any(|pair| pair == ["--speed-time", speed_time])
                 );
                 assert!(
-                    args.windows(2)
-                        .any(|pair| pair == ["--data-raw", "@literal&key=value"])
+                    !args.iter().any(|arg| arg == "--data-raw"
+                        || arg.as_slice().windows(7).any(|w| w == b"literal")),
+                    "POST body must stay off curl argv: {args:?}"
+                );
+                let Input::Bytes(stdin) = &request.stdin else {
+                    panic!("Expected curl config bytes on stdin.");
+                };
+                let stdin = String::from_utf8_lossy(stdin);
+                assert!(
+                    stdin.contains("data-raw = \"@literal&key=value\"\n"),
+                    "{stdin}"
                 );
                 Ok(RunOutput::default())
             })?;
@@ -798,7 +922,6 @@ mod tests {
             "cookie_secret",
             "key_secret",
             "custom_tok",
-            "safe_value",
             "NoColonSecret",
             "u:p4ss",
             "p4ss",
@@ -832,7 +955,7 @@ mod tests {
             "{stdout}"
         );
         assert!(
-            stdout.contains("Add HTTP Header: \"X-Example: <redacted>\""),
+            stdout.contains("Add HTTP Header: \"X-Example: safe_value\""),
             "{stdout}"
         );
         assert!(
@@ -840,7 +963,7 @@ mod tests {
             "{stdout}"
         );
         assert!(
-            stdout.contains("https://<redacted>@cdash.invalid/submit.php?project=<redacted>&foo=<redacted>&%74oken=<redacted>&<redacted>&"),
+            stdout.contains("https://<redacted>@cdash.invalid/submit.php?project=P&foo=<redacted>&%74oken=<redacted>&<redacted>&FileName="),
             "{stdout}"
         );
         assert_eq!(
@@ -855,6 +978,91 @@ mod tests {
         ] {
             assert_eq!(redact_url(invalid), "<redacted-invalid-url>", "{invalid}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn debug_mode_matches_ctest_submit_headers_and_keeps_cdash_upload_post_off_argv()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = if cfg!(windows) { "C:/work" } else { "/work" };
+        let host = PureHost::new(dir.into(), dir.into());
+        let curl = Path::new(dir).join(format!("curl{}", std::env::consts::EXE_SUFFIX));
+        host.seed_file(&curl, b"")?;
+        host.set_permissions(&curl, 0o755)?;
+        host.env_set(b"PATH", Some(dir.as_bytes()));
+        let upload_file = Path::new(dir).join("artifact.bin");
+        host.seed_file(&upload_file, b"payload")?;
+        host.seed_file(
+            &Path::new(dir).join("Testing/TAG"),
+            b"20261126-0000\nExperimental\nExperimental\n",
+        )?;
+        host.set_command_handler(|_, request, _| {
+            let args = &request
+                .pipeline
+                .first()
+                .ok_or_else(|| HostError::unsupported("Missing submission command"))?
+                .args;
+            for arg in args {
+                let text = String::from_utf8_lossy(arg);
+                assert!(
+                    !text.contains("qsecret"),
+                    "POST secret leaked in argv: {text}"
+                );
+                assert!(
+                    !text.contains("asdf"),
+                    "header secret leaked in argv: {text}"
+                );
+            }
+            let Input::Bytes(stdin) = &request.stdin else {
+                panic!("Expected curl config bytes on stdin.");
+            };
+            let stdin = String::from_utf8_lossy(stdin);
+            assert!(
+                stdin.contains("header = \"Authorization: Bearer asdf\"\n"),
+                "{stdin}"
+            );
+            assert!(stdin.contains("data-raw = \"token=qsecret&"), "{stdin}");
+            Ok(RunOutput {
+                stdout: br#"{"status":0,"buildid":"42","datafilesmd5":[1]}"#.to_vec(),
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        let mut transport = Transport::new(false, true, None, None);
+        transport.debug = true;
+        transport.header(&host, "Authorization: Bearer asdf".into())?;
+        let config = Configuration {
+            site: "test-site".into(),
+            build_name: "test-build-name".into(),
+            submit_url: "https://cdash.invalid/submit.php?token=qsecret".into(),
+            ..Configuration::default()
+        };
+        let tag = Tag::read(&host, Path::new(dir))?;
+        let job = Submission {
+            url: submission_url(&config),
+            config: &config,
+            parts: Some(Vec::new()),
+            files: Vec::new(),
+            subproject: None,
+        };
+        let outcome = cdash_upload(
+            &host,
+            Path::new(dir),
+            &tag,
+            &transport,
+            CDashUpload {
+                job: &job,
+                file: &upload_file,
+                kind: b"foo",
+                checksum_test: false,
+            },
+        )?;
+        assert_eq!(outcome.code, 0);
+        let stdout = host.stream_bytes(Stream::Stdout).to_string();
+        assert!(
+            stdout.contains("Add HTTP Header: \"Authorization: Bearer asdf\""),
+            "{stdout}"
+        );
         Ok(())
     }
 }

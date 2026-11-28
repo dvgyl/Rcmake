@@ -555,3 +555,54 @@ fn failure_summary_omits_the_rerun_hint_after_printing_failed_output() -> TestRe
     }
     Ok(())
 }
+
+#[test]
+fn interactive_default_error_mode_applies_only_to_interactive_test_launches() -> TestResult {
+    let run_case = |extra_args: &[&str]| -> Result<Vec<(String, bool)>, Box<dyn Error>> {
+        let host = host("add_test(sample test_bin)\n")?;
+        host.seed_file(
+            Path::new("/work/CTestCustom.cmake"),
+            b"set(CTEST_CUSTOM_PRE_TEST \"pre_cmd\")\nset(CTEST_CUSTOM_POST_TEST \"post_cmd\")\n",
+        )?;
+        let requests = commands(&host)?;
+        let mut argv: Vec<rcmake_base::BString> = vec!["ctest".into()];
+        argv.extend(extra_args.iter().copied().map(rcmake_base::BString::from));
+        assert_eq!(crate::main(&argv, host.clone()), 0);
+        let seen = requests
+            .lock()
+            .map_err(|_| "Cannot read commands.")?
+            .iter()
+            .map(|req| {
+                let prog = req
+                    .pipeline
+                    .first()
+                    .map(|cmd| cmd.program.to_string())
+                    .unwrap_or_default();
+                (prog, req.default_error_mode)
+            })
+            .collect();
+        Ok(seen)
+    };
+
+    // Interactive CTest run: ONLY the test process gets `default_error_mode == true`;
+    // pre-test and post-test custom commands inherit the parent error mode (`false`).
+    assert_eq!(
+        run_case(&[])?,
+        vec![
+            ("pre_cmd".to_owned(), false),
+            ("test_bin".to_owned(), true),
+            ("post_cmd".to_owned(), false),
+        ]
+    );
+
+    // Non-interactive CTest run (`--interactive-debug-mode 0`): everything keeps `false`.
+    assert_eq!(
+        run_case(&["--interactive-debug-mode", "0"])?,
+        vec![
+            ("pre_cmd".to_owned(), false),
+            ("test_bin".to_owned(), false),
+            ("post_cmd".to_owned(), false),
+        ]
+    );
+    Ok(())
+}

@@ -292,7 +292,7 @@ fn records_members(cfg: &CpackConfig) -> bool {
     cfg.get(b"CPACK_GENERATOR").is_some_and(|name| {
         matches!(
             name,
-            b"productbuild" | b"NSIS" | b"NSIS64" | b"WIX" | b"IFW"
+            b"productbuild" | b"NSIS" | b"NSIS64" | b"WIX" | b"IFW" | b"NuGet"
         ) || ArchiveKind::ALL
             .iter()
             .any(|kind| kind.name().as_bytes() == name)
@@ -769,6 +769,7 @@ fn preinstall(
             stderr: Output::SharedWithStdout,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     )?;
@@ -839,6 +840,8 @@ pub(crate) fn package_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BSt
         Some(b"External" | b"productbuild" | b"NSIS" | b"NSIS64" | b"WIX" | b"IFW") => true,
         Some(b"DEB") => cfg.on(b"CPACK_DEB_COMPONENT_INSTALL"),
         Some(b"RPM") => cfg.on(b"CPACK_RPM_COMPONENT_INSTALL"),
+        Some(b"NuGet") => cfg.on(b"CPACK_NUGET_COMPONENT_INSTALL"),
+        Some(b"AppImage") => false,
         Some(b"DragNDrop") => cfg
             .get(b"CPACK_DMG_COMPONENT_INSTALL")
             .is_none_or(truth::is_on),

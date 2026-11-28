@@ -594,6 +594,7 @@ fn probe_version(host: &dyn Host, exe: &Path, deadline: &Deadline) -> Result<Str
         stderr: Output::Capture,
         timeout: Some(timeout),
         tee: false,
+        default_error_mode: false,
     };
     let out = host
         .run_bounded(&req, 64 * 1024)
@@ -660,6 +661,7 @@ fn run_configure(
         stderr: Output::Capture,
         timeout: Some(timeout),
         tee: false,
+        default_error_mode: false,
     };
     let start = host.monotonic();
     let result = host.run_bounded(&req, MAX_CONFIGURE_OUTPUT_BYTES);

@@ -616,3 +616,88 @@ fn simultaneous_hooks_do_not_index_the_same_snippet() {
     assert_eq!(host.stream_bytes(Stream::Stdout), "10");
     assert_eq!(read_bytes(&host, &api.join(".index.lock")), Ok(Vec::new()));
 }
+
+#[test]
+fn output_as_file_name_supports_nul_and_newline_delimiters() -> Result<(), InstrumentError> {
+    let host = host();
+    let build = Path::new("/build");
+    host.seed_file(
+        Path::new("/work/nul-outputs.txt"),
+        b"dir/a,with,comma.o\0dir/b.o",
+    )?;
+    host.seed_file(Path::new("/work/line-outputs.txt"), b"x.o\r\ny.o\n")?;
+    host.set_command_handler(|_, _, _| {
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+
+    for (file, expected) in [
+        ("nul-outputs.txt", &["dir/a,with,comma.o", "dir/b.o"][..]),
+        ("line-outputs.txt", &["x.o", "y.o"][..]),
+    ] {
+        let data = build.join(".cmake/instrumentation/v1/data");
+        let _ = host.remove_dir_all(&data);
+        let argv = [
+            "--instrument",
+            "--command-type",
+            "custom",
+            "--build-dir",
+            "/build",
+            "--output-as-file-name",
+            file,
+            "--",
+            "tool",
+        ]
+        .map(BString::from);
+        assert_eq!(launcher::run_launcher(&host, &argv)?, 0);
+        let snippet = read_json(&host, &only_file(&host, &data))?;
+        assert_eq!(*field(&snippet, "outputs"), text_list(expected));
+    }
+    Ok(())
+}
+
+#[test]
+fn start_instrumentation_skips_under_cmake_build_and_records_direct_build()
+-> Result<(), InstrumentError> {
+    let host = host();
+    let build = Path::new("/build");
+    let api = build.join(".cmake/instrumentation/v1");
+    let data = api.join("data");
+    host.seed_file(
+        &api.join("query/build.json"),
+        br#"{"version":1,"hooks":["preBuild","postBuild"],"callbacks":["observe"]}"#,
+    )?;
+    host.set_command_handler(|host, request, _| {
+        let stage = request.pipeline.first().expect("one stage");
+        let file = path::to_native(stage.args.last().expect("index arg"));
+        let index = read_json(host, &file).expect("read index");
+        let hook = text(field(&index, "hook"));
+        host.write_out(Stream::Stdout, format!("{hook}\n").as_bytes());
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+
+    host.env_set(crate::IN_CMAKE_BUILD_ENV, Some(b"1"));
+    let start_argv = ["--instrument", "--start-instrumentation", "/build"].map(BString::from);
+    assert_eq!(launcher::run_ctest_launcher(&host, &start_argv)?, 0);
+    assert!(host.stream_bytes(Stream::Stdout).is_empty());
+    host.env_set(crate::IN_CMAKE_BUILD_ENV, None);
+
+    assert_eq!(launcher::run_ctest_launcher(&host, &start_argv)?, 0);
+    assert_eq!(host.stream_bytes(Stream::Stdout), "preBuild\npostBuild\n");
+    assert!(json_files(&host, &data)?.is_empty());
+
+    // Without postBuild hook, the build snippet is preserved with role "build" and result null.
+    host.remove_file(&api.join("query/build.json"))?;
+    host.seed_file(&api.join("query/plain.json"), br#"{"version":1}"#)?;
+    assert_eq!(launcher::run_ctest_launcher(&host, &start_argv)?, 0);
+    let snippet = read_json(&host, &only_file(&host, &data))?;
+    assert_eq!(*field(&snippet, "role"), Value::string("build"));
+    assert_eq!(*field(&snippet, "result"), Value::Null);
+    assert!(!object(&snippet).contains_key(b"command".as_slice()));
+    Ok(())
+}

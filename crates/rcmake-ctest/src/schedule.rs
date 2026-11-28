@@ -356,6 +356,7 @@ fn system_load(host: &dyn Host) -> u64 {
                 stderr: Output::Null,
                 timeout: Some(Duration::from_secs(1)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )
@@ -630,6 +631,13 @@ fn invariant_error() -> CtestError {
     CtestError::Schedule("internal scheduler invariant violated".into())
 }
 
+/// Per-run execution settings passed into [`run`].
+pub(crate) struct RunConfig<'a> {
+    pub(crate) deadline: Option<Duration>,
+    pub(crate) coverage_tool: &'a [u8],
+    pub(crate) interactive_debugging: bool,
+}
+
 #[allow(
     clippy::indexing_slicing,
     reason = "The plan supplies all test indices"
@@ -640,9 +648,11 @@ pub(crate) fn run(
     invocation: &Invocation,
     plan: &Plan,
     report: &Report<'_>,
-    deadline: Option<Duration>,
-    coverage_tool: &[u8],
+    config: &RunConfig<'_>,
 ) -> Result<Vec<Option<Status>>, CtestError> {
+    let deadline = config.deadline;
+    let coverage_tool = config.coverage_tool;
+    let interactive_debugging = config.interactive_debugging;
     let options = &invocation.options;
     let (send, receive) = mpsc::channel::<Event<Attempt>>();
     let mut tokens = Tokens::connect(host, send.clone());
@@ -690,6 +700,9 @@ pub(crate) fn run(
         let mut budget = None;
         let mut pending_event = None;
         loop {
+            if rcmake_instrument::interrupt::is_interrupted() {
+                scheduler.stopped = true;
+            }
             let expired =
                 remaining_time(host, deadline).is_some_and(|remaining| remaining.is_zero());
             if let Some(tokens) = &mut tokens
@@ -703,6 +716,7 @@ pub(crate) fn run(
                 completion
             } else if !expired
                 && !scheduler.stopped
+                && !rcmake_instrument::interrupt::is_interrupted()
                 && !scheduler.ready.ordered.is_empty()
                 && running.slots < jobs
             {
@@ -736,14 +750,23 @@ pub(crate) fn run(
                     let test = &plan.tests[id];
                     runs[id] += 1;
                     let run = scheduler.repetition.numbered_run(id, runs[id]);
-                    let result = match prepare(host, options, plan, &scheduler.statuses, test) {
+                    let result = match prepare(
+                        host,
+                        options,
+                        plan,
+                        &scheduler.statuses,
+                        test,
+                        interactive_debugging,
+                    ) {
                         Ok(mut request) => {
                             if let Some(memcheck) = &memcheck {
                                 memcheck.apply(&mut request, test.number);
                             }
                             if coverage_tool == b"LLVM-COV" {
                                 let name = test.name.to_string().replace(['/', '\\'], "_");
-                                let profile = from_native(&dir.join(format!("{name}_%p.profraw")));
+                                let profile = rcmake_host::path::from_native_cmake(
+                                    &dir.join(format!("{name}_%p.profraw")),
+                                );
                                 request.env.retain(|(name, _)| name != "LLVM_PROFILE_FILE");
                                 request.env.push(("LLVM_PROFILE_FILE".into(), profile));
                             }
@@ -892,20 +915,23 @@ pub(crate) fn run(
             scheduler.stopped |= options.stop_on_failure && result.status.failed();
             scheduler.stopped |=
                 remaining_time(host, deadline).is_some_and(|remaining| remaining.is_zero());
+            scheduler.stopped |= rcmake_instrument::interrupt::is_interrupted();
             scheduler.advance(id)?;
-            match scheduler.repetition.group_of[id] {
-                None => state::checkpoint(host, dir, [test.number])?,
-                Some(group) if scheduler.repetition.groups[group].pending == 0 => {
-                    state::checkpoint(
-                        host,
-                        dir,
-                        scheduler.repetition.groups[group]
-                            .members
-                            .iter()
-                            .map(|&member| plan.tests[member].number),
-                    )?;
+            if !rcmake_instrument::interrupt::is_interrupted() {
+                match scheduler.repetition.group_of[id] {
+                    None => state::checkpoint(host, dir, [test.number])?,
+                    Some(group) if scheduler.repetition.groups[group].pending == 0 => {
+                        state::checkpoint(
+                            host,
+                            dir,
+                            scheduler.repetition.groups[group]
+                                .members
+                                .iter()
+                                .map(|&member| plan.tests[member].number),
+                        )?;
+                    }
+                    Some(_) => {}
                 }
-                Some(_) => {}
             }
         }
         Ok(())
@@ -915,10 +941,12 @@ pub(crate) fn run(
     for id in resumed {
         scheduler.statuses[id] = None;
     }
-    state.finish(plan, &scheduler.statuses)?;
-    state::clear_checkpoint(host, dir)?;
-    if let Some(memcheck) = memcheck {
-        memcheck.finish(host, dir, options.quiet)?;
+    if !rcmake_instrument::interrupt::is_interrupted() {
+        state.finish(plan, &scheduler.statuses)?;
+        state::clear_checkpoint(host, dir)?;
+        if let Some(memcheck) = memcheck {
+            memcheck.finish(host, dir, options.quiet)?;
+        }
     }
     Ok(scheduler.statuses)
 }
@@ -933,6 +961,7 @@ fn prepare(
     plan: &Plan,
     statuses: &[Option<Status>],
     test: &PlannedTest,
+    interactive_debugging: bool,
 ) -> Result<RunRequest, ResultLine> {
     if truth::is_on(test.property(b"DISABLED")) {
         return Err(ResultLine::new(Status::Disabled));
@@ -969,5 +998,5 @@ fn prepare(
             )));
         }
     }
-    execution::request(host, test, options).map_err(ResultLine::not_run)
+    execution::request(host, test, options, interactive_debugging).map_err(ResultLine::not_run)
 }

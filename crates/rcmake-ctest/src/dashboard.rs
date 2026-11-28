@@ -242,7 +242,14 @@ fn presets_file(invocation: &Invocation, source: &Path) -> Option<PathBuf> {
     invocation.presets_file.clone().or_else(|| {
         definition(invocation, b"CTEST_PRESETS_FILE")
             .filter(|value| !value.is_empty())
-            .map(|file| source.join(path::to_native(file)))
+            .map(|file| {
+                let native = path::to_native(file);
+                if native.has_root() {
+                    native
+                } else {
+                    source.join(native)
+                }
+            })
     })
 }
 
@@ -282,7 +289,7 @@ fn configure(
             if let Some((_, detail)) = error.message.split_once('\n') {
                 format!(
                     "Could not read presets from \"{}\"\n{detail}",
-                    source.display()
+                    path::from_native_cmake(source)
                 )
             } else {
                 error.message
@@ -333,6 +340,7 @@ fn configure(
                 stderr: Output::SharedWithStdout,
                 timeout: Some(std::time::Duration::from_secs(600)),
                 tee: invocation.options.verbose && !invocation.options.quiet,
+                default_error_mode: false,
             },
             &mut |stream, data| host.write_out(stream, data),
         )
@@ -460,7 +468,7 @@ fn missing_configuration(host: &dyn Host, dir: &Path) {
             Stream::Stderr,
             format!(
                 "Cannot find file: {}\n",
-                dir.join("DartConfiguration.tcl").display()
+                rcmake_host::path::from_native_cmake(&dir.join("DartConfiguration.tcl"))
             )
             .as_bytes(),
         );

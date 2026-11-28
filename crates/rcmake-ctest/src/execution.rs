@@ -78,6 +78,7 @@ pub(crate) fn request(
     host: &dyn Host,
     test: &PlannedTest,
     options: &CtestOptions,
+    default_error_mode: bool,
 ) -> Result<RunRequest, String> {
     let mut command = test.command.clone();
     resolve_program(host, test, &mut command, options);
@@ -96,6 +97,7 @@ pub(crate) fn request(
                 .unwrap_or(DEFAULT_TIMEOUT),
         ),
         tee: false,
+        default_error_mode,
     })
 }
 

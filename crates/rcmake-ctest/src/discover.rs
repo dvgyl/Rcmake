@@ -132,6 +132,7 @@ pub(crate) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         )
         .filter(|timeout| !timeout.is_zero()),
         tee: false,
+        default_error_mode: false,
     };
     let failure = |detail: &str| {
         CmdError::Status(format!("failed to run command: {program}\n\n{detail}").into())

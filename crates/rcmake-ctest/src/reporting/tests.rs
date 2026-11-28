@@ -179,6 +179,7 @@ fn oracle(
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(10)),
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     )
@@ -308,5 +309,77 @@ fn reports_match_ctest_451() -> TestResult {
     assert_eq!(invoke(host.clone(), &argv), 8);
     assert_eq!(stable_junit(&read(&junit)?), expected_junit);
     assert_eq!(stable_cdash(&read(&cdash)?), expected_cdash);
+    Ok(())
+}
+
+#[test]
+fn windows_show_only_json_omits_timeout_signal_properties() -> TestResult {
+    for flag in ["--show-only=json-v1", "--show-only=json-v1-raw"] {
+        let test_host = Arc::new(PureHost::default());
+        let mut sys = test_host.system();
+        sys.sysname = "Windows".into();
+        test_host.set_system(sys)?;
+        test_host.seed_file(
+            Path::new("/work/CTestTestfile.cmake"),
+            br#"
+            add_test(ShowOnly runner)
+            set_tests_properties(ShowOnly PROPERTIES
+                TIMEOUT 10
+                TIMEOUT_SIGNAL_NAME SIGINT
+                TIMEOUT_SIGNAL_GRACE_PERIOD 2.1
+                WORKING_DIRECTORY "C:\\work\\sub"
+                USER_DEFINED_A "A"
+            )
+        "#,
+        )?;
+        test_host.seed_file(Path::new("/work/runner.exe"), b"")?;
+        assert_eq!(invoke(test_host.clone(), &[flag.into()]), 0);
+        let stdout = test_host.stream_bytes(Stream::Stdout).to_string();
+        assert!(
+            !stdout.contains("TIMEOUT_SIGNAL_NAME"),
+            "{flag} leaked TIMEOUT_SIGNAL_NAME on Windows: {stdout}"
+        );
+        assert!(
+            !stdout.contains("TIMEOUT_SIGNAL_GRACE_PERIOD"),
+            "{flag} leaked TIMEOUT_SIGNAL_GRACE_PERIOD on Windows: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"C:/work/sub\""),
+            "{flag} did not normalize explicit WORKING_DIRECTORY on Windows: {stdout}"
+        );
+        assert!(
+            !stdout.contains("C:\\\\work"),
+            "{flag} left backslashes in WORKING_DIRECTORY: {stdout}"
+        );
+        assert!(stdout.contains("USER_DEFINED_A"), "{stdout}");
+    }
+    Ok(())
+}
+
+#[test]
+fn whitespace_parallel_level_env_enables_automatic_jobs_and_windows_missing_exe() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    host.env_set(b"CTEST_PARALLEL_LEVEL", Some(b" "));
+    host.env_set(b"__CTEST_FAKE_PROCESSOR_COUNT_FOR_TESTING", Some(b"1"));
+    let mut cli = crate::cli::parse(&[], host.as_ref()).map_err(std::io::Error::other)?;
+    cli.resolve_options(host.as_ref(), None)
+        .map_err(std::io::Error::other)?;
+    assert!(cli.options.jobs_automatic);
+    assert_eq!(cli.options.jobs, 2);
+
+    let win_host = Arc::new(PureHost::default());
+    let mut sys = win_host.system();
+    sys.sysname = "Windows".into();
+    win_host.set_system(sys)?;
+    win_host.seed_file(
+        Path::new("/work/CTestTestfile.cmake"),
+        b"add_test(missing_app missing_app_NOT_BUILT)\n",
+    )?;
+    assert_eq!(invoke(win_host.clone(), &["-C".into(), "Debug".into()]), 8);
+    let stdout = win_host.stream_bytes(Stream::Stdout).to_string();
+    assert!(
+        stdout.contains("missing_app_NOT_BUILT.exe\nDebug/missing_app_NOT_BUILT\nDebug/missing_app_NOT_BUILT.exe\n"),
+        "{stdout}"
+    );
     Ok(())
 }

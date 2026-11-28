@@ -1,5 +1,6 @@
 //! Generator registry and the External, Linux, macOS, Windows, and IFW generators.
 
+mod appimage;
 pub mod bundle;
 mod deb;
 pub mod dmg;
@@ -8,6 +9,7 @@ mod ifw;
 pub(crate) mod installer;
 mod linux;
 mod nsis;
+mod nuget;
 mod productbuild;
 mod rpm;
 mod wix;
@@ -86,6 +88,10 @@ fn create_for_platform(
     match name {
         b"DEB" => Some(Box::new(deb::Deb)),
         b"RPM" => Some(Box::new(rpm::Rpm)),
+        b"AppImage" if unrestricted || platform == HostPlatform::Linux => {
+            Some(Box::new(appimage::AppImage))
+        }
+        b"NuGet" => Some(Box::new(nuget::NuGet)),
         b"External" => Some(Box::new(external::ExternalGenerator)),
         b"DragNDrop" => Some(Box::new(dmg::DragNDropGenerator)),
         b"Bundle" => Some(Box::new(bundle::BundleGenerator)),
@@ -243,6 +249,7 @@ fn run_tool(
             stderr: Output::SharedWithStdout,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     )?;

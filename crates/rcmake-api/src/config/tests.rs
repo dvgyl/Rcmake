@@ -64,6 +64,7 @@ fn captures_overlay_writes_and_process_denials() -> Result<(), ApiError> {
         stderr: Output::Capture,
         timeout: None,
         tee: false,
+        default_error_mode: false,
     };
     assert!(session.run_bounded(&request, 100).is_err());
     assert!(host.metadata(&output, Follow::No).is_err());

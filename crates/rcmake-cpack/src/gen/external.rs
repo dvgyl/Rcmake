@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, truth};
 use rcmake_eval::Interp;
-use rcmake_host::{Host, WriteMode, path::to_native};
+use rcmake_host::{
+    Host, WriteMode,
+    path::{from_native_cmake, to_native},
+};
 use rcmake_json::{Value, write_compact};
 
 use crate::config::{CpackConfig, absolute, script};
@@ -79,7 +82,7 @@ pub(crate) fn run_script(
         if host.metadata(package, rcmake_host::Follow::Yes)?.kind != rcmake_host::FileKind::File {
             return Err(error(format!(
                 "Expected a package file at {}",
-                package.display()
+                from_native_cmake(package)
             )));
         }
     }

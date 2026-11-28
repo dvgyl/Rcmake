@@ -1468,6 +1468,7 @@ pub(crate) fn run_installer_tool(
         stderr: Output::SharedWithStdout,
         timeout,
         tee: false,
+        default_error_mode: false,
     };
     let mut output = Vec::new();
     let mut truncated = false;

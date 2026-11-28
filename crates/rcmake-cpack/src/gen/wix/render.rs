@@ -1036,9 +1036,7 @@ fn emit_shortcuts_bundle(
         (ShortcutKind::Desktop, "DESKTOP", "CM_DS", "_desktop"),
         (ShortcutKind::Startup, "STARTUP", "CM_SS", "_startup"),
     ] {
-        let should_emit =
-            !shortcuts.is_empty(kind) || (kind == ShortcutKind::StartMenu && emit_uninstall);
-        if !should_emit {
+        if shortcuts.is_empty(kind) {
             continue;
         }
         let (dir_ref, dir_id) = match kind {
@@ -1156,4 +1154,114 @@ fn emit_shortcuts_bundle(
         feats_w.end_element("FeatureRef")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_wix_config() -> WixConfig {
+        WixConfig {
+            version: WixVersion::V3,
+            install_scope: InstallScope::None,
+            architecture: "x64".to_owned(),
+            windows_host: true,
+            package_name: "MyLib".to_owned(),
+            package_version: "1.0.0".to_owned(),
+            vendor: "Vendor".to_owned(),
+            install_directory: "MyLib".to_owned(),
+            product_guid: "*".to_owned(),
+            upgrade_guid: "00000000-0000-0000-0000-000000000000".to_owned(),
+            license_rtf: "license.rtf".to_owned(),
+            product_icon: None,
+            ui_banner: None,
+            ui_dialog: None,
+            ui_ref: "WixUI_InstallDir".to_owned(),
+            root_feature_title: "MyLib".to_owned(),
+            root_feature_description: None,
+            root_folder_override: None,
+            skip_program_folder: false,
+            program_menu_folder: "MyLib".to_owned(),
+            cmake_package_registry: None,
+            cab_per_component: false,
+            component_keys_registry_path: "Software\\Vendor\\MyLib\\Components".to_owned(),
+            custom_xmlns: BTreeMap::new(),
+            wix_properties: BTreeMap::new(),
+            package_executables: Vec::new(),
+            desktop_links: BTreeSet::new(),
+            wix_extensions: BTreeSet::new(),
+            candle_extensions: BTreeSet::new(),
+            light_extensions: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn shortcuts_bundle_skips_empty_table_even_with_emit_uninstall() -> Result<(), CpackError> {
+        let cfg = test_wix_config();
+        let empty = ShortcutTable::default();
+        let mut patches = WixPatchSet::default();
+        let mut files_w = new_wix_writer(&cfg, false)?;
+        let mut feats_w = new_wix_writer(&cfg, false)?;
+        files_w.start_element("Fragment")?;
+        feats_w.start_element("Fragment")?;
+        emit_shortcuts_bundle(
+            &cfg,
+            "",
+            "ProductFeature",
+            &empty,
+            true,
+            &mut patches,
+            &mut files_w,
+            &mut feats_w,
+        )?;
+        files_w.end_element("Fragment")?;
+        files_w.end_element("Wix")?;
+        feats_w.end_element("Fragment")?;
+        feats_w.end_element("Wix")?;
+        let files_xml = files_w.finish()?;
+        let feats_xml = feats_w.finish()?;
+        assert!(!files_xml.contains("CM_SHORTCUT"), "{files_xml}");
+        assert!(!feats_xml.contains("CM_SHORTCUT"), "{feats_xml}");
+        Ok(())
+    }
+
+    #[test]
+    fn shortcuts_bundle_emits_registry_keypath_and_uninstall_when_populated()
+    -> Result<(), CpackError> {
+        let cfg = test_wix_config();
+        let mut table = ShortcutTable::default();
+        table.insert(
+            ShortcutKind::StartMenu,
+            "P_bin.app.exe".to_owned(),
+            ShortcutEntry {
+                label: "App".to_owned(),
+                working_directory_id: "CM_DP_bin".to_owned(),
+                file_id: "CM_FP_bin.app.exe".to_owned(),
+            },
+        );
+        let mut patches = WixPatchSet::default();
+        let mut files_w = new_wix_writer(&cfg, false)?;
+        let mut feats_w = new_wix_writer(&cfg, false)?;
+        files_w.start_element("Fragment")?;
+        feats_w.start_element("Fragment")?;
+        emit_shortcuts_bundle(
+            &cfg,
+            "",
+            "ProductFeature",
+            &table,
+            true,
+            &mut patches,
+            &mut files_w,
+            &mut feats_w,
+        )?;
+        files_w.end_element("Fragment")?;
+        files_w.end_element("Wix")?;
+        feats_w.end_element("Fragment")?;
+        feats_w.end_element("Wix")?;
+        let files_xml = files_w.finish()?;
+        assert!(files_xml.contains("Id=\"CM_SHORTCUT\""), "{files_xml}");
+        assert!(files_xml.contains("KeyPath=\"yes\""), "{files_xml}");
+        assert!(files_xml.contains("Id=\"UNINSTALL\""), "{files_xml}");
+        Ok(())
+    }
 }

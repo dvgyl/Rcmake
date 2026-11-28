@@ -624,6 +624,7 @@ fn run(host: &dyn Host, program: BString, cwd: &Path, args: Vec<BString>) {
                 stderr: Output::SharedWithStdout,
                 timeout: Some(Duration::from_secs(90)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

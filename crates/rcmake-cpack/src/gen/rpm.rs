@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use rcmake_base::{BString, hash::HashAlgo, truth};
+use rcmake_base::{BString, hash::HashAlgo};
 use rcmake_eval::Interp;
 use rcmake_host::{FileKind, path::to_native};
 
@@ -39,23 +39,18 @@ impl PackageGenerator for Rpm {
         };
         let mut passes = passes(&cfg, cx.grouping);
         let named = passes.iter().any(|pass| pass.name.is_some());
-        let main = cfg
-            .get(b"CPACK_RPM_MAIN_COMPONENT")
-            .filter(|name| !truth::is_off(name));
+        let main = cfg.get(b"CPACK_RPM_MAIN_COMPONENT");
         let main_pass = if let Some(main) = main.filter(|_| named) {
             let index = passes
                 .iter()
                 .position(|pass| {
-                    pass.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(main))
+                    !main.is_empty()
+                        && pass
+                            .name
+                            .as_ref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(main))
                 })
-                .ok_or_else(|| {
-                    error(format!(
-                        "CPackRPM: Main component {} was not found",
-                        BString::from(main)
-                    ))
-                })?;
+                .ok_or_else(|| error("CPACK_RPM_MAIN_COMPONENT set to non existing component."))?;
             let pass = passes.remove(index);
             passes.push(pass);
             true
@@ -63,9 +58,17 @@ impl PackageGenerator for Rpm {
             false
         };
         let combined = cfg.on(b"CPACK_RPM_DEBUGINFO_SINGLE_PACKAGE");
-        if combined && named && !main_pass && passes.len() > 1 {
+        let component_count = {
+            let mut components = BTreeSet::new();
+            let projects = cfg.list(b"CPACK_INSTALL_CMAKE_PROJECTS");
+            for [_, _, selection, _] in projects.as_chunks::<4>().0 {
+                components.extend(crate::stage::package_components(&cfg, selection));
+            }
+            components.len()
+        };
+        if combined && named && !main_pass && component_count > 1 {
             return Err(error(
-                "CPackRPM: CPACK_RPM_DEBUGINFO_SINGLE_PACKAGE requires CPACK_RPM_MAIN_COMPONENT",
+                "CPACK_RPM_MAIN_COMPONENT not set but it is mandatory with CPACK_RPM_DEBUGINFO_SINGLE_PACKAGE being set.",
             ));
         }
         let component_debug = |name: &[u8]| {
@@ -171,5 +174,101 @@ impl PackageGenerator for Rpm {
                 Ok(path)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_base::BString;
+    use rcmake_host::path::from_native_cmake;
+    use rcmake_host::{Host, Stream, WriteMode};
+
+    use crate::generators::create_unrestricted;
+    use crate::generators::tests::package_host;
+
+    fn run_rpm_component_case(extra_config: &str) -> (i32, String) {
+        let host = package_host();
+        let root = host.initial_cwd();
+        let build = root.join("build");
+        host.create_dir_all(&build).unwrap();
+        host.write(
+            &build.join("cmake_install.cmake"),
+            br#"if(CMAKE_INSTALL_COMPONENT STREQUAL "applications")
+  file(WRITE "${CMAKE_INSTALL_PREFIX}/foo/a.txt" "a")
+elseif(CMAKE_INSTALL_COMPONENT STREQUAL "headers")
+  file(WRITE "${CMAKE_INSTALL_PREFIX}/bar/b.txt" "b")
+endif()
+"#,
+            WriteMode::Truncate,
+        )
+        .unwrap();
+        let config = root.join("CPackConfig.cmake");
+        let build_str = from_native_cmake(&build);
+        host.write(
+            &config,
+            format!(
+                r#"set(CPACK_GENERATOR RPM)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_PACKAGE_NAME sample)
+set(CPACK_PACKAGE_VERSION "0.1.1")
+set(CPACK_PACKAGE_FILE_NAME "sample-0.1.1-Linux")
+set(CPACK_RPM_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL "applications;headers")
+set(CPACK_INSTALL_CMAKE_PROJECTS "{build_str};sample;ALL;/")
+{extra_config}
+"#
+            )
+            .as_bytes(),
+            WriteMode::Truncate,
+        )
+        .unwrap();
+        let argv = [
+            BString::from("cpack"),
+            BString::from("--config"),
+            from_native_cmake(&config),
+        ];
+        let code = crate::main_with_factory(&argv, host.clone(), create_unrestricted);
+        let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+        (code, stderr)
+    }
+
+    #[test]
+    fn empty_rpm_main_component_reports_non_existing_component() {
+        let (code, stderr) = run_rpm_component_case(r#"set(CPACK_RPM_MAIN_COMPONENT "")"#);
+        assert_eq!(code, 1);
+        assert!(
+            stderr.contains("CPACK_RPM_MAIN_COMPONENT set to non existing component."),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn single_debuginfo_without_main_component_reports_cmake_message() {
+        let (code, stderr) =
+            run_rpm_component_case(r#"set(CPACK_RPM_DEBUGINFO_SINGLE_PACKAGE ON)"#);
+        assert_eq!(code, 1);
+        assert!(
+            stderr.contains(
+                "CPack Error: CPACK_RPM_MAIN_COMPONENT not set but it is mandatory with CPACK_RPM_DEBUGINFO_SINGLE_PACKAGE being set."
+            ),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn single_debuginfo_grouped_two_components_still_requires_main_component() {
+        let (code, stderr) = run_rpm_component_case(
+            r#"set(CPACK_RPM_DEBUGINFO_SINGLE_PACKAGE ON)
+set(CPACK_COMPONENTS_GROUPING ONE_PER_GROUP)
+set(CPACK_COMPONENT_APPLICATIONS_GROUP shared)
+set(CPACK_COMPONENT_HEADERS_GROUP shared)"#,
+        );
+        assert_eq!(code, 1);
+        assert!(
+            stderr.contains(
+                "CPack Error: CPACK_RPM_MAIN_COMPONENT not set but it is mandatory with CPACK_RPM_DEBUGINFO_SINGLE_PACKAGE being set."
+            ),
+            "{stderr}"
+        );
     }
 }

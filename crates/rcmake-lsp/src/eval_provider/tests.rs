@@ -653,6 +653,7 @@ fn publishes_a_denial_hint_with_configure_diagnostics() -> TestResult {
             stderr: Output::Capture,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         assert!(host.run_bounded(&run, 4096).is_err());
         host.write(

@@ -111,6 +111,7 @@ fn probe(host: &dyn Host, program: &str, args: &[&str]) -> Option<Vec<u8>> {
         stderr: Output::Null,
         timeout: Some(Duration::from_secs(2)),
         tee: false,
+        default_error_mode: false,
     };
     let output = host.run(&request, &mut |_, _| {}).ok()?;
     matches!(output.results.as_slice(), [ProcessResult::Exited(0)]).then_some(output.stdout)

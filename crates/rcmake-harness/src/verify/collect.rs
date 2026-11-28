@@ -1679,6 +1679,7 @@ fn collect_ninja_dry_run(
             stderr: Output::Capture,
             timeout: Some(timeout),
             tee: false,
+            default_error_mode: false,
         };
         let run = match host.run_bounded(&req, MAX_NINJA_OUTPUT_BYTES) {
             Ok(res) => res,
@@ -1915,6 +1916,7 @@ fn validate_ninja_executable(
         stderr: Output::Capture,
         timeout: Some(ver_timeout),
         tee: false,
+        default_error_mode: false,
     };
     let ver = host
         .run_bounded(&ver_req, 64 * 1024)
@@ -1945,6 +1947,7 @@ fn validate_ninja_executable(
         stderr: Output::Capture,
         timeout: Some(tools_timeout),
         tee: false,
+        default_error_mode: false,
     };
     let tools = host
         .run_bounded(&tools_req, 64 * 1024)

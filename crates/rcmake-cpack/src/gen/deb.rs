@@ -268,7 +268,7 @@ fn build(
         write_control(host, &controls, &mut control_inputs, name, &contents, 0o644)?;
     }
     if !debug {
-        extras(host, vars, &controls, &mut control_inputs)?;
+        extras(host, vars, payload, &controls, &mut control_inputs)?;
     }
     let control_name = format!("control.tar{control_suffix}");
     let control_tar = work.path.join(&control_name);
@@ -319,6 +319,7 @@ fn write_control(
 fn extras(
     host: &dyn Host,
     cfg: &CpackConfig,
+    payload: &Path,
     root: &Path,
     paths: &mut Vec<PathBuf>,
 ) -> Result<(), CpackError> {
@@ -378,7 +379,11 @@ fn extras(
         {
             host.write_out(
                 Stream::Stderr,
-                format!("CPack Warning: Cannot copy Debian control file: {file}\n").as_bytes(),
+                format!(
+                    "CPack Warning: Adding file to tar:\n#top level directory: {}\n#missing file: {file}\n",
+                    from_native_cmake(payload)
+                )
+                .as_bytes(),
             );
             continue;
         }
@@ -430,4 +435,31 @@ fn member(
         host.write(ar, b"\n", WriteMode::Append)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcmake_host::{PureHost, Stream};
+
+    #[test]
+    fn missing_extra_control_file_warns_in_cmake_tar_format() {
+        let host = PureHost::default();
+        let payload = Path::new("/work/_CPack_Packages/Linux/DEB/extra-0.1.1-Linux/bas");
+        let controls = Path::new("/work/control");
+        host.create_dir_all(controls).unwrap();
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            BString::from("GEN_CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA"),
+            BString::from("/work/conffiles"),
+        );
+        let cfg = CpackConfig { vars };
+        let mut inputs = Vec::new();
+        extras(&host, &cfg, payload, controls, &mut inputs).unwrap();
+        let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+        assert_eq!(
+            stderr,
+            "CPack Warning: Adding file to tar:\n#top level directory: /work/_CPack_Packages/Linux/DEB/extra-0.1.1-Linux/bas\n#missing file: /work/conffiles\n"
+        );
+    }
 }

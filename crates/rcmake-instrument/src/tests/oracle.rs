@@ -87,6 +87,7 @@ fn run(host: &dyn Host, cwd: &Path, args: &[BString], code: i32) -> Vec<u8> {
                 stderr: Output::Capture,
                 timeout: Some(Duration::from_secs(30)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

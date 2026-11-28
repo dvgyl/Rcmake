@@ -184,7 +184,10 @@ impl<'a> Report<'a> {
                 ));
             }
         }
-        self.write(format_args!("Test project {}\n", path.display()));
+        self.write(format_args!(
+            "Test project {}\n",
+            path::from_native_cmake(path)
+        ));
     }
 
     pub(crate) fn jobserver_connected(&self) {
@@ -207,7 +210,7 @@ impl<'a> Report<'a> {
                     "\n{}: Test command: {command}\n{}: Working Directory: {}\n",
                     test.number,
                     test.number,
-                    test.working_directory().display()
+                    path::from_native_cmake(&test.working_directory())
                 ));
                 let labels = labels(test);
                 if !labels.is_empty() {
@@ -238,6 +241,16 @@ impl<'a> Report<'a> {
 
     fn missing_command(&self, test: &PlannedTest) {
         let program = path::to_native(&test.command.program);
+        let windows = self.host.system().sysname.starts_with(b"Windows");
+        let with_exe = |candidate: &BString| -> BString {
+            if windows {
+                let mut exe = candidate.clone();
+                exe.extend_from_slice(b".exe");
+                exe
+            } else {
+                candidate.clone()
+            }
+        };
         self.write(format_args!(
             "Could not find executable {}\nLooked in the following places:\n",
             test.command.program
@@ -247,13 +260,11 @@ impl<'a> Report<'a> {
             .ok()
             .filter(|path| !path.as_os_str().is_empty());
         for base in std::iter::once(program.as_path()).chain(without_root) {
-            self.write(format_args!("{}\n{}\n", base.display(), base.display()));
+            let base_str = path::from_native_cmake(base);
+            self.write(format_args!("{base_str}\n{}\n", with_exe(&base_str)));
             for candidate in configuration_candidates(base, self.options.config.as_ref()) {
-                self.write(format_args!(
-                    "{}\n{}\n",
-                    candidate.display(),
-                    candidate.display()
-                ));
+                let cand_str = path::from_native_cmake(&candidate);
+                self.write(format_args!("{cand_str}\n{}\n", with_exe(&cand_str)));
             }
         }
     }
@@ -296,7 +307,7 @@ impl<'a> Report<'a> {
             self.write(format_args!(
                 "\n{}: Working Directory: {}\n",
                 test.number,
-                request.cwd.display()
+                path::from_native_cmake(&request.cwd)
             ));
             if let Some((_, profile)) = request
                 .env
@@ -389,11 +400,7 @@ impl<'a> Report<'a> {
 
         let working_directory = test.working_directory();
         let setting = test.property(b"WORKING_DIRECTORY");
-        let directory_error = match self.host.metadata(&working_directory, Follow::Yes) {
-            Ok(entry) if entry.kind != FileKind::Dir => Some("Not a directory".into()),
-            Err(error) => Some(error.os_message),
-            _ => None,
-        };
+        let directory_error = directory_error_reason(self.host, &working_directory);
         if let Some(error) = environment_error(detail) {
             self.emit(
                 Stream::Stderr,
@@ -620,7 +627,7 @@ fn failure_message(dir: &Path, output_on_failure: bool) -> String {
     }
     format!(
         "Errors while running CTest\nOutput from these tests are in: {}\nUse \"--rerun-failed --output-on-failure\" to re-run the failed cases verbosely.\n",
-        dir.join("Testing/Temporary/LastTest.log").display()
+        path::from_native_cmake(&dir.join("Testing/Temporary/LastTest.log"))
     )
 }
 
@@ -703,7 +710,7 @@ fn resolved_command(
     {
         let file = test.directory.join(candidate);
         if exists(&file) {
-            command.program = path::from_native(&file);
+            command.program = path::from_native_cmake(&file);
             return Some(command);
         }
     }
@@ -713,7 +720,7 @@ fn resolved_command(
     for dir in std::env::split_paths(&path::to_native(&host.env_get(b"PATH").unwrap_or_default())) {
         let file = test.directory.join(dir).join(&program);
         if exists(&file) {
-            command.program = path::from_native(&file);
+            command.program = path::from_native_cmake(&file);
             return Some(command);
         }
     }
@@ -775,6 +782,35 @@ pub(crate) fn format_date(host: &dyn Host, time: FileTime, utc: bool, format: &s
         stamp.strftime(format).to_string()
     } else {
         local.strftime(format).to_string()
+    }
+}
+
+fn directory_error_reason(host: &dyn Host, dir: &Path) -> Option<String> {
+    match host.metadata(dir, Follow::Yes) {
+        Ok(entry) if entry.kind != FileKind::Dir => Some("Not a directory".into()),
+        Err(error) if error.kind == std::io::ErrorKind::NotFound => {
+            Some("No such file or directory".into())
+        }
+        Err(error) => Some(error.os_message),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod directory_error_tests {
+    use std::path::Path;
+
+    use rcmake_host::PureHost;
+
+    use super::directory_error_reason;
+
+    #[test]
+    fn missing_working_directory_maps_to_posix_enoent_message() {
+        let host = PureHost::default();
+        assert_eq!(
+            directory_error_reason(&host, Path::new("/nonexistent/working_dir")).as_deref(),
+            Some("No such file or directory")
+        );
     }
 }
 

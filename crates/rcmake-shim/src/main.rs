@@ -1,8 +1,8 @@
 //! Tiny dependency-free launcher shim for Windows release packaging.
 //!
 //! Copies of this executable are shipped as `cmake.exe`, `ctest.exe`, `cpack.exe`,
-//! and `rcmake-lsp.exe` alongside the single full `rcmake.exe` engine binary so
-//! release archives do not duplicate the main executable five times.
+//! `ccmake.exe`, and `rcmake-lsp.exe` alongside the single full `rcmake.exe` engine
+//! binary so release archives do not duplicate the main executable six times.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::disallowed_methods, clippy::exit)]
@@ -12,7 +12,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
-const ALLOWED_TOOLS: [&str; 4] = ["cmake", "ctest", "cpack", "rcmake-lsp"];
+const ALLOWED_TOOLS: [&str; 5] = ["cmake", "ctest", "cpack", "ccmake", "rcmake-lsp"];
 const SHIM_TOOL_FLAG_PREFIX: &str = "--rcmake-internal-shim-tool=";
 const SHIM_ARGV0_FLAG: &str = "--rcmake-internal-shim-argv0";
 
@@ -73,7 +73,7 @@ fn main() {
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| exe.to_string_lossy());
         write_stderr(&format!(
-            "rcmake-shim: unsupported launcher name '{name}'; expected cmake, ctest, cpack, or rcmake-lsp\n"
+            "rcmake-shim: unsupported launcher name '{name}'; expected cmake, ctest, cpack, ccmake, or rcmake-lsp\n"
         ));
         std::process::exit(1);
     };
@@ -137,6 +137,9 @@ mod tests {
             ("/opt/rcmake/bin/CTest.exe", Some("ctest")),
             ("cpack", Some("cpack")),
             ("CPACK.exe", Some("cpack")),
+            ("ccmake", Some("ccmake")),
+            ("CCMake.EXE", Some("ccmake")),
+            ("/opt/rcmake/bin/ccmake.exe", Some("ccmake")),
             ("rcmake-lsp", Some("rcmake-lsp")),
             ("RCMAKE-LSP.EXE", Some("rcmake-lsp")),
         ] {
@@ -152,7 +155,9 @@ mod tests {
             "rcmake-shim",
             "rcmake-shim.exe",
             "rcmake-verify.exe",
-            "ccmake",
+            "ccmake.com",
+            "ccmake-gui.exe",
+            "cmake-gui.exe",
             "cmake.bak",
             "cmake.exe.old",
             "evil",

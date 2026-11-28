@@ -194,7 +194,11 @@ fn execute_script(
     {
         host.write_out(
             Stream::Stderr,
-            format!("CMake Error: Cannot find file: {}\n", file.display()).as_bytes(),
+            format!(
+                "CMake Error: Cannot find file: {}\n",
+                path::from_native_cmake(&file)
+            )
+            .as_bytes(),
         );
         return Ok(ScriptOutcome::status(1));
     }
@@ -334,8 +338,32 @@ fn register(registry: &mut Registry) {
 }
 
 fn absolute(cwd: &Path, raw: &[u8]) -> PathBuf {
-    let file = path::from_native_cmake(&cwd.join(path::to_native(raw)));
+    let native = path::to_native(raw);
+    let joined = if native.has_root() {
+        native
+    } else {
+        cwd.join(native)
+    };
+    let file = path::from_native_cmake(&joined);
     path::to_native(&Lexical::new(&file).normalize())
+}
+
+#[cfg(test)]
+mod path_tests {
+    use std::path::Path;
+
+    use rcmake_host::path;
+
+    use super::absolute;
+
+    #[test]
+    fn rooted_preset_path_is_not_prefixed_by_cwd() {
+        let resolved = absolute(Path::new("/work/src"), b"/nonexistent/path/presets.json");
+        assert_eq!(
+            path::from_native_cmake(&resolved),
+            "/nonexistent/path/presets.json"
+        );
+    }
 }
 
 fn error(message: impl Into<BString>) -> CmdError {
@@ -733,6 +761,7 @@ pub(crate) fn run_process(
             stderr: Output::Capture,
             timeout: Some(PROCESS_TIMEOUT),
             tee,
+            default_error_mode: false,
         },
         &mut |stream, bytes| host.write_out(stream, bytes),
     )
@@ -780,7 +809,7 @@ fn ctest_empty_binary_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRes
             None,
             format!(
                 "Did not remove the binary directory:\n {}\nbecause:\n path does not contain an existing CMakeCache.txt file",
-                dir.display()
+                path::from_native_cmake(&dir)
             )
             .into(),
         );
@@ -811,7 +840,11 @@ fn ctest_read_custom_files(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         {
             cx.host().write_out(
                 Stream::Stderr,
-                format!("Problem reading custom configuration: {}\n", file.display()).as_bytes(),
+                format!(
+                    "Problem reading custom configuration: {}\n",
+                    path::from_native_cmake(&file)
+                )
+                .as_bytes(),
             );
             return Err(CmdError::Reported);
         }

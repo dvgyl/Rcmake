@@ -89,7 +89,31 @@ fn next_value<'a>(args: &mut Arguments<'a>) -> Option<&'a [u8]> {
 }
 
 pub(crate) fn parse(args: &[BString], host: &dyn Host) -> Result<Invocation, String> {
+    if matches!(
+        args.first().map(|arg| arg.as_slice()),
+        Some(b"--start-instrumentation" | b"--wait-and-collect")
+    ) {
+        return Ok(Invocation {
+            mode: Mode::Instrument {
+                args: args.to_vec(),
+                command: Vec::new(),
+            },
+            ..Invocation::default()
+        });
+    }
     if let Some(launcher) = args.strip_prefix(&[BString::from("--instrument")]) {
+        if matches!(
+            launcher.first().map(|arg| arg.as_slice()),
+            Some(b"--start-instrumentation" | b"--wait-and-collect")
+        ) {
+            return Ok(Invocation {
+                mode: Mode::Instrument {
+                    args: launcher.to_vec(),
+                    command: Vec::new(),
+                },
+                ..Invocation::default()
+            });
+        }
         let Some(split) = launcher.iter().position(|arg| arg == "--") else {
             return Err("ctest --launch: this mode is for internal CTest use only".into());
         };
@@ -712,7 +736,7 @@ impl Invocation {
         };
         let jobs = self.execution.jobs.or_else(|| {
             let raw = env(b"CTEST_PARALLEL_LEVEL")?;
-            parse_jobs(b"--parallel", Some(&raw)).ok()
+            parse_jobs(b"--parallel", Some(raw.trim_ascii())).ok()
         });
         self.options.jobs_automatic = matches!(jobs, Some(TestJobs::Automatic));
         self.options.jobs = match jobs {

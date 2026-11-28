@@ -62,7 +62,7 @@ impl<'a> Recorder<'a> {
         let snippet = Snippet {
             role: SnippetRole::CTest,
             command: command_line(command),
-            working_dir: path::from_native(&self.build),
+            working_dir: path::from_native_cmake(&self.build),
             result: interrupt_signal.is_none().then_some(i64::from(code)),
             time_start: millis(sample.time),
             duration: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
@@ -135,7 +135,7 @@ impl<'a> Recorder<'a> {
         let snippet = Snippet {
             role: SnippetRole::Test,
             command: command_line(&command),
-            working_dir: path::from_native(&request.cwd),
+            working_dir: path::from_native_cmake(&request.cwd),
             result,
             time_start: millis(sample.time),
             duration: elapsed.as_millis().try_into().unwrap_or(u64::MAX),

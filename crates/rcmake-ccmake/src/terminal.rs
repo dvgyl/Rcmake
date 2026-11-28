@@ -3,6 +3,15 @@
 #[cfg(unix)]
 pub mod native;
 pub mod scripted;
+#[cfg(any(windows, test))]
+pub mod windows;
+
+/// Native terminal backend of the current platform.
+#[cfg(unix)]
+pub use native::NativeTerminal;
+/// Native terminal backend of the current platform.
+#[cfg(windows)]
+pub use windows::NativeTerminal;
 
 use std::fmt;
 

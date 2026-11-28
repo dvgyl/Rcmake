@@ -53,6 +53,7 @@ fn request(
         stderr: output,
         timeout,
         tee: capture,
+        default_error_mode: false,
     })
 }
 
@@ -223,6 +224,33 @@ fn comma_list(value: &[u8]) -> Vec<BString> {
         .collect()
 }
 
+fn output_file_list(bytes: &[u8]) -> Vec<BString> {
+    if bytes.contains(&b'\0') {
+        bytes
+            .split(|&byte| byte == b'\0')
+            .filter(|item| !item.is_empty())
+            .map(BString::from)
+            .collect()
+    } else if bytes.contains(&b'\n') {
+        bytes
+            .split(|&byte| byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .filter(|item| !item.is_empty())
+            .map(BString::from)
+            .collect()
+    } else {
+        comma_list(bytes)
+    }
+}
+
+fn normalize_cmake_path(value: BString, windows: bool) -> BString {
+    if windows {
+        rcmake_base::path_lex::cmake_style(&value)
+    } else {
+        value
+    }
+}
+
 fn run(
     host: &dyn Host,
     build_dir: &Path,
@@ -292,6 +320,15 @@ fn run(
             }
         }
     });
+    let windows = host.system().sysname.starts_with(b"Windows");
+    let outputs = metadata
+        .outputs
+        .into_iter()
+        .map(|output| normalize_cmake_path(output, windows))
+        .collect();
+    let source = metadata
+        .source
+        .map(|source| normalize_cmake_path(source, windows));
     let snippet = Snippet {
         role,
         command,
@@ -300,8 +337,8 @@ fn run(
         time_start,
         duration,
         target: metadata.target,
-        outputs: metadata.outputs,
-        source: metadata.source,
+        outputs,
+        source,
         language: metadata.language,
         test_name: metadata.test_name,
         config: metadata.config,
@@ -393,13 +430,16 @@ fn run_launcher_with_policy(
     argv: &[BString],
     ctest: bool,
 ) -> Result<i32, InstrumentError> {
-    let mut args = argv.iter().peekable();
-    if argv
-        .first()
-        .is_some_and(|arg| arg.as_slice() == b"--instrument")
-    {
-        args.next();
+    let rest = argv
+        .strip_prefix(&[BString::from("--instrument")])
+        .unwrap_or(argv);
+    if let Some(sub_args) = rest.strip_prefix(&[BString::from("--start-instrumentation")]) {
+        return crate::build_daemon::start(host, sub_args);
     }
+    if let Some(sub_args) = rest.strip_prefix(&[BString::from("--wait-and-collect")]) {
+        return crate::build_daemon::wait_and_collect(host, sub_args);
+    }
+    let mut args = rest.iter().peekable();
     let mut metadata = Metadata {
         ctest,
         ..Metadata::default()
@@ -444,7 +484,9 @@ fn run_launcher_with_policy(
             b"--output-path" => metadata.outputs.push(value.clone()),
             b"--output-as-file-name" => {
                 let file = absolute(host, &path::to_native(value));
-                metadata.outputs = comma_list(&read_bytes(host, &file)?);
+                metadata
+                    .outputs
+                    .extend(output_file_list(&read_bytes(host, &file)?));
             }
             b"--target-labels" => metadata.labels.extend(comma_list(value)),
             _ => {

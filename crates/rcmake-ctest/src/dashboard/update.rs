@@ -185,6 +185,7 @@ fn collect(
                     stderr: Output::Capture,
                     timeout: Some(Duration::from_secs(30 * 60)),
                     tee: false,
+                    default_error_mode: false,
                 },
                 16 * 1024 * 1024,
             )

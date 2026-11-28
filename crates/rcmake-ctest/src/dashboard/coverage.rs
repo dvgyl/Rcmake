@@ -202,6 +202,7 @@ fn gcov(
                     stderr: Output::Capture,
                     timeout: Some(Duration::from_secs(60)),
                     tee: false,
+                    default_error_mode: false,
                 },
                 1024 * 1024,
             )

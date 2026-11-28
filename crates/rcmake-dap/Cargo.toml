@@ -16,6 +16,9 @@ rcmake-host.workspace = true
 rcmake-json.workspace = true
 rcmake-model.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "~1.48.0", default-features = false, features = ["net", "rt", "sync", "time"] }
+
 [lints]
 workspace = true
 

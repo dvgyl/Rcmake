@@ -281,14 +281,21 @@ fn run_cli_tests(
                 .as_ref()
                 .is_err_and(|error| error.kind == std::io::ErrorKind::NotFound))
     {
-        let message = metadata
-            .err()
-            .map_or_else(|| "Not a directory".into(), |error| error.os_message);
+        let message = metadata.err().map_or_else(
+            || "Not a directory".into(),
+            |error| {
+                if error.kind == std::io::ErrorKind::NotFound {
+                    "No such file or directory".into()
+                } else {
+                    error.os_message
+                }
+            },
+        );
         host.write_out(
             Stream::Stderr,
             format!(
                 "Failed to change working directory to \"{}\": {message}\n",
-                dir.display()
+                rcmake_host::path::from_native_cmake(dir)
             )
             .as_bytes(),
         );
@@ -316,7 +323,7 @@ fn run_cli_tests(
             Stream::Stderr,
             format!(
                 "Cannot find file: {}\n",
-                dir.join("DartConfiguration.tcl").display()
+                rcmake_host::path::from_native_cmake(&dir.join("DartConfiguration.tcl"))
             )
             .as_bytes(),
         );
@@ -342,7 +349,11 @@ fn run_cli_tests(
             if !invocation.options.quiet {
                 host.write_out(
                     Stream::Stdout,
-                    format!("Test project {}\n", dir.display()).as_bytes(),
+                    format!(
+                        "Test project {}\n",
+                        rcmake_host::path::from_native_cmake(dir)
+                    )
+                    .as_bytes(),
                 );
             }
             host.write_out(

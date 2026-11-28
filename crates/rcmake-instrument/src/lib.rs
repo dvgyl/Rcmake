@@ -12,21 +12,28 @@
 //! - [`snippet`]: write snippet and index files.
 //! - [`hooks`]: run indexing and callbacks at a hook.
 //! - [`launcher`]: wrap a command and record its snippet (`ctest --instrument`).
+//! - [`interrupt`]: catch user interrupts (`SIGINT`) around instrumented commands.
 //! - [`trace`]: write the Google trace file.
 
 #![forbid(unsafe_code)]
 
 use rcmake_base::BString;
 
+mod build_daemon;
 mod files;
 mod system;
 
 pub mod hooks;
+pub mod interrupt;
 pub mod launcher;
 pub mod metrics;
 pub mod query;
 pub mod snippet;
 pub mod trace;
+
+/// Environment variable set while `cmake --build` is active so native make-program
+/// start-instrumentation hooks (`preBuild` / `postBuild`) do not fire under `cmake --build`.
+pub const IN_CMAKE_BUILD_ENV: &[u8] = b"_RCMAKE_INSTRUMENT_IN_CMAKE_BUILD";
 
 /// Return the signal from the internal instrumentation test environment.
 #[doc(hidden)]

@@ -2454,6 +2454,7 @@ set(CPACK_COMMAND_PRODUCTBUILD "{prod}")
                 stderr: rcmake_host::Output::SharedWithStdout,
                 timeout: Some(std::time::Duration::from_secs(30)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

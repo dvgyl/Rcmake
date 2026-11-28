@@ -28,6 +28,10 @@ pub(crate) enum SymlinkPolicy {
     /// Preserve payload symlinks whose targets (including chained links) remain strictly
     /// within the validated root.
     PreserveContained,
+    /// Preserve leaf payload symlinks literally without following them (used by archive
+    /// generators that record symlink link-targets without dereferencing). Parent
+    /// directories are still strictly required to be real directories inside the root.
+    PreserveLiteral,
     /// Reject any symbolic link inside the payload tree (used for formats/targets that do
     /// not preserve POSIX symlinks, or for generated control trees).
     Reject,
@@ -197,15 +201,20 @@ pub(crate) fn verify_contained_path(
             continue;
         }
         match meta.kind {
-            FileKind::Symlink => {
-                if symlink_policy == SymlinkPolicy::Reject {
+            FileKind::Symlink => match symlink_policy {
+                SymlinkPolicy::Reject => {
                     return Err(error(format!(
                         "Symbolic link is not permitted in staged payload: {}",
                         current.display()
                     )));
                 }
-                validate_contained_symlink(host, root, canon_root, &current)?;
-            }
+                SymlinkPolicy::PreserveContained => {
+                    validate_contained_symlink(host, root, canon_root, &current)?;
+                }
+                SymlinkPolicy::PreserveLiteral => {
+                    validate_literal_symlink(host, &current)?;
+                }
+            },
             FileKind::Dir | FileKind::File => {
                 let canon = host.canonicalize_fresh(&current)?;
                 if !canon.starts_with(canon_root) {
@@ -228,6 +237,19 @@ pub(crate) fn verify_contained_path(
         "Empty CPack relative path: {}",
         rel.display()
     )))
+}
+
+fn validate_literal_symlink(host: &dyn Host, link_path: &Path) -> Result<PathBuf, CpackError> {
+    let target = host.read_link(link_path)?;
+    let raw = from_native(&target);
+    if raw.is_empty() || raw.contains(&0) {
+        return Err(error(format!(
+            "Invalid CPack payload symbolic link target: {} -> {}",
+            link_path.display(),
+            target.display()
+        )));
+    }
+    Ok(target)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -625,15 +647,20 @@ fn validate_dir_walk(
                     )));
                 }
             }
-            FileKind::Symlink => {
-                if symlink_policy == SymlinkPolicy::Reject {
+            FileKind::Symlink => match symlink_policy {
+                SymlinkPolicy::Reject => {
                     return Err(error(format!(
                         "Symbolic link is not permitted in staged payload: {}",
                         entry_path.display()
                     )));
                 }
-                validate_contained_symlink(host, root, canon_root, &entry_path)?;
-            }
+                SymlinkPolicy::PreserveContained => {
+                    validate_contained_symlink(host, root, canon_root, &entry_path)?;
+                }
+                SymlinkPolicy::PreserveLiteral => {
+                    validate_literal_symlink(host, &entry_path)?;
+                }
+            },
             FileKind::Other => {
                 return Err(error(format!(
                     "Unsupported special file in CPack staging tree: {}",
@@ -740,7 +767,7 @@ pub(crate) fn merge_component(
     source: &Path,
     dest: &Path,
 ) -> Result<(), CpackError> {
-    copy_checked_tree(host, source, dest, SymlinkPolicy::PreserveContained, false)
+    copy_checked_tree(host, source, dest, SymlinkPolicy::PreserveLiteral, false)
 }
 
 /// Copy a validated tree from `source` into `dest`, checking every parent and payload
@@ -879,7 +906,7 @@ pub(crate) fn merge_recorded(
         expected_canon_source,
         members,
         dest,
-        SymlinkPolicy::PreserveContained,
+        SymlinkPolicy::PreserveLiteral,
         false,
     )
 }
@@ -940,7 +967,18 @@ pub(crate) fn merge_recorded_checked(
                 )?;
             }
             FileKind::Symlink => {
-                let target = validate_contained_symlink(host, source, &canon_source, &input)?;
+                let target = match symlink_policy {
+                    SymlinkPolicy::Reject => {
+                        return Err(error(format!(
+                            "Symbolic link is not permitted in staged payload: {}",
+                            input.display()
+                        )));
+                    }
+                    SymlinkPolicy::PreserveContained => {
+                        validate_contained_symlink(host, source, &canon_source, &input)?
+                    }
+                    SymlinkPolicy::PreserveLiteral => validate_literal_symlink(host, &input)?,
+                };
                 clear_output_file(host, &output)?;
                 host.symlink(&target, &output)?;
             }
@@ -1030,13 +1068,18 @@ fn copy_tree(
             }
             FileKind::Symlink => {
                 let target = if let Some((root, canon_root, policy)) = containment {
-                    if policy == SymlinkPolicy::Reject {
-                        return Err(error(format!(
-                            "Symbolic link is not permitted in staged payload: {}",
-                            input.display()
-                        )));
+                    match policy {
+                        SymlinkPolicy::Reject => {
+                            return Err(error(format!(
+                                "Symbolic link is not permitted in staged payload: {}",
+                                input.display()
+                            )));
+                        }
+                        SymlinkPolicy::PreserveContained => {
+                            validate_contained_symlink(host, root, canon_root, &input)?
+                        }
+                        SymlinkPolicy::PreserveLiteral => validate_literal_symlink(host, &input)?,
                     }
-                    validate_contained_symlink(host, root, canon_root, &input)?
                 } else {
                     host.read_link(&input)?
                 };
@@ -1094,7 +1137,7 @@ fn existing_component_entry(
     }
     Err(error(format!(
         "ERROR The data in files with the same filename is different: {}",
-        input.strip_prefix(root).unwrap_or(input).display()
+        from_native_cmake(input.strip_prefix(root).unwrap_or(input))
     )))
 }
 
@@ -1119,4 +1162,60 @@ fn same_file_contents(
         offset += len;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use rcmake_host::{Host, PureHost, WriteMode};
+
+    use super::*;
+
+    #[test]
+    fn archive_merge_preserves_matching_absolute_symlinks_and_detects_conflicts() {
+        let host = PureHost::default();
+        let c1 = Path::new("/work/stage/c1");
+        let c2 = Path::new("/work/stage/c2");
+        let merged = Path::new("/work/merged");
+        host.create_dir_all(&c1.join("files")).unwrap();
+        host.create_dir_all(&c2.join("files")).unwrap();
+        host.create_dir_all(merged).unwrap();
+
+        host.write(&c1.join("files/1.txt"), b"same", WriteMode::Truncate)
+            .unwrap();
+        host.write(&c2.join("files/1.txt"), b"same", WriteMode::Truncate)
+            .unwrap();
+        host.symlink(Path::new("/abs/build/2.txt"), &c1.join("files/symlink2"))
+            .unwrap();
+        host.symlink(Path::new("/abs/build/2.txt"), &c2.join("files/symlink2"))
+            .unwrap();
+
+        merge_component(&host, c1, merged).unwrap();
+        merge_component(&host, c2, merged).unwrap();
+        assert_eq!(
+            host.read_link(&merged.join("files/symlink2")).unwrap(),
+            Path::new("/abs/build/2.txt")
+        );
+
+        let c3 = Path::new("/work/stage/c3");
+        host.create_dir_all(&c3.join("files")).unwrap();
+        host.symlink(Path::new("/abs/build/1.txt"), &c3.join("files/symlink2"))
+            .unwrap();
+        let err = merge_component(&host, c3, merged).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ERROR The data in files with the same filename is different: files/symlink2"
+        );
+
+        let c4 = Path::new("/work/stage/c4");
+        host.create_dir_all(&c4.join("files")).unwrap();
+        host.write(&c4.join("files/1.txt"), b"conflict", WriteMode::Truncate)
+            .unwrap();
+        let err = merge_component(&host, c4, merged).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ERROR The data in files with the same filename is different: files/1.txt"
+        );
+    }
 }

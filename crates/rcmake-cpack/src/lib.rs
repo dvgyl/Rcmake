@@ -351,7 +351,7 @@ fn run_with_factory(
                     Stream::Stderr,
                     format!(
                         "CPack Warning: CPACK_PROJECT_CONFIG_FILE not found: {}\n",
-                        path.display()
+                        from_native_cmake(&path)
                     )
                     .as_bytes(),
                 );
@@ -928,11 +928,17 @@ fn publish(
             committed.push((dest_path, backup));
         }
 
-        log(host, format!("- package: {} generated.", dest.display()));
+        log(
+            host,
+            format!("- package: {} generated.", from_native_cmake(&dest)),
+        );
         for checksum_dest in &checksum_dests {
             log(
                 host,
-                format!("- checksum file: {} generated.", checksum_dest.display()),
+                format!(
+                    "- checksum file: {} generated.",
+                    from_native_cmake(checksum_dest)
+                ),
             );
         }
     }

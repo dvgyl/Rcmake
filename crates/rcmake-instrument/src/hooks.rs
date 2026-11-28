@@ -100,7 +100,7 @@ fn pending(host: &dyn Host, data: &Path) -> Result<(Vec<BString>, bool), Instrum
     let mut result = Vec::new();
     for prefix in ["", "v1"] {
         for name in json_files(host, &data.join(prefix))? {
-            let name = path::from_native(&Path::new(prefix).join(path::to_native(&name)));
+            let name = path::from_native_cmake(&Path::new(prefix).join(path::to_native(&name)));
             if indexed.contains(&name) {
                 continue;
             }
@@ -128,8 +128,8 @@ fn write_batch(
 ) -> Result<(PathBuf, Vec<BString>), InstrumentError> {
     let (snippets, _) = pending(host, data)?;
     let mut index = IndexFile {
-        build_dir: path::from_native(build),
-        data_dir: path::from_native(data),
+        build_dir: path::from_native_cmake(build),
+        data_dir: path::from_native_cmake(data),
         hook: hook.as_str().into(),
         snippets,
         trace: None,
@@ -153,7 +153,7 @@ fn write_batch(
             &format!("trace-{suffix}"),
             &trace,
         )?;
-        index.trace = file.strip_prefix(data).ok().map(path::from_native);
+        index.trace = file.strip_prefix(data).ok().map(path::from_native_cmake);
     }
     let file = match publish_at(
         host,
@@ -223,7 +223,7 @@ pub fn run_hook(host: &dyn Host, build_dir: &Path, hook: Hook) -> Result<(), Ins
     };
     for callback in queries.iter().flat_map(|query| &query.callbacks) {
         let result = callback_arguments(callback).and_then(|mut command| {
-            command.push(path::from_native(&index));
+            command.push(path::from_native_cmake(&index));
             execute(
                 host,
                 host.initial_cwd(),
