@@ -151,7 +151,7 @@ The pinned CMake 4.5.1 binary is the reference oracle. Only `rcmake-harness` (in
 | 2 | Recorded CLI and script cases (`rcmake-harness`) | Byte-exact stdout, stderr, generated files, and exit code after path normalization |
 | 3 | Upstream `Tests/RunCMake` (`runcmake_eval.py`) | Same pass or fail outcome and diagnostic matches across 3 OSes |
 | 4 | Independent black-box suite (`independent_verify.py`) | All 679 checks across 20 scenarios pass and match on both binaries |
-| 5 | 10 large C++ projects (`corpus_eval.py`) | L1 configure and stderr parity, plus L2 cache, Ninja graph, and File API parity |
+| 5 | 10 large C++ projects (`large_projects_local.py`) | L1 configure diagnostics, cache, File API, and graph edges, plus L2 Ninja dry-run commands |
 | 6 | Fuzzing and ecosystem (`rcmake-fuzz`, `ecosystem_eval.py`, `vcpkg`) | Zero panics across 14 parsers and package-manager build parity |
 | 7 | Sealed 240-repository unseen holdout (`unseen_eval.py`) | Aggregate parity measured once on the frozen release binary |
 

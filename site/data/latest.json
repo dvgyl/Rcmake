@@ -1,7 +1,7 @@
 {
   "$schema": "./dashboard.schema.json",
   "schemaVersion": 1,
-  "generatedAt": "2026-11-28T05:02:16Z",
+  "generatedAt": "2026-11-28T05:20:51Z",
   "commit": "2a16da12e77c7d0c982fbe075db05873b9785e9e",
   "rcmakeVersion": "0.2.1",
   "targetCmakeVersion": "4.5.1",
@@ -1088,7 +1088,7 @@
           "unit": "x",
           "baseline": "vs CMake 4.5.1 new build tree (CMake has no cross-tree probe cache)",
           "status": "pass",
-          "note": "Geometric mean across synthetic. Both tools configure a new build tree. Rcmake uses its shared probe cache. CMake 4.5.1 has no cache across build trees."
+          "note": "Geometric mean across synthetic. Both tools configure a new build tree. rcmake uses its shared probe cache. CMake 4.5.1 has no cache across build trees."
         },
         "incrementalLeafP95Ms": {
           "label": "Leaf edit reconfigure (p95)",
@@ -1396,7 +1396,7 @@
   "releaseSha": "2a16da12e77c7d0c982fbe075db05873b9785e9e",
   "binarySha256": "65dd838bc16209894c636d45839bc2e379f9fee8424f7972e2d17b8658a1b8fd",
   "knownParityGaps": [
-    "Full RunCMake passed 9,310 of 9,373 cases (99.33 percent) across all 362 Linux suites with zero incomplete suites and 496 of 496 (100 percent) on Linux extended conformance, and passed 9,641 of 9,706 cases (99.33 percent) across all 371 macOS suites with zero incomplete suites after fixing RunCMake check-script SEND_ERROR attribution on the verbatim CI log (cross-checked locally on Apple Silicon at 9,641 passes). On Windows, RunCMake shard 3 of 3 completed 122 of 367 suites at 2,401 of 2,692 cases (89.19 percent) with 7 incomplete suites (4 where CMake 4.5.1 itself errored on Windows temp paths plus EnvSbom, InstallSbom, and Ninja), while shards 1 and 2 hit the 168-minute runner timeout before writing JSON and remain tracked for expanded Windows sharding in v0.2.2. All 10 large C++ projects passed strict L2 dry-run parity alongside matching diagnostics and CMakeCache.txt (10 of 10, up from 7 of 10 in v0.2.0), with duckdb and opencv passing full strict L1 and L2 parity while codemodel or edge differences remain on the other 8 projects. All 64 vcpkg shards completed across 2,621 ports with 1,488 of 1,529 observed CMake configures passing (97.32 percent, 41 configure mismatches, 436 non-CMake ports, 656 oracle-blocked ports, and 1,782 vs 1,831 installs). The sealed 240-repository unseen holdout completed all 6 shards at 31 of 79 oracle-green repositories passing strict L1 parity (39.24 percent, up from 26.87 percent in v0.2.0), with 151 oracle-red, 8 timeouts, 2 source errors, and 48 L1 differences (34 generator, 10 policy, 3 configure, and 1 find-module). Quiet-host unloaded benchmarks passed all 5 giants at 1.06x cold geomean, 1.36x warm probe-cache geomean, 1.09x incremental leaf geomean, and 391.4 MiB peak RSS (below CMake 4.5.1 at 392.3 MiB), while cold protobuf (0.86x), cold llvm-project (0.99x), and warm qtbase (0.90x) remain targets for further speedup."
+    "Full RunCMake passed 9,310 of 9,373 cases (99.33 percent) across all 362 Linux suites with zero incomplete suites and 496 of 496 (100 percent) on Linux extended conformance, and passed 9,641 of 9,706 cases (99.33 percent) across all 371 macOS suites with zero incomplete suites after fixing RunCMake check-script SEND_ERROR attribution on the verbatim CI log (cross-checked locally on Apple Silicon at 9,641 passes). On Windows, RunCMake shard 3 of 3 ran 122 of 367 suites (115 clean plus 7 incomplete suites, 4 where CMake 4.5.1 itself errored on Windows temp paths plus EnvSbom, InstallSbom, and Ninja) at 2,401 of 2,692 cases (89.19 percent), while shards 1 and 2 hit the 165-minute step timeout before writing JSON and remain tracked for expanded Windows sharding in v0.2.2. All 10 large C++ projects passed strict L2 Ninja dry-run parity alongside matching diagnostics and CMakeCache.txt (10 of 10, up from 7 of 10 in v0.2.0), with duckdb and opencv passing all four L1 checks while codemodel or graph-edge differences remain on the other 8 projects. All 64 vcpkg shards completed across 2,621 ports with 1,488 of 1,529 observed CMake configures passing (97.32 percent, 41 configure mismatches, 436 non-CMake ports, 656 oracle-blocked ports, and 1,782 vs 1,831 installs). The sealed 240-repository unseen holdout completed all 6 shards at 31 of 79 oracle-green repositories passing strict L1 parity (39.24 percent, up from 26.87 percent in v0.2.0), with 151 oracle-red, 8 timeouts, 2 source errors, and 48 L1 differences (34 generator, 10 policy, 3 configure, and 1 find-module). Quiet-host unloaded benchmarks passed all 5 giants at 1.06x cold geomean, 1.36x warm probe-cache geomean, 1.09x incremental leaf geomean, and 391.4 MiB peak RSS (below CMake 4.5.1 at 392.3 MiB), while cold protobuf (0.86x), cold llvm-project (0.99x), warm qtbase (0.90x), and leaf-edit protobuf (0.76x), qtbase (0.96x), and llvm-project (0.96x) remain targets for further speedup."
   ],
   "receipt": {
     "commit": "2a16da12e77c7d0c982fbe075db05873b9785e9e",

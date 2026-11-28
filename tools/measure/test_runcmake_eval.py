@@ -620,6 +620,19 @@ class CheckScriptErrorTests(unittest.TestCase):
         self.assertFalse(fatal_result["complete"])
         self.assertEqual(len(fatal_result["driver_errors"]), 1)
 
+        prep_err_log = (
+            "CMake Error at /tmp/src/Tests/RunCMake/Foo/CaseA-prep.cmake:4 (message):\n"
+            "  preparation hook failed\n"
+            "Call Stack (most recent call first):\n"
+            "  /tmp/src/Tests/RunCMake/RunCMake.cmake:120 (include)\n"
+            "  /tmp/src/Tests/RunCMake/RunCMake.cmake:314 (run_cmake)\n\n"
+            "-- CaseA - PASSED\n"
+            "-- runcmake_eval: suite complete\n"
+        )
+        prep_cases, prep_result = runcmake_eval.case_results(1, False, prep_err_log)
+        self.assertEqual(len(prep_result["driver_errors"]), 1)
+        self.assertTrue(prep_cases["CaseA", 1]["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

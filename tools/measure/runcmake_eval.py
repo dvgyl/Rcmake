@@ -135,6 +135,7 @@ CHECK_SCRIPT_ERROR = re.compile(
     re.MULTILINE,
 )
 CHECK_SCRIPT_FRAME = re.compile(r"[/\\]RunCMake\.cmake:\d+ \(include\)\s*$", re.MULTILINE)
+CHECK_SCRIPT_FILE = re.compile(r"-check[^/\\]*\.cmake:\d+\b")
 
 RUN_CMAKE_SKIP = re.compile(
     r"^-- (?P<name>.+?)(?: - | )(?:All checks )?SKIPPED\b(?P<reason>.*)$",
@@ -494,6 +495,8 @@ def case_results(code, timed_out, log):
     consumed_spans = list(case_spans)
     for err in CHECK_SCRIPT_ERROR.finditer(log):
         if overlaps_case(err.start(), err.end()) or not CHECK_SCRIPT_FRAME.search(err["stack"]):
+            continue
+        if not (CHECK_SCRIPT_FILE.search(err["location"]) or CHECK_SCRIPT_FILE.search(err["stack"])):
             continue
         next_case = next((idx for idx, m in enumerate(case_matches) if m.start() >= err.end()), None)
         if next_case is None:

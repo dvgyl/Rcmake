@@ -9,7 +9,7 @@ Direct answers on CMake 4.5.1 parity, native developer tooling, caching, install
 - [Which generators, languages, and CMake 4.5.1 interfaces are supported?](#which-generators-languages-and-cmake-451-interfaces-are-supported)
 - [Does rcmake work with vcpkg, Conan, find_package, and FetchContent?](#does-rcmake-work-with-vcpkg-conan-find_package-and-fetchcontent)
 - [How do the probe cache, portable archives, and drift checks work?](#how-do-the-probe-cache-portable-archives-and-drift-checks-work)
-- [How does incremental configure replay work in 0.2.0?](#how-does-incremental-configure-replay-work-in-020)
+- [How does incremental configure replay work?](#how-does-incremental-configure-replay-work)
 - [What native developer tools does rcmake include?](#what-native-developer-tools-does-rcmake-include)
 - [Does rcmake include a language server, WebAssembly build, and Rust API?](#does-rcmake-include-a-language-server-webassembly-build-and-rust-api)
 - [Does rcmake use unsafe Rust or copied CMake C++ code, and what is the licence?](#does-rcmake-use-unsafe-rust-or-copied-cmake-c-code-and-what-is-the-licence)
@@ -39,7 +39,7 @@ Yes. `rcmake` is an independent reimplementation of CMake 4.5.1 in safe Rust wit
 
 ## Does rcmake work with vcpkg, Conan, find_package, and FetchContent?
 
-Yes. `rcmake` bundles CMake 4.5.1 `Modules/`, `Templates/`, and rendered `Help/` under `share/cmake-4.5` and runs `vcpkg` toolchain files, Conan (`CMakeToolchain` and `CMakeDeps`), `find_package()`, and `FetchContent` directly. In `0.2.0`, sound incremental replay also stays active with `vcpkg` toolchains and Conan configure presets by running setup hooks live and validating setup checkpoints.
+Yes. `rcmake` bundles CMake 4.5.1 `Modules/`, `Templates/`, and rendered `Help/` under `share/cmake-4.5` and runs `vcpkg` toolchain files, Conan (`CMakeToolchain` and `CMakeDeps`), `find_package()`, and `FetchContent` directly. Sound incremental replay also stays active with `vcpkg` toolchains and Conan configure presets by running setup hooks live and validating setup checkpoints.
 
 ## How do the probe cache, portable archives, and drift checks work?
 
@@ -47,7 +47,7 @@ In native mode, `rcmake` stores verified compiler checks (`try_compile`, `check_
 
 To share probes across CI runners without a remote server, run `rcmake cache export probes.tar.gz` and import on downstream jobs with `rcmake cache import probes.tar.gz --sha256 <digest>` (trusted archives publish live, while imports without `--sha256` stage as untrusted candidates that never trigger hits). To detect stale `CMakeCache.txt` drift when compilers, toolchain files, launchers, or `CMAKE_PREFIX_PATH` change, native configures automatically warn on drift and `rcmake doctor -B <build>` reports drift offline without running compilers. See [CACHING.md](CACHING.md) for full details.
 
-## How does incremental configure replay work in 0.2.0?
+## How does incremental configure replay work?
 
 On a warm native reconfigure, `rcmake` re-executes edited directory regions and replays unchanged subtrees from `CMakeFiles/rcmake/configure.v1.bin` whenever entry context and recorded inputs match. Starting in `0.2.0`, toolchain files (`vcpkg`), configure presets, `-C` initial cache scripts, and `PreLoad.cmake` no longer disable replay globally. Instead, setup spans run live on every configure and hash observable interpreter state into setup checkpoints so any setup change disables replay hits safely.
 

@@ -59,7 +59,7 @@
             "Tests/RunCMake pass rate across 371 suites on macOS arm64, 362 suites on Linux x86_64, and 367 suites on Windows x86_64",
             "62 core conformance suites",
             "35 policy suites covering CMake policies CMP0066 to CMP0226",
-            "L1 configure and L2 Ninja build-graph and File API parity across 10 large C++ projects",
+            "L1 configure, cache, File API, and graph-edge parity plus L2 Ninja dry-run parity across 10 large C++ projects",
             "Aggregate parity across a 240-repository sealed unseen holdout",
             "64 vcpkg port matrix shards",
             "Configure wall time and peak RSS compared with CMake 4.5.1",
@@ -158,7 +158,7 @@
         <nav class="rail-mobile" id="report-rail-mobile" aria-label="Report sections"></nav>
         <noscript>
           <div class="noscript-banner">
-            <strong>JavaScript is required to render the interactive charts.</strong> This report compares <code>rcmake</code> 0.2.1 against CMake 4.5.1 across upstream <code>Tests/RunCMake</code> (371 macOS arm64, 362 Linux x86_64, and 367 Windows x86_64 suites), 62 core suites, and 35 policy suites covering <code>CMP0066</code> to <code>CMP0226</code>. It also tracks 20 black-box scenarios (679 checks), L1 configure and L2 Ninja and File API parity on 10 large C++ projects, a 240-repository blind holdout, 64 <code>vcpkg</code> shards, seeded generative fuzzing across 14 targets, WebAssembly and WASI checks, probe-cache and mutation-replay soundness gates, and configure speed benchmarks. Inspect the raw dataset in <a href="./data/latest.json">data/latest.json</a> or read <a href="./llms.txt">llms.txt</a>.
+            <strong>JavaScript is required to render the interactive charts.</strong> This report compares <code>rcmake</code> 0.2.1 against CMake 4.5.1 across upstream <code>Tests/RunCMake</code> (371 macOS arm64, 362 Linux x86_64, and 367 Windows x86_64 suites), 62 core suites, and 35 policy suites covering <code>CMP0066</code> to <code>CMP0226</code>. It also tracks 20 black-box scenarios (679 checks), L1 configure, cache, File API, and graph-edge parity plus L2 Ninja dry-run parity on 10 large C++ projects, a 240-repository blind holdout, 64 <code>vcpkg</code> shards, seeded generative fuzzing across 14 targets, WebAssembly and WASI checks, probe-cache and mutation-replay soundness gates, and configure speed benchmarks. Inspect the raw dataset in <a href="./data/latest.json">data/latest.json</a> or read <a href="./llms.txt">llms.txt</a>.
           </div>
         </noscript>
         <div id="report" class="is-loading" data-test="report-body"></div>

@@ -594,7 +594,7 @@ def merge_benchmarks(metrics, paths, identity=(None, None, False)):
         projects = ", ".join(sorted({str(row["project"]) for row in selected}))
         record("warmProbeSpeedup", speedup, status,
                f"Geometric mean across {projects}. Both tools configure a new build tree. "
-               "Rcmake uses its shared probe cache. CMake 4.5.1 has no cache across build trees.")
+               "rcmake uses its shared probe cache. CMake 4.5.1 has no cache across build trees.")
 
     incremental = [row for row in rows if row.get("case") == "incremental-leaf"]
     if incremental:
