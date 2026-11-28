@@ -73,7 +73,7 @@ Seven verification layers compare `rcmake` against the pinned CMake 4.5.1 oracle
 | --- | --- | --- | --- |
 | 1 | Unit and integration tests | `cargo test --workspace` on `PureHost` and `NativeHost` | Logic bugs, panics, host-contract drift |
 | 2 | Recorded CLI and script cases | `rcmake-harness` over `conformance/cases/` | Byte-exact `-P`, `-E`, CLI, presets, SARIF, and `configure_file` parity |
-| 3 | Upstream `Tests/RunCMake` | 371 macOS arm64, 362 Linux, 367 Windows suites run (of 463 upstream entries) | Diagnostic text, policy transitions, generator corner cases |
+| 3 | Upstream `Tests/RunCMake` | 371 macOS arm64, 362 Linux, and 367 Windows suites targeted (of 463 upstream entries) | Diagnostic text, policy transitions, generator corner cases |
 | 4 | Independent black-box suite | 20 scenarios, 679 checks (`independent_verify.py`) | End-to-end build, install, RPATH, `tar`, `ctest`, `cpack`, and File API parity |
 | 5 | Large C++ projects | 10 open-source projects at pinned tags with reduced options (`large_projects.toml`) | Real module scripts, configure diagnostics, cache, File API, and graph edges (L1), plus Ninja dry-run commands (L2) |
 | 6 | Fuzzing and ecosystem lanes | Seeded generative fuzzing (14 targets, 1,000,000 inputs each), 64-shard `vcpkg`, Conan, Qt 6 | Panics, resource exhaustion, package-manager compatibility |

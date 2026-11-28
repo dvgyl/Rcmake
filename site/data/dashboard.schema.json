@@ -148,6 +148,7 @@
                   "suitesPassed": { "type": ["integer", "null"], "minimum": 0 },
                   "expectedSuites": { "type": "integer", "minimum": 1 },
                   "completedSuites": { "type": "integer", "minimum": 0 },
+                  "reportedSuites": { "type": "integer", "minimum": 0 },
                   "partial": { "type": "boolean" },
                   "casesPassed": { "type": ["integer", "null"], "minimum": 0 },
                   "casesTotal": { "type": ["integer", "null"], "minimum": 0 },

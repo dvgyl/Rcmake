@@ -1,7 +1,7 @@
 {
   "$schema": "./dashboard.schema.json",
   "schemaVersion": 1,
-  "generatedAt": "2026-11-28T05:20:51Z",
+  "generatedAt": "2026-11-28T05:25:04Z",
   "commit": "2a16da12e77c7d0c982fbe075db05873b9785e9e",
   "rcmakeVersion": "0.2.1",
   "targetCmakeVersion": "4.5.1",
@@ -109,7 +109,8 @@
           "note": "Full OS report: 371 suites completed (minimum 371).",
           "expectedSuites": 371,
           "completedSuites": 371,
-          "partial": false
+          "partial": false,
+          "reportedSuites": 371
         },
         {
           "id": "linux-x86_64",
@@ -124,7 +125,8 @@
           "note": "Full OS report: 362 suites completed (minimum 362).",
           "expectedSuites": 362,
           "completedSuites": 362,
-          "partial": false
+          "partial": false,
+          "reportedSuites": 362
         },
         {
           "id": "windows-x86_64",
@@ -136,10 +138,11 @@
           "casesTotal": 2692,
           "passRate": 89.19,
           "status": "fail",
-          "note": "Partial OS report: 122 of 367 expected suites completed.",
+          "note": "Partial OS report: 122 of 367 expected suites reported (115 complete, 7 incomplete).",
           "expectedSuites": 367,
-          "completedSuites": 122,
-          "partial": true
+          "completedSuites": 115,
+          "partial": true,
+          "reportedSuites": 122
         }
       ]
     },
@@ -297,7 +300,7 @@
       "reposTotal": 79,
       "reposPassed": 31,
       "passRate": 39.24,
-      "policy": "Blind holdout corpus. Individual repository identities are never published, and only aggregate pass rates and category counts are reported.",
+      "policy": "Blind holdout corpus. The manifest stays unopened during development, and dashboard reports and receipts publish only aggregate pass rates and failure category counts.",
       "note": "Repository counts from the blind holdout report.",
       "categories": [
         {

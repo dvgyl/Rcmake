@@ -245,7 +245,7 @@ export function rateArc({ rate, status, size = 88, stroke = 6 } = {}) {
   return `<svg class="ring-svg" width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}" data-status="${st}" aria-hidden="true"><path fill="none" stroke="var(--line)" stroke-width="${sw}" d="${arcPath(c, c, r, 0, 359.99)}"/><path class="ring-seg ${cls}" d="${arcPath(c, c, r, 0, deg)}" stroke-width="${sw}" stroke-dasharray="${len}" style="--len:${len}"/><text class="ring-val" x="${c}" y="${(c + 6).toFixed(1)}" text-anchor="middle" data-value>${escapeHtml(formatPercent(pct))}</text></svg>`;
 }
 
-export function waffle({ passed, total, cols = 53, rows = 7, status, cell = 7, gap = 2 } = {}) {
+export function waffle({ passed, attempted = null, total, cols = 53, rows = 7, status, cell = 7, gap = 2 } = {}) {
   const c = isMeasured(cols) && cols > 0 ? Math.min(100, Math.floor(cols)) : 53;
   const r = isMeasured(rows) && rows > 0 ? Math.min(40, Math.floor(rows)) : 7;
   const sz = isMeasured(cell) && cell > 0 ? cell : 7;
@@ -253,12 +253,13 @@ export function waffle({ passed, total, cols = 53, rows = 7, status, cell = 7, g
   const n = isMeasured(total) && total > 0 ? Math.min(c * r, Math.floor(total)) : 0;
   const ok = n > 0 && isMeasured(passed) && passed >= 0;
   const hit = ok ? Math.min(n, Math.floor(passed)) : 0;
+  const cap = ok && isMeasured(attempted) && attempted >= hit ? Math.min(n, Math.floor(attempted)) : n;
   const st = ok ? normalizeStatus(status) : "pending";
   let rects = "";
   for (let i = 0; i < n; i += 1) {
     const col = i % c;
     const row = Math.floor(i / c);
-    const cls = !ok ? "is-pending" : i < hit ? "is-pass" : "is-fail";
+    const cls = !ok || i >= cap ? "is-pending" : i < hit ? "is-pass" : "is-fail";
     rects += `<rect class="wf-cell ${cls}" x="${col * (sz + g)}" y="${row * (sz + g)}" width="${sz}" height="${sz}" rx="${(sz * 0.32).toFixed(1)}" style="--c:${col}"/>`;
   }
   return `<svg class="waffle-svg" viewBox="0 0 ${c * (sz + g) - g} ${r * (sz + g) - g}" data-status="${st}" data-cells="${n}" aria-hidden="true">${rects}</svg>`;
@@ -269,8 +270,9 @@ export function waffleRowsHtml(platforms, { cell = 7, gap = 2, testPrefix = "waf
     const ok = isMeasured(p.suitesPassed);
     const st = ok ? normalizeStatus(p.status) : "pending";
     const aria = ok ? `${p.name}. ${p.suitesPassed} of ${p.suitesTotal} Tests/RunCMake suites pass.` : `${p.name}. ${p.suitesTotal} Tests/RunCMake suites pending.`;
+    const attempted = p.partial ? (p.reportedSuites ?? p.completedSuites) : p.suitesTotal;
     const visual = ok
-      ? waffle({ passed: p.suitesPassed, total: p.suitesTotal, cols: 53, rows: 7, status: st, cell, gap })
+      ? waffle({ passed: p.suitesPassed, attempted, total: p.suitesTotal, cols: 53, rows: 7, status: st, cell, gap })
       : '<div class="bar-track waffle-pending-bar is-pending" data-loop data-status="pending" aria-hidden="true"></div>';
     const footParts = [];
     if (ok) {
@@ -280,7 +282,12 @@ export function waffleRowsHtml(platforms, { cell = 7, gap = 2, testPrefix = "waf
         footParts.push(`${formatNumber(p.casesPassed)} / ${formatNumber(p.casesTotal)} cases`);
       }
       if (p.partial && isMeasured(p.completedSuites) && isMeasured(p.expectedSuites)) {
-        footParts.push(`partial run, ${formatNumber(p.completedSuites)} of ${formatNumber(p.expectedSuites)} suites completed`);
+        if (isMeasured(p.reportedSuites) && p.reportedSuites > p.completedSuites) {
+          const incomplete = p.reportedSuites - p.completedSuites;
+          footParts.push(`partial run, ${formatNumber(p.completedSuites)} complete and ${formatNumber(incomplete)} incomplete of ${formatNumber(p.expectedSuites)} suites`);
+        } else {
+          footParts.push(`partial run, ${formatNumber(p.completedSuites)} of ${formatNumber(p.expectedSuites)} suites completed`);
+        }
       }
     } else {
       footParts.push(`${formatNumber(p.suitesTotal)} RunCMake suites`);

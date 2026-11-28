@@ -423,24 +423,41 @@ def merge_runcmake(tracks, reports):
         statuses = [row[2] for row in results]
         totals = suite_totals(results)
         expected_suites = EXPECTED_OS_SUITES[platform["id"]]
-        completed_suites = len(results)
-        is_partial = completed_suites < expected_suites
+        reported_suites = len(results)
+        driver_complete_suites = sum(
+            1
+            for row in report["suites"].values()
+            if all(
+                driver.get("complete") is True and not driver.get("driver_errors")
+                for key in ("oracle_driver", "rcmake_driver")
+                if (driver := row.get(key)) is not None
+            )
+        )
+        incomplete_count = reported_suites - driver_complete_suites
+        is_partial = reported_suites < expected_suites
         all_gates_ok = all(row[3] for row in results)
         if is_partial:
             platform_status = "fail" if "fail" in statuses else "partial"
-            note = f"Partial OS report: {completed_suites:,} of {expected_suites:,} expected suites completed."
+            if incomplete_count > 0:
+                note = (
+                    f"Partial OS report: {reported_suites:,} of {expected_suites:,} expected suites "
+                    f"reported ({driver_complete_suites:,} complete, {incomplete_count:,} incomplete)."
+                )
+            else:
+                note = f"Partial OS report: {reported_suites:,} of {expected_suites:,} expected suites completed."
         elif all_gates_ok and totals["passRate"] is not None and totals["passRate"] >= RUNCMAKE_MIN_PASS_RATE:
             platform_status = "pass"
-            note = f"Full OS report: {completed_suites:,} suites completed (minimum {expected_suites:,})."
+            note = f"Full OS report: {driver_complete_suites:,} suites completed (minimum {expected_suites:,})."
         else:
             platform_status = "fail"
-            note = f"Full OS report: {completed_suites:,} suites completed (minimum {expected_suites:,})."
+            note = f"Full OS report: {driver_complete_suites:,} suites completed (minimum {expected_suites:,})."
         platform.update(
             totals,
-            suitesTotal=max(expected_suites, completed_suites),
+            suitesTotal=max(expected_suites, reported_suites),
             suitesPassed=statuses.count("pass"),
             expectedSuites=expected_suites,
-            completedSuites=completed_suites,
+            completedSuites=driver_complete_suites,
+            reportedSuites=reported_suites,
             partial=is_partial,
             status=platform_status,
             note=note,
@@ -1155,7 +1172,15 @@ def merge_holdout(track, path, identity=(None, None, False)):
             aggregate["status"] = "pass"
         if payload.get("status", report.get("status")) == "fail" or report.get("sealed") is False:
             aggregate["status"] = "fail"
-        track.update(aggregate, sealed=True, note="Repository counts from the blind holdout report.")
+        track.update(
+            aggregate,
+            sealed=True,
+            policy=(
+                "Blind holdout corpus. The manifest stays unopened during development, "
+                "and dashboard reports and receipts publish only aggregate pass rates and failure category counts."
+            ),
+            note="Repository counts from the blind holdout report.",
+        )
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
         raise ValueError("The holdout report must contain valid aggregate and category counts.") from None
 
