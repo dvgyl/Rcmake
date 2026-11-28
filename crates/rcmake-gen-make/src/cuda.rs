@@ -5,14 +5,14 @@
 
 use std::{collections::BTreeSet, path::Path};
 
-use rcmake_base::{BString, path_lex::Lexical, shell::quote_always};
+use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_gen_common::GenError;
 use rcmake_host::Host;
 use rcmake_resolve::{BuildStep, DeviceLinkMode, Invocation};
 
 use crate::{
-    FORCE, Word, build_path, check_make_path, invalid_graph, make_recipe_text, make_word, progress,
-    rule, shell_invocation,
+    FORCE, MakeDialect, Word, build_path, check_make_path_for, invalid_graph, make_recipe_text,
+    make_recipe_text_for, make_word_for, progress, quote_arg, rule_for, shell_invocation_for,
 };
 
 /// Render one device-object rule. Return whether this module handled the step.
@@ -25,7 +25,9 @@ use crate::{
 /// # Errors
 ///
 /// Returns an error if a dependency or a command cannot be written in Make.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit(
+    dialect: MakeDialect,
     out: &mut Vec<u8>,
     build_dir: &Path,
     step: &BuildStep,
@@ -45,14 +47,15 @@ pub(crate) fn emit(
     };
     let intermediates = intermediate_paths(mode).map(|path| build_path(path, build_dir));
     let output = build_path(output, build_dir);
-    let mut inputs = prerequisites(inputs.iter().chain(link_depends), build_dir)?;
+    let mut inputs = prerequisites(dialect, inputs.iter().chain(link_depends), build_dir)?;
     let response = response_invocation(host, build_dir, &output, mode)?;
     if let Some((file, _)) = &response {
         inputs.insert(file.clone());
     }
-    check_make_path(&output)?;
-    check_make_path(build_file)?;
-    rule(
+    check_make_path_for(dialect, &output)?;
+    check_make_path_for(dialect, build_file)?;
+    rule_for(
+        dialect,
         out,
         &output,
         inputs
@@ -61,6 +64,7 @@ pub(crate) fn emit(
             .chain([build_file]),
     );
     progress::report(
+        dialect,
         out,
         format!("Linking {lang} device code {output}").as_bytes(),
         progress_number,
@@ -96,20 +100,32 @@ pub(crate) fn emit(
         }
     }
     for directory in directories {
-        out.extend_from_slice(b"\t$(SILENT)mkdir -p -- ");
-        make_recipe_text(out, &quote_always(&directory))?;
+        if dialect.is_nmake() {
+            out.extend_from_slice(b"\t$(SILENT)$(CMAKE_COMMAND) -E make_directory ");
+        } else {
+            out.extend_from_slice(b"\t$(SILENT)mkdir -p -- ");
+        }
+        make_recipe_text_for(dialect, out, &quote_arg(dialect, &directory))?;
         out.push(b'\n');
     }
     for invocation in invocations {
-        write_invocation(out, invocation)?;
+        write_invocation(dialect, out, invocation)?;
     }
     for path in intermediates {
-        check_make_path(&path)?;
-        out.extend_from_slice(b"ifeq ($(wildcard ");
-        make_word(out, &path, Word::Wildcard);
-        out.extend_from_slice(b"),)\n");
-        rule(out, &output, [FORCE]);
-        out.extend_from_slice(b"endif\n");
+        check_make_path_for(dialect, &path)?;
+        if dialect.is_nmake() {
+            out.extend_from_slice(b"!IF !EXIST(\"");
+            make_recipe_text(out, &path)?;
+            out.extend_from_slice(b"\")\n");
+            rule_for(dialect, out, &output, [FORCE]);
+            out.extend_from_slice(b"!ENDIF\n");
+        } else {
+            out.extend_from_slice(b"ifeq ($(wildcard ");
+            make_word_for(dialect, out, &path, Word::Wildcard);
+            out.extend_from_slice(b"),)\n");
+            rule_for(dialect, out, &output, [FORCE]);
+            out.extend_from_slice(b"endif\n");
+        }
     }
     Ok(true)
 }
@@ -181,6 +197,7 @@ fn intermediate_paths(mode: &DeviceLinkMode) -> impl Iterator<Item = &BString> {
 ///
 /// Returns an error if a path cannot be written in Make.
 pub(crate) fn emit_link_depends(
+    dialect: MakeDialect,
     out: &mut Vec<u8>,
     build_dir: &Path,
     step: &BuildStep,
@@ -193,14 +210,20 @@ pub(crate) fn emit_link_depends(
         && !implicit_inputs.is_empty()
     {
         let output = build_path(&step.output, build_dir);
-        check_make_path(&output)?;
-        let inputs = prerequisites(implicit_inputs, build_dir)?;
-        rule(out, &output, inputs.iter().map(|value| value.as_slice()));
+        check_make_path_for(dialect, &output)?;
+        let inputs = prerequisites(dialect, implicit_inputs, build_dir)?;
+        rule_for(
+            dialect,
+            out,
+            &output,
+            inputs.iter().map(|value| value.as_slice()),
+        );
     }
     Ok(())
 }
 
 fn prerequisites<'a>(
+    dialect: MakeDialect,
     paths: impl IntoIterator<Item = &'a BString>,
     build_dir: &Path,
 ) -> Result<BTreeSet<BString>, GenError> {
@@ -208,17 +231,21 @@ fn prerequisites<'a>(
         .into_iter()
         .map(|input| {
             let input = build_path(input, build_dir);
-            check_make_path(&input)?;
+            check_make_path_for(dialect, &input)?;
             Ok(input)
         })
         .collect()
 }
 
-fn write_invocation(out: &mut Vec<u8>, invocation: &Invocation) -> Result<(), GenError> {
-    let command = shell_invocation(invocation)
+fn write_invocation(
+    dialect: MakeDialect,
+    out: &mut Vec<u8>,
+    invocation: &Invocation,
+) -> Result<(), GenError> {
+    let command = shell_invocation_for(dialect, invocation)
         .ok_or_else(|| invalid_graph("The device-link command is empty."))?;
     out.extend_from_slice(b"\t$(SILENT)");
-    make_recipe_text(out, &command)?;
+    make_recipe_text_for(dialect, out, &command)?;
     out.push(b'\n');
     Ok(())
 }
@@ -246,6 +273,7 @@ mod tests {
         let products = clean_artifacts(&step, Path::new("/build"));
         let mut out = Vec::new();
         assert!(emit(
+            MakeDialect::Unix,
             &mut out,
             Path::new("/build"),
             &step,

@@ -232,7 +232,9 @@ impl InstallManifest {
                         ..EvalContext::default()
                     };
                     let path = evaluate(&parse(value)?, &context, &mut usage.host(target.dir))?.0;
-                    if !Lexical::new(&path).absolute() || !reported.insert(path.clone()) {
+                    if !crate::usage::paths::full_path_for_host(model, target.dir, host, &path)
+                        || !reported.insert(path.clone())
+                    {
                         continue;
                     }
                     let body: BString =

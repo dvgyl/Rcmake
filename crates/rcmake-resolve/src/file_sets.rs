@@ -80,7 +80,12 @@ pub fn options_for_set(model: &ProjectModel, index: usize, name: &[u8]) -> Optio
     let mut options = model.installs.get(index)?.options.clone();
     while let Some(key) = args.next() {
         match key {
-            b"DESTINATION" => options.destination = Some(args.next()?.into()),
+            b"DESTINATION" => {
+                let value = args.next()?;
+                if !value.is_empty() {
+                    options.destination = Some(value.into());
+                }
+            }
             b"COMPONENT" => options.component = Some(args.next()?.into()),
             b"OPTIONAL" => options.optional = true,
             b"EXCLUDE_FROM_ALL" => options.exclude_from_all = true,

@@ -732,12 +732,6 @@ fn collect_tests(
         );
         let mut directory_deps = BTreeSet::new();
         let mut host = usage.host(dir);
-        let mut expand = |value: &[u8]| {
-            parse(value)
-                .and_then(|expression| evaluate(&expression, &context, &mut host))
-                .map(|(value, _)| value)
-                .map_err(|error| generation_error(graph.build_dir, error.to_string()))
-        };
         for (_, test) in model.dir_tests(dir) {
             let target = name(b"test_prep/", &test.name);
             if !test.is_discovery()
@@ -746,14 +740,17 @@ fn collect_tests(
                     || !test
                         .name
                         .iter()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte))
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.:+-".contains(byte))
                     || !available(graph, &target))
             {
                 continue;
             }
             let mut deps = BTreeSet::new();
             for (index, arg) in test.command.iter().enumerate() {
-                let value = expand(arg)?;
+                let ast = parse(arg)
+                    .map_err(|error| generation_error(graph.build_dir, error.to_string()))?;
+                let (value, _) = evaluate(&ast, &context, &mut host)
+                    .map_err(|error| generation_error(graph.build_dir, error.to_string()))?;
                 if index == 0
                     && let Some(id) = model.find_target(dir, &value)
                     && let Some(executable) = model
@@ -763,14 +760,26 @@ fn collect_tests(
                 {
                     deps.extend(graph.target_dependencies(&executable.name));
                 }
-                if arg.windows(2).any(|pair| pair == b"$<")
-                    && let Some(dep) = graph.file_dependency(&value)
-                {
-                    deps.insert(dep);
+                if arg.windows(2).any(|pair| pair == b"$<") {
+                    collect_ast_target_deps(
+                        &ast.nodes, graph, model, dir, &context, &mut host, &mut deps,
+                    )?;
+                    if let Some(dep) = graph.file_dependency(&value) {
+                        deps.insert(dep);
+                    } else if let Some(pos) = value.iter().position(|&byte| byte == b'=')
+                        && let Some(rhs) = value.get(pos + 1..)
+                        && let Some(dep) = graph.file_dependency(rhs)
+                    {
+                        deps.insert(dep);
+                    }
                 }
             }
             for input in &test.build_depends {
-                for value in list::split(&expand(&input.value)?, list::Empty::Drop) {
+                let expanded = parse(&input.value)
+                    .and_then(|expression| evaluate(&expression, &context, &mut host))
+                    .map(|(value, _)| value)
+                    .map_err(|error| generation_error(graph.build_dir, error.to_string()))?;
+                for value in list::split(&expanded, list::Empty::Drop) {
                     deps.extend(test_dependency(graph, model, dir, &value));
                 }
             }
@@ -781,7 +790,11 @@ fn collect_tests(
             }
         }
         if let Some(inputs) = directory.props.get(b"CMAKE_TEST_BUILD_DEPENDS") {
-            for input in list::split(&expand(inputs)?, list::Empty::Drop) {
+            let expanded = parse(inputs)
+                .and_then(|expression| evaluate(&expression, &context, &mut host))
+                .map(|(value, _)| value)
+                .map_err(|error| generation_error(graph.build_dir, error.to_string()))?;
+            for input in list::split(&expanded, list::Empty::Drop) {
                 directory_deps.extend(test_dependency(graph, model, dir, &input));
             }
         }
@@ -790,6 +803,174 @@ fn collect_tests(
                 .entry(directory_target)
                 .or_default()
                 .extend(directory_deps);
+        }
+    }
+    Ok(())
+}
+
+/// Walk a parsed test argument generator-expression AST and collect target
+/// artifact dependencies referenced inside active branches, matching CMake's
+/// `cmTestGenerator.cxx` (including nested expressions like
+/// `$<BOOL:$<TARGET_FILE:tool>>`).
+fn collect_ast_target_deps(
+    nodes: &[rcmake_genex::GenexNode],
+    graph: &Graph<'_>,
+    model: &ProjectModel,
+    dir: DirId,
+    context: &EvalContext,
+    host: &mut dyn rcmake_genex::GenexHost,
+    deps: &mut BTreeSet<BString>,
+) -> Result<(), GenError> {
+    collect_ast_target_deps_inner(nodes, graph, model, dir, context, host, deps, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_ast_target_deps_inner(
+    nodes: &[rcmake_genex::GenexNode],
+    graph: &Graph<'_>,
+    model: &ProjectModel,
+    dir: DirId,
+    context: &EvalContext,
+    host: &mut dyn rcmake_genex::GenexHost,
+    deps: &mut BTreeSet<BString>,
+    depth: usize,
+) -> Result<(), GenError> {
+    if depth > rcmake_genex::MAX_NESTING {
+        return Ok(());
+    }
+    for node in nodes {
+        let rcmake_genex::GenexNode::Expr(expr) = node else {
+            continue;
+        };
+        match expr.identifier.as_slice() {
+            [rcmake_genex::GenexNode::Text(ident)] => match ident.as_slice() {
+                b"0" => continue,
+                b"IF" => {
+                    if let Some(params) = &expr.params
+                        && let Some(cond_nodes) = params.first()
+                    {
+                        collect_ast_target_deps_inner(
+                            cond_nodes,
+                            graph,
+                            model,
+                            dir,
+                            context,
+                            host,
+                            deps,
+                            depth + 1,
+                        )?;
+                        let cond_ast = rcmake_genex::GenexAst {
+                            nodes: cond_nodes.clone(),
+                        };
+                        let (cond_val, _) =
+                            evaluate(&cond_ast, context, host).map_err(|error| {
+                                generation_error(graph.build_dir, error.to_string())
+                            })?;
+                        let branch = if truth::is_on(&cond_val) {
+                            params.get(1)
+                        } else {
+                            params.get(2)
+                        };
+                        if let Some(branch) = branch {
+                            collect_ast_target_deps_inner(
+                                branch,
+                                graph,
+                                model,
+                                dir,
+                                context,
+                                host,
+                                deps,
+                                depth + 1,
+                            )?;
+                        }
+                    }
+                }
+                b"TARGET_FILE"
+                | b"TARGET_LINKER_FILE"
+                | b"TARGET_SONAME_FILE"
+                | b"TARGET_IMPORT_FILE"
+                | b"TARGET_PDB_FILE"
+                | b"TARGET_BUNDLE_FILE"
+                | b"TARGET_BUNDLE_DIR"
+                | b"TARGET_RUNTIME_DLLS"
+                | b"TARGET_FILE_DIR"
+                | b"TARGET_FILE_NAME"
+                | b"TARGET_FILE_BASE_NAME"
+                | b"TARGET_FILE_PREFIX"
+                | b"TARGET_FILE_SUFFIX" => {
+                    let sub_ast = rcmake_genex::GenexAst {
+                        nodes: vec![rcmake_genex::GenexNode::Expr(expr.clone())],
+                    };
+                    if let Ok((sub_val, _)) = evaluate(&sub_ast, context, host) {
+                        for item in list::split(&sub_val, list::Empty::Drop) {
+                            if let Some(dep) = graph.file_dependency(&item) {
+                                deps.insert(dep);
+                            }
+                        }
+                    }
+                    if let Some(params) = &expr.params
+                        && let Some(target_nodes) = params.first()
+                    {
+                        let target_ast = rcmake_genex::GenexAst {
+                            nodes: target_nodes.clone(),
+                        };
+                        if let Ok((target_name, _)) = evaluate(&target_ast, context, host)
+                            && let Some(id) = model.find_target(dir, &target_name)
+                            && let Some(target) = model.target(id)
+                            && !target.is_imported()
+                        {
+                            deps.extend(graph.target_dependencies(&target.name));
+                        }
+                    }
+                }
+                _ => {
+                    for param in expr.params.iter().flatten() {
+                        collect_ast_target_deps_inner(
+                            param,
+                            graph,
+                            model,
+                            dir,
+                            context,
+                            host,
+                            deps,
+                            depth + 1,
+                        )?;
+                    }
+                }
+            },
+            _ => {
+                // Conditional `$<cond:body>` form: collect deps from the condition
+                // itself and recurse into `params` only when `cond` is truthy.
+                collect_ast_target_deps_inner(
+                    &expr.identifier,
+                    graph,
+                    model,
+                    dir,
+                    context,
+                    host,
+                    deps,
+                    depth + 1,
+                )?;
+                let cond_ast = rcmake_genex::GenexAst {
+                    nodes: expr.identifier.clone(),
+                };
+                let (cond_val, _) = evaluate(&cond_ast, context, host)
+                    .map_err(|error| generation_error(graph.build_dir, error.to_string()))?;
+                if truth::is_on(&cond_val) {
+                    for param in expr.params.iter().flatten() {
+                        collect_ast_target_deps_inner(
+                            param,
+                            graph,
+                            model,
+                            dir,
+                            context,
+                            host,
+                            deps,
+                            depth + 1,
+                        )?;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1121,6 +1302,132 @@ mod tests {
                 .get(b"install_prep/RtLib".as_slice())
                 .is_some_and(|deps| deps.contains(b"app".as_slice())),
             "{dll_release:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_prep_accepts_colons_and_embedded_target_file_genex()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+
+        use rcmake_base::BString;
+        use rcmake_diag::{Backtrace, PolicyMap};
+        use rcmake_model::{
+            DirId, ProjectModel, PropertyMap, Target, TargetKind, TargetOrigin, TestEntry, TestKind,
+        };
+        use rcmake_resolve::{
+            ArtifactSet, BuildGraph, BuildStep, GraphTarget, Invocation, LinkKind, LinkStep,
+        };
+
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let mut tool = Target::new(
+            "tool".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        tool.props
+            .set("RUNTIME_OUTPUT_DIRECTORY".into(), "/build/bin".into());
+        let tool_id = model.add_target(tool)?;
+        let make_test = |name: &str, command: Vec<BString>| TestEntry {
+            name: name.into(),
+            dir: DirId::ROOT,
+            backtrace: Backtrace::default(),
+            command,
+            configurations: Vec::new(),
+            working_directory: None,
+            command_expand_lists: false,
+            old_style: false,
+            policies: PolicyMap::default(),
+            props: PropertyMap::default(),
+            build_depends: Vec::new(),
+            kind: TestKind::Single,
+        };
+        model.add_test(make_test(
+            "VTK::ChartsCore-HeaderTest",
+            vec!["/usr/bin/python3".into(), "check.py".into()],
+        ))?;
+        model.add_test(make_test(
+            "Suite::embedded",
+            vec![
+                "/usr/bin/cmake".into(),
+                "-DTEST_EXE=$<TARGET_FILE:tool>".into(),
+                "-DDISABLED=$<$<BOOL:0>:$<TARGET_FILE:tool>>".into(),
+            ],
+        ))?;
+        model.add_test(make_test(
+            "Suite::nested_bool",
+            vec![
+                "/usr/bin/cmake".into(),
+                "-DHAS_TOOL=$<BOOL:$<TARGET_FILE:tool>>".into(),
+            ],
+        ))?;
+        model.add_test(make_test(
+            "Suite::disabled_only",
+            vec![
+                "/usr/bin/cmake".into(),
+                "-DDISABLED=$<$<BOOL:0>:$<TARGET_FILE:tool>>".into(),
+            ],
+        ))?;
+
+        let input = BuildGraph {
+            steps: vec![BuildStep::Link {
+                inputs: Vec::new(),
+                implicit_inputs: Vec::new(),
+                step: LinkStep {
+                    kind: LinkKind::Executable,
+                    language: "CXX".into(),
+                    fragments: Vec::new(),
+                    output: "bin/tool".into(),
+                },
+                invocations: vec![Invocation::default()],
+            }],
+            targets: vec![GraphTarget {
+                name: "tool".into(),
+                steps: vec![0],
+                depends: Vec::new(),
+                in_all: true,
+            }],
+            target_ids: vec![tool_id],
+            ..BuildGraph::default()
+        };
+        let artifacts = ArtifactSet {
+            file: Some("/build/bin/tool".into()),
+            ..ArtifactSet::default()
+        };
+        let artifact_map = BTreeMap::from([(b"tool".as_slice(), &artifacts)]);
+        let graph = super::Graph::new(&input, &artifact_map, Path::new("/build"), None)?;
+        let mut targets = super::Targets::new();
+        super::collect_tests(&graph, &model, &mut targets)?;
+        assert!(
+            targets.contains_key(b"test_prep/VTK::ChartsCore-HeaderTest".as_slice()),
+            "colon-scoped test with empty deps must be emitted: {targets:?}"
+        );
+        assert_eq!(
+            targets
+                .get(b"test_prep/Suite::embedded".as_slice())
+                .map(|deps| deps.iter().cloned().collect::<Vec<BString>>()),
+            Some(vec![BString::from("bin/tool")]),
+            "embedded $<TARGET_FILE:tool> must capture executable dependency"
+        );
+        assert_eq!(
+            targets
+                .get(b"test_prep/Suite::nested_bool".as_slice())
+                .map(|deps| deps.iter().cloned().collect::<Vec<BString>>()),
+            Some(vec![BString::from("bin/tool")]),
+            "nested $<BOOL:$<TARGET_FILE:tool>> must capture executable dependency"
+        );
+        assert_eq!(
+            targets
+                .get(b"test_prep/Suite::disabled_only".as_slice())
+                .map(|deps| deps.iter().cloned().collect::<Vec<BString>>()),
+            Some(Vec::new()),
+            "inactive $<$<BOOL:0>:$<TARGET_FILE:tool>> must not record dependency"
         );
         Ok(())
     }

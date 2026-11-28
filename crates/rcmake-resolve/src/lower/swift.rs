@@ -1364,7 +1364,7 @@ mod tests {
             _ => return Err("expected Compile step for app".into()),
         };
         assert!(
-            app_shell.contains("-I/work/build/custom_mods"),
+            app_shell.contains("-I /work/build/custom_mods"),
             "app missing custom module search path -I: {app_shell}"
         );
         Ok(())
@@ -1446,7 +1446,7 @@ mod tests {
                 action.kind
             );
             assert!(
-                shell.contains("-I/work/src/target_inc"),
+                shell.contains("-I /work/src/target_inc"),
                 "{:?} missing target include: {shell}",
                 action.kind
             );

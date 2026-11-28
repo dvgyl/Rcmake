@@ -72,9 +72,14 @@ impl<'a> Graph<'a> {
                     action.sources.iter().map(|src| self.node(src)).collect();
                 let mut launched = None;
                 let (rule, special_command): (Cow<'static, [u8]>, Option<Vec<u8>>) =
-                    if invocations.len() == 1 && !self.commands.windows() {
-                        let (rule, command) =
-                            crate::instrumented::compile(primary_invocation, false, false);
+                    if invocations.len() == 1 {
+                        let (rule, command) = crate::instrumented::compile(
+                            primary_invocation,
+                            false,
+                            false,
+                            false,
+                            &self.commands,
+                        );
                         if command.is_some() {
                             (Cow::Borrowed(rule), command)
                         } else if let Some(info) = crate::instrumented::launched(
@@ -86,6 +91,8 @@ impl<'a> Graph<'a> {
                             &self.launcher_slots,
                             false,
                             false,
+                            false,
+                            &self.commands,
                         ) {
                             let rule = info.rule.clone();
                             let cmd = info.command.clone();
@@ -157,19 +164,16 @@ impl<'a> Graph<'a> {
                 let msvc = scan.is_some() || self.msvc_deps(object, invocation);
                 let scanned = dyndep.is_some() || modmap.is_some();
                 let mut launched = None;
-                let (rule, command): (Cow<'static, [u8]>, Option<Vec<u8>>) = if msvc {
+                let (rule, command): (Cow<'static, [u8]>, Option<Vec<u8>>) = if scan.is_some() {
                     (Cow::Borrowed(COMPILE_MSVC), None)
-                } else if self.commands.windows() {
-                    (
-                        Cow::Borrowed(crate::instrumented::ordinary_rule(
-                            scanned,
-                            depfile.is_some(),
-                        )),
-                        None,
-                    )
                 } else {
-                    let (rule, command) =
-                        crate::instrumented::compile(invocation, scanned, depfile.is_some());
+                    let (rule, command) = crate::instrumented::compile(
+                        invocation,
+                        scanned,
+                        depfile.is_some(),
+                        msvc,
+                        &self.commands,
+                    );
                     if command.is_some() {
                         (Cow::Borrowed(rule), command)
                     } else if let Some(info) = crate::instrumented::launched(
@@ -178,11 +182,24 @@ impl<'a> Graph<'a> {
                         &self.launcher_slots,
                         scanned,
                         depfile.is_some(),
+                        msvc,
+                        &self.commands,
                     ) {
                         let rule = info.rule.clone();
                         let cmd = info.command.clone();
                         launched = Some(info);
                         (rule, Some(cmd))
+                    } else if let Some(synth_rule) = self
+                        .step_owner
+                        .get(&step_index)
+                        .and_then(|&owner| self.input.targets.get(owner))
+                        .and_then(|target| {
+                            crate::modules::synthetic_compile_rule_name(&target.name, self.config)
+                        })
+                    {
+                        (Cow::Owned(synth_rule.into()), None)
+                    } else if msvc {
+                        (Cow::Borrowed(COMPILE_MSVC), None)
                     } else {
                         (Cow::Borrowed(rule), None)
                     }
@@ -445,12 +462,10 @@ impl<'a> Graph<'a> {
                     HashSet::new()
                 };
                 for node in lib_implicit {
-                    if no_shared
+                    if !(no_shared
                         && self.is_shared_library_input(&node)
-                        && !explicit_link_depends.contains(&node)
+                        && !explicit_link_depends.contains(&node))
                     {
-                        plan.order_only.push(node);
-                    } else {
                         plan.implicit_inputs.push(node);
                     }
                 }
@@ -467,12 +482,7 @@ impl<'a> Graph<'a> {
                             continue;
                         }
                         let token = frag.text.value.as_slice();
-                        if !token.is_empty()
-                            && !token.starts_with(b"-")
-                            && !token.ends_with(b"/")
-                            && !token.ends_with(b".framework")
-                            && self.commands.absolute(token)
-                        {
+                        if self.is_absolute_library_fragment(token) {
                             let seen = seen.get_or_insert_with(|| {
                                 plan.implicit_inputs
                                     .iter()
@@ -481,15 +491,12 @@ impl<'a> Graph<'a> {
                                     .collect()
                             });
                             let node = self.node(token);
-                            if seen.insert(node.clone()) {
-                                if no_shared
+                            if seen.insert(node.clone())
+                                && !(no_shared
                                     && self.is_shared_library_input(&node)
-                                    && !explicit_link_depends.contains(&node)
-                                {
-                                    plan.order_only.push(node);
-                                } else {
-                                    plan.implicit_inputs.push(node);
-                                }
+                                    && !explicit_link_depends.contains(&node))
+                            {
+                                plan.implicit_inputs.push(node);
                             }
                         }
                     }
@@ -699,5 +706,32 @@ impl<'a> Graph<'a> {
             }
         };
         Ok(plan)
+    }
+
+    fn is_absolute_library_fragment(&self, token: &[u8]) -> bool {
+        if token.is_empty()
+            || token.starts_with(b"-")
+            || token.ends_with(b"/")
+            || token.ends_with(b".framework")
+        {
+            return false;
+        }
+        if self.target_is_windows() || self.commands.windows() {
+            let drive = token.first().is_some_and(u8::is_ascii_alphabetic)
+                && token.get(1) == Some(&b':')
+                && matches!(token.get(2), Some(b'/' | b'\\'));
+            let unc = token.starts_with(b"//") || token.starts_with(b"\\\\");
+            return drive || unc;
+        }
+        if let Some(rest) = token.strip_prefix(b"/") {
+            let first_segment = rest
+                .split(|&byte| byte == b'/' || byte == b'\\')
+                .next()
+                .unwrap_or(rest);
+            if first_segment.contains(&b':') {
+                return false;
+            }
+        }
+        self.commands.absolute(token)
     }
 }

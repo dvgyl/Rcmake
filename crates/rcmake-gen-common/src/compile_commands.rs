@@ -59,7 +59,10 @@ pub fn render_selected(
             .filter_map(|(id, object)| selection.contains(&id).then_some(object))
             .collect()
     });
-    if generator != GeneratorKind::UnixMakefiles {
+    if !matches!(
+        generator,
+        GeneratorKind::UnixMakefiles | GeneratorKind::NMakeMakefiles
+    ) {
         return render_with_directories(graphs, build_dir, &HashMap::new(), true, objects.as_ref());
     }
 

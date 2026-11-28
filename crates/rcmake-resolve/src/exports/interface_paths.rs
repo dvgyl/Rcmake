@@ -19,7 +19,7 @@ pub(super) fn validate(
             && Lexical::new(&Lexical::new(parent).normalize())
                 .prefix(Lexical::new(&Lexical::new(child).normalize()))
     };
-    let body = if !Lexical::new(value).absolute() {
+    let body = if !crate::usage::paths::full_path_for_model(model, target.dir, value) {
         format!("contains relative path:\n  \"{value}\"")
     } else {
         let binary = inside(&root.binary_dir, value);

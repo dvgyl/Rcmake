@@ -718,7 +718,8 @@ fn open_link_paths(
     step: &LinkStep,
     usage: &mut UsageResolver<'_>,
 ) -> Result<RuntimeLibraries, ResolveError> {
-    let mut libraries = linked_libraries(step);
+    let mut libraries =
+        linked_libraries(step, super::super::shell::windows_host(model, target.dir));
     if is_darwin(model, target.dir) {
         libraries.extend(frameworks::named_framework_files(
             model, target, config, step, &libraries,

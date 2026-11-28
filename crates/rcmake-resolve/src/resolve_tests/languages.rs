@@ -279,11 +279,26 @@ fn autogen_writes_metadata_for_the_generated_sources() -> TestResult {
     )?;
 
     let first = resolve(&model, &host, &[])?;
-    let info = first
-        .metadata
-        .generated_files
+    assert!(
+        !first
+            .metadata
+            .generated_files
+            .iter()
+            .any(|path| path.ends_with(b"AutogenInfo.json")),
+        "AutogenInfo.json must not be registered as a RERUN_CMAKE output"
+    );
+    let graph = first.graphs.first().ok_or("Missing Qt build graph.")?;
+    let info = graph
+        .steps
         .iter()
-        .find(|path| path.ends_with(b"AutogenInfo.json"))
+        .find_map(|step| match step {
+            BuildStep::Custom(custom) => custom
+                .invocations
+                .iter()
+                .flat_map(|command| &command.argv)
+                .find(|arg| arg.ends_with(b"AutogenInfo.json")),
+            _ => None,
+        })
         .ok_or("Missing Qt metadata path.")?;
     let info_file = rcmake_host::path::to_native(info);
     let read = || host.read(&info_file, rcmake_host::ReadRange::All { limit: 65_536 });
@@ -291,20 +306,12 @@ fn autogen_writes_metadata_for_the_generated_sources() -> TestResult {
     let text = String::from_utf8(data.clone())?;
     assert!(text.contains("QT_MOC_EXECUTABLE"));
     assert!(text.contains("example.h"));
-    let graph = first.graphs.first().ok_or("Missing Qt build graph.")?;
     assert!(
         graph
             .steps
             .iter()
             .any(|step| matches!(step, BuildStep::Compile { source, .. }
         if source.ends_with(b"mocs_compilation.cpp")))
-    );
-    assert!(
-        graph
-            .steps
-            .iter()
-            .any(|step| matches!(step, BuildStep::Custom(custom)
-        if custom.invocations.iter().any(|command| command.argv.contains(info))))
     );
 
     let autogen = first
@@ -375,11 +382,26 @@ fn autogen_and_object_intermediate_directory_strategies_are_independent() -> Tes
             &host,
             &[ConfigId("Debug".into()), ConfigId("Release".into())],
         )?;
+        assert!(
+            !result
+                .metadata
+                .generated_files
+                .iter()
+                .any(|path| path.ends_with(b"AutogenInfo.json")),
+            "AutogenInfo.json must not be registered as a RERUN_CMAKE output"
+        );
         let info = result
-            .metadata
-            .generated_files
+            .graphs
             .iter()
-            .find(|path| path.ends_with(b"AutogenInfo.json"))
+            .flat_map(|graph| &graph.steps)
+            .find_map(|step| match step {
+                BuildStep::Custom(custom) => custom
+                    .invocations
+                    .iter()
+                    .flat_map(|command| &command.argv)
+                    .find(|arg| arg.ends_with(b"AutogenInfo.json")),
+                _ => None,
+            })
             .ok_or("Missing autogen information.")?;
         assert_eq!(info.to_string().contains("/.o/"), short_autogen, "{info}");
         for app in result

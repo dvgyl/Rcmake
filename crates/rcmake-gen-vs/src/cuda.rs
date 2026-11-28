@@ -297,6 +297,8 @@ pub(crate) struct SourceOptions<'a> {
     pub(crate) object_output: Option<&'a str>,
     /// NASM output switch from the Visual Studio flag table.
     pub(crate) nasm_output_switch: Option<&'a str>,
+    /// `VS_SETTINGS` metadata names and values, written last.
+    pub(crate) metadata: &'a [(&'a str, &'a str)],
 }
 
 /// Write a CUDA source item in an ItemGroup.
@@ -324,7 +326,7 @@ fn source_item(
     nasm: bool,
     source: &SourceOptions<'_>,
 ) {
-    let path = msbuild(&windows(source.path));
+    let path = crate::msbuild_item(&windows(source.path));
     let mut attrs = vec![("Include", path.as_str())];
     if let Some(condition) = source.condition {
         attrs.push(("Condition", condition));
@@ -359,6 +361,9 @@ fn source_item(
                 .collect::<Vec<_>>();
             xml.text("AdditionalDependencies", &[], &inputs.join(";"));
         }
+    }
+    for (name, value) in source.metadata {
+        xml.text(name, &[], value);
     }
     xml.end();
 }

@@ -48,7 +48,8 @@ pub(super) fn module_map_flag(model: &ProjectModel, target: &Target, path: &[u8]
 }
 
 pub(super) fn is_std_bmi(model: &ProjectModel, target: &Target) -> bool {
-    crate::cxx_modules::is_std_provider(target)
+    (crate::cxx_modules::is_std_provider(target)
+        || crate::cxx_modules::is_synthetic_provider(target))
         && definition(model, target.dir, b"CMAKE_CXX_COMPILER_ID")
             .is_none_or(|id| id != b"MSVC".as_slice())
 }

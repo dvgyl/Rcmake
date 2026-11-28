@@ -20,7 +20,7 @@ impl UsageResolver<'_> {
         target: TargetId,
         ctx: &EvalContext,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
-        self.order_links(target, ctx, false)
+        self.order_links(target, ctx, false, false)
     }
 
     pub(crate) fn ordered_links_for_result(
@@ -28,7 +28,15 @@ impl UsageResolver<'_> {
         target: TargetId,
         ctx: &EvalContext,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
-        self.order_links(target, ctx, self.provenance.is_some())
+        self.order_links(target, ctx, self.provenance.is_some(), false)
+    }
+
+    pub(crate) fn ordered_runtime_links(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
+        self.order_links(target, ctx, false, true)
     }
 
     fn order_links(
@@ -36,6 +44,7 @@ impl UsageResolver<'_> {
         target: TargetId,
         ctx: &EvalContext,
         record: bool,
+        include_shared_deps: bool,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
         let ctx = link_context(target, ctx);
         let owner = self.target(target)?;
@@ -162,36 +171,41 @@ impl UsageResolver<'_> {
                 ResolveError::Message(body) => error(body),
                 other => other,
             })?;
-        if let Some(paths) = paths {
+        if !include_shared_deps && let Some(paths) = paths {
             warn_policy(model, paths, owner, 156);
             if owner.policies.policies.get(PolicyId::new(156)) == PolicyStatus::New {
                 warn_policy(model, paths, owner, 179);
             }
         }
-        let debug = paths.filter(|_| {
-            owner
-                .props
-                .get(b"LINK_DEPENDS_DEBUG_MODE")
-                .is_some_and(|value| truth::is_on(value))
-                || definition(model, owner.dir, b"CMAKE_LINK_DEPENDS_DEBUG_MODE")
+        let debug = (!include_shared_deps)
+            .then_some(paths)
+            .flatten()
+            .filter(|_| {
+                owner
+                    .props
+                    .get(b"LINK_DEPENDS_DEBUG_MODE")
                     .is_some_and(|value| truth::is_on(value))
-        });
+                    || definition(model, owner.dir, b"CMAKE_LINK_DEPENDS_DEBUG_MODE")
+                        .is_some_and(|value| truth::is_on(value))
+            });
         // A shared library that appears only as a dependency of another shared
         // library constrains the order (`LinkEntry::SharedDep`). It stays on the
-        // link line only in the `Link` mode. The other modes use only its
-        // directory, which the runtime path lowering computes.
-        let mode = crate::lower::shared_dependency_mode(
-            model,
-            owner.dir,
-            ctx.link_language
-                .as_ref()
-                .map(|language| language.as_slice()),
-        );
-        ordered.retain(|item| {
-            !dependent_only.contains(&item.key())
-                || (mode == crate::lower::SharedDependencyMode::Link
-                    && crate::lower::links_shared_dependency(model, item))
-        });
+        // link line only in the `Link` mode, whereas runtime DLL collection keeps
+        // all shared dependencies in the final link order.
+        if !include_shared_deps {
+            let mode = crate::lower::shared_dependency_mode(
+                model,
+                owner.dir,
+                ctx.link_language
+                    .as_ref()
+                    .map(|language| language.as_slice()),
+            );
+            ordered.retain(|item| {
+                !dependent_only.contains(&item.key())
+                    || (mode == crate::lower::SharedDependencyMode::Link
+                        && crate::lower::links_shared_dependency(model, item))
+            });
+        }
         if let Some(paths) = debug {
             print_link_order(paths, model, owner, "link dependency ordering", &ordered);
         }
@@ -249,16 +263,20 @@ impl UsageResolver<'_> {
         }
         let mut dependent_only = HashSet::new();
         let mut budget = Limits::default().max_value_bytes / 64;
-        while let Some((depender, dependency)) = queue.pop_front() {
+        while let Some((depender, mut dependency)) = queue.pop_front() {
             budget = budget.checked_sub(1).ok_or_else(|| {
                 ResolveError::Message("The link dependency graph exceeds the size limit.".into())
             })?;
-            let key = dependency.key();
-            let new = !graph.nodes.contains_key(&key);
-            let index = graph.insert(&dependency);
-            if new {
-                dependent_only.insert(key);
+            if dependency.feature.is_some() {
+                Arc::make_mut(&mut dependency).feature = None;
             }
+            let key = dependency.key();
+            let index = if let Some(index) = graph.nodes.get_index_of(&key) {
+                index
+            } else {
+                dependent_only.insert(key);
+                graph.insert(&dependency)
+            };
             if let Some((_, (_, edges))) = graph.nodes.get_index_mut(depender) {
                 edges.insert(index);
             }
@@ -267,7 +285,13 @@ impl UsageResolver<'_> {
             {
                 let (interface, _) = self.usage_links(id, true, ctx)?;
                 for item in interface.iter() {
-                    queue.push_back((index, Arc::clone(item)));
+                    if let ResolvedLinkKind::Group { members, .. } = &item.kind {
+                        for member in members {
+                            queue.push_back((index, Arc::new(member.clone())));
+                        }
+                    } else {
+                        queue.push_back((index, Arc::clone(item)));
+                    }
                 }
                 for item in self.shared_dependencies(id, ctx)? {
                     queue.push_back((index, item));
@@ -279,7 +303,7 @@ impl UsageResolver<'_> {
 
     /// The runtime dependencies of a library on shared libraries that are not in
     /// its link interface (`cmLinkInterface::SharedDeps`).
-    fn shared_dependencies(
+    pub(super) fn shared_dependencies(
         &mut self,
         id: TargetId,
         ctx: &EvalContext,

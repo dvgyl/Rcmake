@@ -71,7 +71,8 @@ impl SourceUsage {
             Self::Includes => {
                 let mut seen = IndexSet::new();
                 let mut includes = Vec::new();
-                for path in set_values.into_iter().chain(source_values) {
+                for mut path in set_values.into_iter().chain(source_values) {
+                    path.value = normalize_include_path(&path.value);
                     if seen.insert(path.value.clone()) {
                         includes.push(InterfaceInclude {
                             path,
@@ -89,6 +90,14 @@ impl SourceUsage {
             }
         }
     }
+}
+
+fn normalize_include_path(path: &[u8]) -> BString {
+    let mut normalized = Lexical::new(path).normalize();
+    while normalized.len() > 1 && normalized.ends_with(b"/") && !normalized.ends_with(b":/") {
+        normalized.pop();
+    }
+    normalized
 }
 
 fn config_definition_property(config: &ConfigId) -> Vec<u8> {
@@ -546,8 +555,10 @@ pub(crate) struct SourceIndex<'a> {
     pub(crate) generator_facts: Option<&'a dyn crate::GeneratorFacts>,
     root_source_dir: Option<BString>,
     source_records: IndexMap<BString, IndexMap<BString, IndexSet<SourceRecord>>>,
+    ambiguous_prop_bindings: IndexMap<BString, IndexMap<BString, BString>>,
     absolute_sources: IndexMap<BString, IndexSet<BString>>,
     pub(super) generated: IndexMap<BString, IndexSet<BString>>,
+    custom_outputs: IndexMap<DirId, IndexSet<BString>>,
     pub(crate) output_source_reads: IndexMap<BString, IndexSet<TargetId>>,
     objects: IndexMap<BString, TargetId>,
     header_only: IndexMap<DirId, IndexSet<BString>>,
@@ -593,8 +604,10 @@ impl<'a> SourcePaths<'a> {
                 generator_facts: None,
                 root_source_dir: None,
                 source_records: IndexMap::new(),
+                ambiguous_prop_bindings: IndexMap::new(),
                 absolute_sources: IndexMap::new(),
                 generated: IndexMap::new(),
+                custom_outputs: IndexMap::new(),
                 output_source_reads: IndexMap::new(),
                 objects: IndexMap::new(),
                 header_only: IndexMap::new(),
@@ -709,10 +722,12 @@ impl<'a> SourcePaths<'a> {
     }
 
     pub(crate) fn index_source_records(&mut self, model: &ProjectModel) {
-        let Some(index) = self.index_mut() else {
+        let SourceIndexStorage::Owned(index) = &mut self.index else {
             return;
         };
+        let host = self.host;
         index.root_source_dir = Some(model.dir(DirId::ROOT).source_dir.clone());
+        index.ambiguous_prop_bindings.clear();
         for (_, dir) in model.dirs().filter(|(_, dir)| ambiguous_source_names(dir)) {
             let records = index
                 .source_records
@@ -782,6 +797,31 @@ impl<'a> SourcePaths<'a> {
                 }
             }
         }
+        bind_ambiguous_properties(model, host, index);
+    }
+
+    pub(crate) fn properties<'d>(
+        &self,
+        dir: &'d Directory,
+        source: &BString,
+    ) -> SourceProperties<'d> {
+        let mut props = properties(dir, source);
+        if ambiguous_source_names(dir)
+            && let Some(bindings) = self.ambiguous_prop_bindings.get(&dir.binary_dir)
+        {
+            if let Some(stem_key) = bindings.get(source) {
+                props.stem = dir.source_props.get(stem_key);
+            }
+            let binary = Lexical::new(&dir.binary_dir);
+            let source_lex = Lexical::new(source);
+            if binary.prefix(source_lex)
+                && let Some(relative) = source_lex.relative(binary)
+                && let Some(stem_key) = bindings.get(&absolute_path(&dir.source_dir, &relative))
+            {
+                props.stem_relative = dir.source_props.get(stem_key);
+            }
+        }
+        props
     }
 
     pub(crate) fn index_generated(
@@ -791,6 +831,7 @@ impl<'a> SourcePaths<'a> {
     ) -> Result<(), ResolveError> {
         if let Some(index) = self.index_mut() {
             index.generated.clear();
+            index.custom_outputs.clear();
             index.output_source_reads.clear();
         }
         let mut usage = UsageResolver::new(model).with_ide(self.ide);
@@ -806,8 +847,16 @@ impl<'a> SourcePaths<'a> {
                 }
             };
             let dir = model.dir(command.dir);
+            let is_output_command = command.kind == rcmake_model::CustomCommandKind::Output;
             if let Some(index) = self.index_mut() {
                 for path in outputs.into_iter().chain(byproducts) {
+                    if is_output_command {
+                        index
+                            .custom_outputs
+                            .entry(command.dir)
+                            .or_default()
+                            .insert(path.clone());
+                    }
                     index
                         .generated
                         .entry(path)
@@ -830,6 +879,12 @@ impl<'a> SourcePaths<'a> {
         }
         self.index_file_generations(model, config, &mut usage)?;
         Ok(())
+    }
+
+    pub(crate) fn is_custom_output_in_dir(&self, dir: DirId, path: &[u8]) -> bool {
+        self.custom_outputs
+            .get(&dir)
+            .is_some_and(|outputs| outputs.contains(path))
     }
 
     pub(crate) fn index_objects(&mut self, model: &ProjectModel, config: &ConfigId) {
@@ -917,6 +972,7 @@ impl<'a> SourcePaths<'a> {
             && source_path != binary_path
             && !self.generated_in(dir, source_path)
             && let Some((src_idx, _, src_props)) = dir.source_props.get_full(source_path)
+            && src_props.get(b"\0rcmake-source-absolute").is_some()
             && src_props
                 .get(b"\0rcmake-source-binary-alternative")
                 .is_none()
@@ -1461,24 +1517,33 @@ pub(crate) struct SourceProperties<'a> {
     source_dir: &'a BString,
     path: Option<&'a PropertyMap>,
     relative: Option<&'a PropertyMap>,
+    stem: Option<&'a PropertyMap>,
+    stem_relative: Option<&'a PropertyMap>,
 }
 
 impl<'a> SourceProperties<'a> {
     pub(crate) fn is_empty(self) -> bool {
-        self.path.is_none() && self.relative.is_none()
+        self.path.is_none()
+            && self.relative.is_none()
+            && self.stem.is_none()
+            && self.stem_relative.is_none()
     }
 
     pub(crate) fn get(self, name: &[u8]) -> Option<&'a BString> {
         self.path
             .and_then(|props| props.get(name))
             .or_else(|| self.relative.and_then(|props| props.get(name)))
+            .or_else(|| self.stem.and_then(|props| props.get(name)))
+            .or_else(|| self.stem_relative.and_then(|props| props.get(name)))
     }
 
     pub(crate) fn tracked_entries(self, name: &[u8]) -> Vec<BT<BString>> {
         let props = self
             .path
             .filter(|props| props.get(name).is_some())
-            .or_else(|| self.relative.filter(|props| props.get(name).is_some()));
+            .or_else(|| self.relative.filter(|props| props.get(name).is_some()))
+            .or_else(|| self.stem.filter(|props| props.get(name).is_some()))
+            .or_else(|| self.stem_relative.filter(|props| props.get(name).is_some()));
         props.map_or_else(Vec::new, |props| property_entries(props, name))
     }
 }
@@ -1493,10 +1558,66 @@ fn property_entries(props: &PropertyMap, name: &[u8]) -> Vec<BT<BString>> {
     }
 }
 
+fn bind_ambiguous_properties(model: &ProjectModel, host: &dyn Host, index: &mut SourceIndex<'_>) {
+    let exists = |path: &[u8]| {
+        host.metadata(&to_native(path), Follow::Yes)
+            .is_ok_and(|metadata| metadata.kind == FileKind::File)
+    };
+    for (_, dir) in model.dirs().filter(|(_, dir)| ambiguous_source_names(dir)) {
+        let records = index.source_records.get(&dir.binary_dir);
+        let mut dir_bindings = IndexMap::new();
+        for prop_key in dir.source_props.keys() {
+            let filename = Lexical::new(prop_key).filename();
+            if filename.is_empty()
+                || known_extension_offset(filename).is_some()
+                || dir.generated_sources.contains(prop_key)
+                || exists(prop_key)
+            {
+                continue;
+            }
+            let matched_record = records
+                .and_then(|map| map.get(filename))
+                .into_iter()
+                .flatten()
+                .find_map(|record| match record {
+                    SourceRecord::Absolute(abs) => {
+                        (abs != prop_key && matches_source_name(abs, prop_key)).then(|| abs.clone())
+                    }
+                    SourceRecord::Relative(rel) => {
+                        let rec_src = absolute_path(&dir.source_dir, rel);
+                        if rec_src != *prop_key && matches_source_name(&rec_src, prop_key) {
+                            return Some(rec_src);
+                        }
+                        let rec_bin = absolute_path(&dir.binary_dir, rel);
+                        (rec_bin != *prop_key && matches_source_name(&rec_bin, prop_key))
+                            .then_some(rec_bin)
+                    }
+                });
+            let concrete = matched_record.or_else(|| {
+                KNOWN_EXTENSIONS.iter().find_map(|&ext| {
+                    let candidate: BString = [prop_key.as_slice(), b".", ext].concat().into();
+                    (dir.generated_sources.contains(&candidate) || exists(&candidate))
+                        .then_some(candidate)
+                })
+            });
+            if let Some(concrete) = concrete {
+                dir_bindings
+                    .entry(concrete)
+                    .or_insert_with(|| prop_key.clone());
+            }
+        }
+        if !dir_bindings.is_empty() {
+            index
+                .ambiguous_prop_bindings
+                .insert(dir.binary_dir.clone(), dir_bindings);
+        }
+    }
+}
+
 pub(crate) fn properties<'a>(dir: &'a Directory, source: &BString) -> SourceProperties<'a> {
-    let relative = || {
+    let relative = |path: &[u8]| {
         let binary = Lexical::new(&dir.binary_dir);
-        let source = Lexical::new(source);
+        let source = Lexical::new(path);
         if !binary.prefix(source) {
             return None;
         }
@@ -1508,7 +1629,9 @@ pub(crate) fn properties<'a>(dir: &'a Directory, source: &BString) -> SourceProp
     SourceProperties {
         source_dir: &dir.source_dir,
         path: dir.source_props.get(source),
-        relative: relative(),
+        relative: relative(source),
+        stem: None,
+        stem_relative: None,
     }
 }
 
@@ -1820,6 +1943,59 @@ fn extensionless_lookup_uses_directory_registration_order_and_binds_missing_firs
     assert!(
         err.to_string().contains("missing.c"),
         "expected missing.c diagnostic under CMP0115 OLD, got: {err}"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn normalize_include_path_strips_trailing_slash_and_keeps_roots() {
+    assert_eq!(
+        normalize_include_path(b"/src/third_party/pocketfft/"),
+        "/src/third_party/pocketfft"
+    );
+    assert_eq!(normalize_include_path(b"/"), "/");
+    assert_eq!(normalize_include_path(b"C:/"), "C:/");
+}
+
+#[cfg(test)]
+#[test]
+fn relative_generated_source_prefers_binary_dir_unless_source_record_is_absolute()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/src/shared.hh"), b"// source copy\n")?;
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/src".into(), "/build".into());
+    model.mark_generated(DirId::ROOT, "/build/shared.hh".into());
+    // Non-absolute property record on `/src/shared.hh` must NOT shadow `/build/shared.hh`.
+    model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/shared.hh".into())
+        .or_default()
+        .set("HEADER_FILE_ONLY".into(), "ON".into());
+    let mut paths = SourcePaths::new(&host);
+    paths.index_generated(&model, &ConfigId::default())?;
+    assert_eq!(
+        paths.find(model.dir(DirId::ROOT), b"shared.hh"),
+        Some(BString::from("/build/shared.hh"))
+    );
+
+    // An explicitly bound absolute source record recorded before the generated output wins.
+    let mut model2 = ProjectModel::default();
+    model2.set_root_dirs("/src".into(), "/build".into());
+    model2
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/src/shared.hh".into())
+        .or_default()
+        .set("\0rcmake-source-absolute".into(), "1".into());
+    model2.mark_generated(DirId::ROOT, "/build/shared.hh".into());
+    let mut paths2 = SourcePaths::new(&host);
+    paths2.index_generated(&model2, &ConfigId::default())?;
+    assert_eq!(
+        paths2.find(model2.dir(DirId::ROOT), b"shared.hh"),
+        Some(BString::from("/src/shared.hh"))
     );
     Ok(())
 }

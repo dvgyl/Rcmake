@@ -8,20 +8,17 @@ const NAMESPACE: [u8; 16] = [
 ];
 
 /// Get the cached GUID for a name, or calculate the CMake version-3 UUID.
+///
+/// CMake uses a non-empty `<name>_GUID_CMAKE` cache value exactly as given.
+/// For example, `include_external_msproject(ext ext.proj GUID aaa-bbb)`
+/// stores `aaa-bbb`, and the solution then refers to `{aaa-bbb}`.
 #[must_use]
 pub fn for_name(model: &ProjectModel, binary_dir: &str, name: &str) -> String {
     let key = format!("{name}_GUID_CMAKE");
-    if let Some(cached) = model.cache.get(key.as_bytes()) {
-        let value = String::from_utf8_lossy(&cached.value);
-        let bare = value.trim().trim_start_matches('{').trim_end_matches('}');
-        if bare.len() == 36
-            && bare.bytes().enumerate().all(|(index, byte)| match index {
-                8 | 13 | 18 | 23 => byte == b'-',
-                _ => byte.is_ascii_hexdigit(),
-            })
-        {
-            return format!("{{{}}}", bare.to_ascii_uppercase());
-        }
+    if let Some(cached) = model.cache.get(key.as_bytes())
+        && !cached.value.is_empty()
+    {
+        return format!("{{{}}}", String::from_utf8_lossy(&cached.value));
     }
 
     let mut hash = Md5::new();

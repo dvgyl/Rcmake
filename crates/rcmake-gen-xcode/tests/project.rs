@@ -518,6 +518,7 @@ fn native_xcodebuild_compiles_and_runs_program() {
                 stderr: Output::Capture,
                 timeout: Some(Duration::from_secs(timeout)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

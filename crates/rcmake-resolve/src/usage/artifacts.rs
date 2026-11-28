@@ -171,11 +171,23 @@ impl UsageResolver<'_> {
                 .props
                 .get(b"XCODE_ATTRIBUTE_GENERATE_TEXT_BASED_STUBS")
                 .is_some_and(|value| value.eq_ignore_ascii_case(b"NO"));
+        let windows_has_import_lib = !windows
+            || target.is_imported()
+            || target
+                .props
+                .get(b"IMPORT_SUFFIX")
+                .or_else(|| definition(self.model, target.dir, b"CMAKE_IMPORT_LIBRARY_SUFFIX"))
+                .is_none_or(|suffix| !suffix.is_empty());
         let import = matches!(kind, ImportFile | LinkerImportFile | SonameImportFile)
             || (kind == LinkerFile
-                && ((windows && matches!(target.kind, SharedLibrary | Executable))
+                && ((windows
+                    && windows_has_import_lib
+                    && matches!(target.kind, SharedLibrary | Executable))
                     || apple_import));
         if apple && import && !apple_import {
+            return Ok(None);
+        }
+        if windows && import && !windows_has_import_lib {
             return Ok(None);
         }
         if windows && import && target.kind == Executable && !on(target, b"ENABLE_EXPORTS") {
@@ -300,34 +312,60 @@ impl UsageResolver<'_> {
             return Ok(None);
         }
         if kind == PdbFile {
-            let Some(runtime) = self.output_artifact(id, File, ArtifactPart::Full, config)? else {
-                return Ok(None);
+            let dir = if matches!(part, ArtifactPart::Dir | ArtifactPart::Full) {
+                if target.props.get(b"PDB_OUTPUT_DIRECTORY").is_some()
+                    || target
+                        .props
+                        .get(format!("PDB_OUTPUT_DIRECTORY_{config_upper}").as_bytes())
+                        .is_some()
+                {
+                    self.artifact_output_directory(id, config, target, "PDB", &config_upper)?
+                } else {
+                    self.artifact_output_directory(id, config, target, category, &config_upper)?
+                }
+            } else {
+                BString::default()
             };
-            let base = self
-                .artifact_property(
+            let base = if matches!(
+                part,
+                ArtifactPart::Full | ArtifactPart::Name | ArtifactPart::BaseName
+            ) {
+                let cmp0202_new =
+                    target.policies.policies.get(PolicyId::new(202)) == PolicyStatus::New;
+                let postfix = target
+                    .props
+                    .get(format!("{config_upper}_POSTFIX").as_bytes())
+                    .filter(|_| !app);
+                let pdb_out = self.pdb_output_name(
                     id,
                     config,
-                    "PDB_NAME",
-                    &[format!("PDB_NAME_{config_upper}"), "PDB_NAME".into()],
-                )?
-                .filter(|value| !value.is_empty())
-                .unwrap_or(runtime.base);
-            let dir = if target.props.get(b"PDB_OUTPUT_DIRECTORY").is_some()
-                || target
-                    .props
-                    .get(format!("PDB_OUTPUT_DIRECTORY_{config_upper}").as_bytes())
-                    .is_some()
-            {
-                self.artifact_output_directory(id, config, target, "PDB", &config_upper)?
+                    target,
+                    category,
+                    &config_upper,
+                    cmp0202_new,
+                    postfix,
+                )?;
+                if cmp0202_new {
+                    append_postfix(pdb_out, postfix)
+                } else {
+                    pdb_out
+                }
             } else {
-                runtime.output_dir
+                BString::default()
             };
-            let file = [runtime.prefix.as_slice(), &base, b".pdb"].concat();
-            return Ok(Some(Artifact::from_path(
-                lower::join(&dir, &file),
-                &runtime.prefix,
-                b".pdb",
-            )));
+            let file = [prefix.as_slice(), &base, b".pdb"].concat();
+            let path = if dir.is_empty() {
+                file.into()
+            } else {
+                lower::join(&dir, &file)
+            };
+            return Ok(Some(Artifact {
+                output_dir: dir,
+                path,
+                prefix,
+                base,
+                suffix: ".pdb".into(),
+            }));
         }
         let nested = app || framework || module_bundle;
         let category = if framework && target.kind == TargetKind::SharedLibrary {
@@ -399,8 +437,12 @@ impl UsageResolver<'_> {
             .then_some(version.or_else(|| target.props.get(b"VERSION")))
             .flatten()
             .filter(|version| !version.is_empty());
+        let dll_soversion = (windows && !import && kind == File)
+            .then(|| lower::artifacts::dll_soversion(self.model, target))
+            .flatten();
         let file = match version {
             _ if let Some(version) = exe_version => [p, n, s, b"-", version.as_slice()].concat(),
+            _ if let Some(soversion) = dll_soversion => [p, n, b"-", soversion, s].concat(),
             Some(version) if apple => [p, n, b".", version.as_slice(), s].concat(),
             Some(version) => [p, n, s, b".", version.as_slice()].concat(),
             None => [p, n, s].concat(),
@@ -526,6 +568,112 @@ impl UsageResolver<'_> {
                 .map(|path| lower::build_relative(self.model, &path)),
         };
         Ok((artifacts, naming))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "PDB output name resolution checks policy, config, category, and postfix."
+    )]
+    fn pdb_output_name(
+        &self,
+        id: TargetId,
+        config: &ConfigId,
+        target: &Target,
+        category: &str,
+        config_upper: &BString,
+        cmp0202_new: bool,
+        postfix: Option<&BString>,
+    ) -> Result<BString, ResolveError> {
+        let key = (id, config.clone(), BString::from("PDB_NAME"));
+        if self.artifact_properties.contains(&key) {
+            return Err(GenexError::ArtifactCycle {
+                target: target.name.clone(),
+                property: "PDB_NAME",
+            }
+            .into());
+        }
+        if self.artifact_properties.len() >= super::MAX_WALK_DEPTH {
+            return Err(GenexError::TooDeep.into());
+        }
+        let mut resolver = self.fork_for_artifacts();
+        resolver.artifact_properties.push(key);
+        let pdb_names = if config_upper.is_empty() {
+            vec!["PDB_NAME".to_owned()]
+        } else {
+            vec![format!("PDB_NAME_{config_upper}"), "PDB_NAME".to_owned()]
+        };
+        let raw_pdb = pdb_names
+            .iter()
+            .find_map(|name| target.props.get(name.as_bytes()).map(|value| (name, value)));
+        if let Some((name, value)) = raw_pdb
+            && !value.is_empty()
+        {
+            if !value.windows(2).any(|window| window == b"$<") {
+                return Ok(value.clone());
+            }
+            let ctx = EvalContext {
+                head: Some(handle(id)),
+                config: config.clone(),
+                ..Default::default()
+            };
+            let entry = BT::new(value.clone(), target.backtrace.clone());
+            let (evaluated, _) =
+                resolver.eval_entry(id, target.dir, name.as_bytes(), &entry, &ctx, false)?;
+            return Ok(evaluated);
+        }
+        let output_name = resolver
+            .artifact_property(
+                id,
+                config,
+                "OUTPUT_NAME",
+                &lower::output_name_keys(category, config_upper.as_slice())
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )?
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| target.name.clone());
+        if cmp0202_new {
+            Ok(output_name)
+        } else {
+            Ok(append_postfix(output_name, postfix))
+        }
+    }
+
+    pub(super) fn pdb_base_name_without_postfix(
+        &self,
+        id: TargetId,
+        config: &ConfigId,
+    ) -> Result<Option<BString>, ResolveError> {
+        let Some(target) = self.model.target(id) else {
+            return Ok(None);
+        };
+        if !matches!(
+            target.kind,
+            TargetKind::Executable | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+        ) {
+            return Ok(None);
+        }
+        let config_upper = BString::from(config.0.to_ascii_uppercase());
+        let category = if target.kind == TargetKind::ModuleLibrary {
+            "LIBRARY"
+        } else {
+            "RUNTIME"
+        };
+        let cmp0202_new = target.policies.policies.get(PolicyId::new(202)) == PolicyStatus::New;
+        let postfix = target
+            .props
+            .get(format!("{config_upper}_POSTFIX").as_bytes());
+        let output = self.pdb_output_name(
+            id,
+            config,
+            target,
+            category,
+            &config_upper,
+            cmp0202_new,
+            postfix,
+        )?;
+        Ok(Some(output))
     }
 
     fn artifact_property(
@@ -704,6 +852,14 @@ impl UsageResolver<'_> {
             );
         }
         Some(list::join(files))
+    }
+}
+
+fn append_postfix(name: BString, postfix: Option<&BString>) -> BString {
+    if let Some(postfix) = postfix {
+        [name.as_slice(), postfix.as_slice()].concat().into()
+    } else {
+        name
     }
 }
 
@@ -922,7 +1078,7 @@ fn imported_configs(value: &[u8]) -> Vec<BString> {
         .collect()
 }
 
-pub(super) fn selected_imported_config(target: &Target, config: &ConfigId) -> Option<BString> {
+pub(crate) fn selected_imported_config(target: &Target, config: &ConfigId) -> Option<BString> {
     if advertised_imports(target) {
         selected_imported_config_new(target, config)
     } else {

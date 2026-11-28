@@ -643,7 +643,8 @@ fn explicit_full_path_source_precedes_later_generated_output() -> TestResult {
         .dir_mut(DirId::ROOT)
         .source_props
         .entry(src_dup.as_str().into())
-        .or_default();
+        .or_default()
+        .set("\0rcmake-source-absolute".into(), "1".into());
     let mut cmd = rcmake_model::CustomCommand::new(
         DirId::ROOT,
         rcmake_model::CustomCommandKind::Output,

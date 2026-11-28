@@ -227,14 +227,17 @@ fn resolve_destination(
         {
             continue;
         }
-        let destination = options.destination.or_else(|| {
-            (set.kind == FileSetKind::Headers).then(|| {
-                model
-                    .definition(dir, b"CMAKE_INSTALL_INCLUDEDIR")
-                    .cloned()
-                    .unwrap_or_else(|| "include".into())
-            })
-        });
+        let destination = options
+            .destination
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                (set.kind == FileSetKind::Headers).then(|| {
+                    model
+                        .definition(dir, b"CMAKE_INSTALL_INCLUDEDIR")
+                        .cloned()
+                        .unwrap_or_else(|| "include".into())
+                })
+            });
         if let Some(destination) = destination {
             let ctx = EvalContext {
                 config: config.clone(),

@@ -129,6 +129,7 @@ pub(super) fn generate_multi(
             .metadata
             .generated_files
             .iter()
+            .filter(|file| !is_autogen_info_file(file))
             .map(|file| default.node(file)),
     );
     add_install_scripts(&mut manifests, default, result, model);
@@ -155,6 +156,7 @@ pub(super) fn generate_multi(
         host,
         build_dir,
         uses_modules,
+        true,
         model,
         &commands,
         &programs.cmake,
@@ -240,14 +242,19 @@ pub(super) fn generate_multi(
         if !cross.is_empty() {
             graph.emit_aliases(&mut ninja, Some(b"all"), &cross, &emitted);
         }
+        let regen_pos = ninja.0.len();
         emit_regeneration(
             &mut ninja,
             graph,
+            host,
             &manifests,
             result,
             &regenerate,
             verify_globs.then_some(programs.cmake.as_slice()),
             has_cache,
+        );
+        crate::emit_start_instrument_edges(
+            &mut ninja, graph, regen_pos, result, model, host, build_dir,
         );
         crate::write_always(
             host,
@@ -502,6 +509,12 @@ pub(crate) fn emit_clean<'a>(
     if !cross.is_empty() {
         emit(b"all", cross);
     }
+}
+
+fn is_autogen_info_file(path: &[u8]) -> bool {
+    let filename = rcmake_base::path_lex::Lexical::new(path).filename();
+    filename == b"AutogenInfo.json"
+        || (filename.starts_with(b"AutoRcc_") && filename.ends_with(b"_Info.json"))
 }
 
 #[cfg(test)]

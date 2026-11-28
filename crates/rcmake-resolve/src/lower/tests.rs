@@ -2183,3 +2183,1009 @@ fn explicit_link_depends_stays_in_implicit_inputs_when_also_linked() -> TestResu
     );
     Ok(())
 }
+
+#[test]
+fn cluster1_windows_interface_sources_and_export_paths() -> TestResult {
+    let mut model = fixture("Windows");
+    model.set_root_dirs("/src".into(), "/build".into());
+    var(&mut model, "CMAKE_HOST_SYSTEM_NAME", "Windows");
+    let mut iface = raw_target("iface", TargetKind::InterfaceLibrary);
+    iface.usage.push(
+        rcmake_model::UsageField::InterfaceSources,
+        bt("/src/iface.c"),
+    );
+    model.add_target(iface)?;
+    let mut app = raw_target("app", TargetKind::Executable);
+    app.sources.push(bt("main.c"));
+    app.usage.link_libraries = Some(vec![rcmake_model::LinkItem {
+        text: bt("iface"),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(rcmake_model::UsageScope::Private),
+    }]);
+    model.add_target(app)?;
+
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/src/iface.c"), b"int f(){return 1;}")?;
+    host.seed_file(
+        std::path::Path::new("/src/main.c"),
+        b"int main(){return 0;}",
+    )?;
+    let result = crate::resolve(&model, &host, &[])?;
+    assert!(
+        result.targets[1]
+            .compile_units
+            .iter()
+            .any(|unit| unit.source.value == "/src/iface.c")
+    );
+    assert!(crate::usage::paths::full_path_for_model(
+        &model,
+        DirId::ROOT,
+        b"C:/src/iface.c"
+    ));
+
+    // Relative interface source must still be rejected.
+    let mut bad_model = model.clone();
+    let iface_id = bad_model
+        .find_target(DirId::ROOT, b"iface")
+        .ok_or("iface")?;
+    bad_model
+        .target_mut(iface_id)
+        .ok_or("iface mut")?
+        .usage
+        .push(rcmake_model::UsageField::InterfaceSources, bt("rel/bad.c"));
+    assert!(crate::resolve(&bad_model, &host, &[]).is_err());
+
+    // Export interface path validation accepts `/include` and unterminated genex on Windows.
+    let target = model.target(iface_id).ok_or("iface")?;
+    let mut export_model = model.clone();
+    export_model
+        .target_mut(iface_id)
+        .ok_or("iface mut")?
+        .usage
+        .push(
+            rcmake_model::UsageField::InterfaceIncludeDirectories,
+            bt("/include;/include/$<BUILD_INTERFACE:subdir"),
+        );
+    let _ = target;
+    let export_target = export_model.target(iface_id).ok_or("iface")?;
+    let mut usage = crate::usage::UsageResolver::new(&export_model);
+    let _ = &mut usage;
+    assert!(crate::usage::paths::full_path_for_model(
+        &export_model,
+        export_target.dir,
+        b"/include"
+    ));
+    assert!(crate::usage::paths::full_path_for_model(
+        &export_model,
+        export_target.dir,
+        b"/include/$<BUILD_INTERFACE:subdir"
+    ));
+    assert!(!crate::usage::paths::full_path_for_model(
+        &export_model,
+        export_target.dir,
+        b"relative/include"
+    ));
+
+    // POSIX host cross-compiling to Windows uses host path rules, not target platform rules.
+    let mut cross_model = fixture("Windows");
+    var(&mut cross_model, "CMAKE_HOST_SYSTEM_NAME", "Linux");
+    assert!(!crate::usage::paths::full_path_for_model(
+        &cross_model,
+        DirId::ROOT,
+        b"C:/src/iface.c"
+    ));
+    Ok(())
+}
+
+#[test]
+fn cluster2_windows_optional_import_libs_and_module_defaults() -> TestResult {
+    let mut model = fixture("Windows");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    var(&mut model, "CMAKE_IMPORT_LIBRARY_SUFFIX", ".lib");
+    var(&mut model, "CMAKE_INSTALL_BINDIR", "custom_bin");
+
+    let mut shared = raw_target("shlib", TargetKind::SharedLibrary);
+    shared.sources.push(bt("a.c"));
+    let shared_id = model.add_target(shared)?;
+
+    let mut exe = raw_target("app", TargetKind::Executable);
+    exe.props.set("ENABLE_EXPORTS".into(), "ON".into());
+    exe.sources.push(bt("b.c"));
+    let exe_id = model.add_target(exe)?;
+
+    let mut module = raw_target("plug", TargetKind::ModuleLibrary);
+    module.sources.push(bt("c.c"));
+    let module_id = model.add_target(module)?;
+
+    model.add_install(rcmake_model::InstallRule {
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        kind: rcmake_model::InstallKind::Targets {
+            targets: vec![shared_id, exe_id, module_id],
+            export: None,
+        },
+        options: rcmake_model::InstallOptions::default(),
+    });
+    for (idx, arg) in ["TARGETS", "ARCHIVE", "DESTINATION", "lib"]
+        .into_iter()
+        .enumerate()
+    {
+        model
+            .global
+            .props
+            .set(format!("_RCMAKE_INSTALL_0_ARG{idx}").into(), arg.into());
+    }
+    model.add_install(rcmake_model::InstallRule {
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        kind: rcmake_model::InstallKind::Targets {
+            targets: vec![shared_id],
+            export: None,
+        },
+        options: rcmake_model::InstallOptions::default(),
+    });
+
+    let host = rcmake_host::PureHost::default();
+    for src in ["/project/a.c", "/project/b.c", "/project/c.c"] {
+        host.seed_file(std::path::Path::new(src), b"int x(){return 0;}")?;
+    }
+    let result = crate::resolve(&model, &host, &[])?;
+
+    // Shared library (rule 1, no explicit destinations):
+    // install script marks the import lib OPTIONAL while File API preserves declared OPTIONAL.
+    let shared_imp_action = result
+        .install
+        .actions
+        .iter()
+        .find(|act| matches!(&act.kind, InstallActionKind::Files { file_type, files, .. } if file_type == "STATIC_LIBRARY" && files.iter().any(|f| f.ends_with(b"shlib.lib"))))
+        .ok_or("missing shared import install action")?;
+    let shared_dll_action = result
+        .install
+        .actions
+        .iter()
+        .find(|act| matches!(&act.kind, InstallActionKind::Files { file_type, files, .. } if file_type == "SHARED_LIBRARY" && files.iter().any(|f| f.ends_with(b"shlib.dll"))))
+        .ok_or("missing shared dll install action")?;
+    assert!(
+        shared_imp_action.optional,
+        "Windows shared import library install script action must be optional"
+    );
+    assert!(
+        !shared_dll_action.optional,
+        "Windows shared DLL install script action must remain required"
+    );
+    let shared_installers: Vec<_> = result
+        .install
+        .target_installers
+        .iter()
+        .filter(|inst| inst.rule == 1 && inst.target == shared_id)
+        .collect();
+    let imp = shared_installers
+        .iter()
+        .find(|inst| inst.import_library)
+        .ok_or("missing shared import installer")?;
+    let dll = shared_installers
+        .iter()
+        .find(|inst| !inst.import_library)
+        .ok_or("missing shared dll installer")?;
+    assert!(
+        !imp.optional,
+        "File API shared import installer must preserve declared OPTIONAL flag"
+    );
+    assert!(!dll.optional, "Windows DLL must remain required");
+
+    // Exported executable (rule 0): has optional ARCHIVE import-library installer,
+    // and RUNTIME installer contains only the executable (not .lib).
+    let exe_imp = result
+        .install
+        .target_installers
+        .iter()
+        .find(|inst| inst.rule == 0 && inst.target == exe_id && inst.import_library)
+        .ok_or("missing exported exe import installer")?;
+    assert!(exe_imp.optional);
+    assert_eq!(exe_imp.destination, "lib");
+    let exe_rt = result
+        .install
+        .target_installers
+        .iter()
+        .find(|inst| inst.rule == 0 && inst.target == exe_id && !inst.import_library)
+        .ok_or("missing exported exe runtime installer")?;
+    assert!(
+        exe_rt
+            .paths
+            .iter()
+            .all(|(_, name)| !name.ends_with(b".lib")),
+        "RUNTIME installer must not include .lib: {:?}",
+        exe_rt.paths
+    );
+
+    // Module library on DLL platform defaults to CMAKE_INSTALL_BINDIR (`custom_bin`).
+    let mod_inst = result
+        .install
+        .target_installers
+        .iter()
+        .find(|inst| inst.rule == 0 && inst.target == module_id)
+        .ok_or("missing module installer")?;
+    assert_eq!(mod_inst.destination, "custom_bin");
+    Ok(())
+}
+
+#[test]
+fn cluster3_def_eligibility_no_exe_implib_symlink_and_vs_nm_gating() -> TestResult {
+    let mut model = fixture("Windows");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    var(&mut model, "CMAKE_C_LINK_DEF_FILE_FLAG", "/DEF:");
+    var(&mut model, "CMAKE_NM", "C:/tools/llvm-nm.exe");
+    var(&mut model, "CMAKE_IMPORT_LIBRARY_SUFFIX", ".lib");
+    var(
+        &mut model,
+        "CMAKE_C_LINK_EXECUTABLE",
+        "<CMAKE_LINKER> /out:<TARGET> /implib:<TARGET_IMPLIB> <LINK_FLAGS> <OBJECTS>",
+    );
+
+    let mut plain_exe = raw_target("plain", TargetKind::Executable);
+    plain_exe
+        .props
+        .set("WINDOWS_EXPORT_ALL_SYMBOLS".into(), "ON".into());
+    plain_exe.sources.push(bt("main.c"));
+    model.add_target(plain_exe)?;
+
+    let mut exported_exe = raw_target("say", TargetKind::Executable);
+    exported_exe.props.set("ENABLE_EXPORTS".into(), "ON".into());
+    exported_exe
+        .props
+        .set("WINDOWS_EXPORT_ALL_SYMBOLS".into(), "ON".into());
+    exported_exe.sources.push(bt("main.c"));
+    model.add_target(exported_exe)?;
+
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(
+        std::path::Path::new("/project/main.c"),
+        b"int main(){return 0;}",
+    )?;
+    let result = crate::resolve(&model, &host, &[])?;
+    let graph = &result.graphs[0];
+    let link_invocations = |name: &str| {
+        let target = graph.targets.iter().find(|t| t.name == name)?;
+        target
+            .steps
+            .iter()
+            .find_map(|&idx| match &graph.steps[idx] {
+                BuildStep::Link { invocations, .. } => Some(invocations),
+                _ => None,
+            })
+    };
+
+    // Executable without ENABLE_EXPORTS must NOT run __create_def.
+    let plain_cmds = link_invocations("plain").ok_or("missing plain link")?;
+    assert!(
+        !plain_cmds
+            .iter()
+            .any(|inv| inv.argv.iter().any(|arg| arg == "__create_def")),
+        "plain exe must not generate .def: {plain_cmds:?}"
+    );
+
+    // Exported executable runs __create_def with --nm on Ninja, and does NOT run cmake_symlink_executable.
+    let say_cmds = link_invocations("say").ok_or("missing say link")?;
+    assert!(
+        say_cmds
+            .iter()
+            .any(|inv| inv.argv.iter().any(|arg| arg == "__create_def")
+                && inv
+                    .argv
+                    .iter()
+                    .any(|arg| arg == "--nm=C:/tools/llvm-nm.exe")),
+        "Ninja exported exe must pass --nm: {say_cmds:?}"
+    );
+    assert!(
+        !say_cmds
+            .iter()
+            .any(|inv| inv.argv.iter().any(|arg| arg == "cmake_symlink_executable")),
+        "Windows exported exe must not overwrite implib with cmake_symlink_executable: {say_cmds:?}"
+    );
+
+    // Visual Studio: generator toolset governs --nm (v143 omits even if target overrides VS_PLATFORM_TOOLSET).
+    for (toolset, expect_nm) in [("v143", false), ("ClangCL", true)] {
+        let mut vs_model = model.clone();
+        vs_model.generator = Some(rcmake_model::GeneratorKind::VisualStudio(
+            rcmake_model::VsVersion::Vs17,
+        ));
+        var(&mut vs_model, "CMAKE_VS_PLATFORM_TOOLSET", toolset);
+        if !expect_nm
+            && let Some(say_id) = vs_model.find_target(DirId::ROOT, b"say")
+            && let Some(say_raw) = vs_model.target_mut(say_id)
+        {
+            say_raw
+                .props
+                .set("VS_PLATFORM_TOOLSET".into(), "ClangCL".into());
+        }
+        let vs_res = crate::resolve_with_options(
+            &vs_model,
+            &host,
+            &[ConfigId("Debug".into())],
+            &crate::ResolveOptions {
+                ide: Some(crate::ide::IdeFlavor::VisualStudio),
+                ..Default::default()
+            },
+        )?;
+        let vs_graph = &vs_res.graphs[0];
+        let say_target = vs_graph
+            .targets
+            .iter()
+            .find(|t| t.name == "say")
+            .ok_or("vs say")?;
+        let say_inv = say_target
+            .steps
+            .iter()
+            .find_map(|&idx| match &vs_graph.steps[idx] {
+                BuildStep::Link { invocations, .. } => Some(invocations),
+                _ => None,
+            })
+            .ok_or("vs say link")?;
+        let has_nm = say_inv.iter().any(|inv| {
+            inv.argv
+                .iter()
+                .any(|arg| arg == "--nm=C:/tools/llvm-nm.exe")
+        });
+        assert_eq!(has_nm, expect_nm, "toolset {toolset}: {say_inv:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn cluster4_wholearchive_runtime_dlls_win32_genex_and_cmp0212() -> TestResult {
+    let mut model = fixture("Windows");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    var(&mut model, "CMAKE_IMPORT_LIBRARY_SUFFIX", ".lib");
+    var(&mut model, "CMAKE_C_CREATE_WIN32_EXE", "/subsystem:windows");
+    var(
+        &mut model,
+        "CMAKE_C_CREATE_CONSOLE_EXE",
+        "/subsystem:console",
+    );
+    var(
+        &mut model,
+        "CMAKE_C_LINK_LIBRARY_USING_WHOLE_ARCHIVE_SUPPORTED",
+        "ON",
+    );
+    var(
+        &mut model,
+        "CMAKE_C_LINK_LIBRARY_USING_WHOLE_ARCHIVE",
+        "/WHOLEARCHIVE:<LINK_ITEM>",
+    );
+    var(
+        &mut model,
+        "CMAKE_C_LINK_EXECUTABLE",
+        "<CMAKE_LINKER> /out:<TARGET> <LINK_FLAGS> <OBJECTS> <LINK_LIBRARIES>",
+    );
+
+    let mut stat = raw_target("wholelib", TargetKind::StaticLibrary);
+    stat.sources.push(bt("a.c"));
+    model.add_target(stat)?;
+
+    let mut lib1 = raw_target("lib1", TargetKind::SharedLibrary);
+    lib1.sources.push(bt("a.c"));
+    let mut lib2 = raw_target("lib2", TargetKind::SharedLibrary);
+    lib2.sources.push(bt("a.c"));
+    let mut lib3 = raw_target("lib3", TargetKind::SharedLibrary);
+    lib3.sources.push(bt("a.c"));
+    lib1.usage.link_libraries = Some(vec![rcmake_model::LinkItem {
+        text: bt("lib2"),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(rcmake_model::UsageScope::Private),
+    }]);
+    lib1.usage.interface_link_libraries = Some(vec![rcmake_model::LinkItem {
+        text: bt("lib3"),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(rcmake_model::UsageScope::Interface),
+    }]);
+    model.add_target(lib1)?;
+    model.add_target(lib2)?;
+    model.add_target(lib3)?;
+
+    let mut imported = Target::new(
+        "imported".into(),
+        TargetKind::SharedLibrary,
+        rcmake_model::TargetOrigin::Imported(rcmake_model::ImportedVisibility::Global),
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    imported
+        .props
+        .set("IMPORTED_LOCATION".into(), "/project/imported.dll".into());
+    imported
+        .props
+        .set("IMPORTED_IMPLIB".into(), "/project/imported.lib".into());
+    model.add_target(imported)?;
+
+    let mut exe = raw_target("exe", TargetKind::Executable);
+    exe.sources.push(bt("main.c"));
+    exe.props
+        .set("WIN32_EXECUTABLE".into(), "$<CONFIG:Release>".into());
+    exe.usage.link_libraries = Some(vec![
+        rcmake_model::LinkItem {
+            text: bt("$<LINK_LIBRARY:WHOLE_ARCHIVE,wholelib>"),
+            lookup_dir: DirId::ROOT,
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
+            scope: Some(rcmake_model::UsageScope::Private),
+        },
+        rcmake_model::LinkItem {
+            text: bt("lib1"),
+            lookup_dir: DirId::ROOT,
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
+            scope: Some(rcmake_model::UsageScope::Private),
+        },
+        rcmake_model::LinkItem {
+            text: bt("imported"),
+            lookup_dir: DirId::ROOT,
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
+            scope: Some(rcmake_model::UsageScope::Private),
+        },
+    ]);
+    let exe_id = model.add_target(exe)?;
+
+    // CMP0212 OLD vs NEW custom command DEPENDS lookup.
+    let mut old_policies = rcmake_diag::PolicyMap::default();
+    old_policies.set(
+        rcmake_diag::PolicyId::new(212),
+        rcmake_diag::PolicyStatus::Old,
+    )?;
+    let mut cmd_old = rcmake_model::CustomCommand::new(
+        DirId::ROOT,
+        rcmake_model::CustomCommandKind::Output,
+        Default::default(),
+        old_policies,
+    );
+    cmd_old.outputs.push(bt("out_old.txt"));
+    cmd_old.depends.push(bt("exe.exe"));
+    model.add_command(cmd_old)?;
+
+    let mut new_policies = rcmake_diag::PolicyMap::default();
+    new_policies.set(
+        rcmake_diag::PolicyId::new(212),
+        rcmake_diag::PolicyStatus::New,
+    )?;
+    let mut cmd_new = rcmake_model::CustomCommand::new(
+        DirId::ROOT,
+        rcmake_model::CustomCommandKind::Output,
+        Default::default(),
+        new_policies,
+    );
+    cmd_new.outputs.push(bt("out_new.txt"));
+    cmd_new.depends.push(bt("exe.exe"));
+    model.add_command(cmd_new)?;
+
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/project/a.c"), b"int a(){return 1;}")?;
+    host.seed_file(
+        std::path::Path::new("/project/main.c"),
+        b"int main(){return 0;}",
+    )?;
+    let result = crate::resolve(&model, &host, &[ConfigId("Release".into())])?;
+
+    // /WHOLEARCHIVE: decorated on command line, real archive path in Ninja inputs.
+    let exe_graph = result.graphs[0]
+        .targets
+        .iter()
+        .find(|t| t.name == "exe")
+        .ok_or("exe graph")?;
+    let (inputs, invocations) = exe_graph
+        .steps
+        .iter()
+        .find_map(|&idx| match &result.graphs[0].steps[idx] {
+            BuildStep::Link {
+                inputs,
+                invocations,
+                ..
+            } => Some((inputs, invocations)),
+            _ => None,
+        })
+        .ok_or("exe link")?;
+    assert!(
+        !inputs.iter().any(|p| p.starts_with(b"/WHOLEARCHIVE:")),
+        "Ninja prerequisites must not contain /WHOLEARCHIVE: prefix: {inputs:?}"
+    );
+    assert!(
+        inputs
+            .iter()
+            .any(|p| p.ends_with(b"wholelib.a") || p.ends_with(b"wholelib.lib")),
+        "real archive file path must be in inputs: {inputs:?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|inv| inv.shell.windows(14).any(|w| w == b"/WHOLEARCHIVE:")),
+        "command line must keep /WHOLEARCHIVE: decoration: {invocations:?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|inv| inv.shell.windows(18).any(|w| w == b"/subsystem:windows")),
+        "WIN32_EXECUTABLE genex must evaluate ON in Release: {invocations:?}"
+    );
+
+    // TARGET_RUNTIME_DLLS order: lib1, imported, lib3, lib2.
+    let mut usage = crate::usage::UsageResolver::new(&model);
+    let ctx = rcmake_genex::EvalContext {
+        config: ConfigId("Release".into()),
+        head: Some(crate::usage::handle(exe_id)),
+        current: Some(crate::usage::handle(exe_id)),
+        ..Default::default()
+    };
+    let (dlls, _) = rcmake_genex::evaluate(
+        &rcmake_genex::parse(b"$<TARGET_RUNTIME_DLLS:exe>")?,
+        &ctx,
+        &mut usage.host(DirId::ROOT),
+    )?;
+    let names: Vec<_> = rcmake_base::list::split(&dlls, rcmake_base::list::Empty::Drop)
+        .into_iter()
+        .map(|p| BString::from(rcmake_base::path_lex::Lexical::new(&p).filename()))
+        .collect();
+    assert_eq!(names, ["lib1.dll", "imported.dll", "lib3.dll", "lib2.dll"]);
+
+    // CMP0212 OLD attaches target dependency on `exe`, NEW keeps plain file dependency.
+    let step_for = |out: &str| {
+        result.graphs[0].steps.iter().find_map(|step| match step {
+            BuildStep::Custom(custom) if custom.outputs.iter().any(|o| o == out) => Some(custom),
+            _ => None,
+        })
+    };
+    let old_step = step_for("out_old.txt").ok_or("old step")?;
+    let new_step = step_for("out_new.txt").ok_or("new step")?;
+    assert!(
+        old_step
+            .target_dependencies
+            .iter()
+            .any(|(id, _)| *id == exe_id)
+    );
+    assert!(new_step.target_dependencies.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cluster5_msvc_defines_pdb_cmp0202_runtime_checks_and_pch_pdb_dir() -> TestResult {
+    let mut model = fixture("Windows");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    var(&mut model, "CMAKE_C_COMPILER_ID", "MSVC");
+    var(&mut model, "CMAKE_IMPORT_LIBRARY_SUFFIX", ".lib");
+    var(&mut model, "CMAKE_C_LINKER_SUPPORTS_PDB", "ON");
+    var(
+        &mut model,
+        "CMAKE_C_SHARED_LIBRARY_COMPILE_DEFINITIONS",
+        "_WINDLL",
+    );
+    var(
+        &mut model,
+        "CMAKE_MSVC_RUNTIME_CHECKS_DEFAULT",
+        "StackFrameErrorCheck;UninitializedVariable",
+    );
+    var(
+        &mut model,
+        "CMAKE_C_COMPILE_OPTIONS_MSVC_RUNTIME_CHECKS_RTCsu",
+        "-RTC1",
+    );
+    var(
+        &mut model,
+        "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT_DEFAULT",
+        "ProgramDatabase",
+    );
+    var(
+        &mut model,
+        "CMAKE_C_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_ProgramDatabase",
+        "-Zi",
+    );
+
+    let mut policies = rcmake_diag::PolicyMap::default();
+    policies.set(
+        rcmake_diag::PolicyId::new(202),
+        rcmake_diag::PolicyStatus::New,
+    )?;
+    policies.set(
+        rcmake_diag::PolicyId::new(203),
+        rcmake_diag::PolicyStatus::New,
+    )?;
+    policies.set(
+        rcmake_diag::PolicyId::new(204),
+        rcmake_diag::PolicyStatus::New,
+    )?;
+
+    let mut lib = Target::new(
+        "sh".into(),
+        TargetKind::SharedLibrary,
+        rcmake_model::TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        policies,
+    );
+    lib.sources.push(bt("a.c"));
+    lib.props.set("DEBUG_POSTFIX".into(), "_d".into());
+    lib.props.set("PDB_NAME".into(), "custom".into());
+    let lib_id = model.add_target(lib)?;
+
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/project/a.c"), b"int f(){return 1;}")?;
+    let result = crate::resolve(&model, &host, &[ConfigId("Debug".into())])?;
+    let sh = result
+        .targets
+        .iter()
+        .find(|t| t.id == lib_id)
+        .ok_or("missing sh")?;
+    let defs: Vec<_> = sh.compile_groups[0]
+        .defines
+        .iter()
+        .map(|d| d.value.as_slice())
+        .collect();
+    assert!(
+        defs.contains(&b"_MBCS".as_slice()),
+        "CMP0204 _MBCS missing: {defs:?}"
+    );
+    assert!(
+        defs.contains(&b"_WINDLL".as_slice()),
+        "CMP0203 _WINDLL missing: {defs:?}"
+    );
+
+    // CMP0202 NEW appends postfix once to explicit PDB_NAME, POSTFIX:EXCLUDE omits it.
+    let mut usage = crate::usage::UsageResolver::new(&model);
+    let ctx = rcmake_genex::EvalContext {
+        config: ConfigId("Debug".into()),
+        head: Some(crate::usage::handle(lib_id)),
+        ..Default::default()
+    };
+    let (with_pf, _) = rcmake_genex::evaluate(
+        &rcmake_genex::parse(b"$<TARGET_PDB_FILE_BASE_NAME:sh>")?,
+        &ctx,
+        &mut usage.host(DirId::ROOT),
+    )?;
+    let (no_pf, _) = rcmake_genex::evaluate(
+        &rcmake_genex::parse(b"$<TARGET_PDB_FILE_BASE_NAME:sh,POSTFIX:EXCLUDE>")?,
+        &ctx,
+        &mut usage.host(DirId::ROOT),
+    )?;
+    assert_eq!(with_pf, "custom_d");
+    assert_eq!(no_pf, "custom");
+
+    // CMP0184 combines StackFrameErrorCheck + UninitializedVariable -> RTCsu -> -RTC1.
+    let compile_cmd = result.graphs[0]
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            BuildStep::Compile { invocation, .. } => Some(invocation),
+            _ => None,
+        })
+        .ok_or("compile step")?;
+    assert!(
+        compile_cmd.shell.windows(5).any(|w| w == b"-RTC1"),
+        "expected combined -RTC1 in compile flags: {}",
+        compile_cmd.shell
+    );
+
+    // CMP0202 Warn emits exactly one policy warning via genex evaluation for both
+    // explicit POSTFIX:INCLUDE and POSTFIX:EXCLUDE, and does NOT warn for 1-arg form
+    // or when CMP0202 is OLD/NEW.
+    for (status, expr, expect_warn) in [
+        (
+            rcmake_diag::PolicyStatus::Warn,
+            b"$<TARGET_PDB_FILE_BASE_NAME:sh>".as_slice(),
+            false,
+        ),
+        (
+            rcmake_diag::PolicyStatus::Warn,
+            b"$<TARGET_PDB_FILE_BASE_NAME:sh,POSTFIX:INCLUDE>".as_slice(),
+            true,
+        ),
+        (
+            rcmake_diag::PolicyStatus::Warn,
+            b"$<TARGET_PDB_FILE_BASE_NAME:sh,POSTFIX:EXCLUDE>".as_slice(),
+            true,
+        ),
+        (
+            rcmake_diag::PolicyStatus::Old,
+            b"$<TARGET_PDB_FILE_BASE_NAME:sh,POSTFIX:INCLUDE>".as_slice(),
+            false,
+        ),
+        (
+            rcmake_diag::PolicyStatus::Old,
+            b"$<TARGET_PDB_FILE_BASE_NAME:sh,POSTFIX:EXCLUDE>".as_slice(),
+            false,
+        ),
+    ] {
+        let mut warn_model = model.clone();
+        warn_model
+            .target_mut(lib_id)
+            .ok_or("lib mut")?
+            .policies
+            .policies
+            .set(rcmake_diag::PolicyId::new(202), status)?;
+        let warn_host = rcmake_host::PureHost::default();
+        let warn_paths = crate::sources::SourcePaths::new(&warn_host);
+        let mut warn_usage =
+            crate::usage::UsageResolver::with_source_paths(&warn_model, &warn_paths);
+        let _ = rcmake_genex::evaluate(
+            &rcmake_genex::parse(expr)?,
+            &ctx,
+            &mut warn_usage.host(DirId::ROOT),
+        )?;
+        let stderr = warn_host
+            .stream_bytes(rcmake_host::Stream::Stderr)
+            .to_string();
+        let count = stderr.matches("Policy CMP0202 is not set").count();
+        assert_eq!(
+            count,
+            usize::from(expect_warn),
+            "CMP0202 {status:?} warning count mismatch for {}: {stderr}",
+            BString::from(expr)
+        );
+    }
+
+    // Empty CMAKE_IMPORT_LIBRARY_SUFFIX produces no import library.
+    let mut no_imp = model.clone();
+    var(&mut no_imp, "CMAKE_IMPORT_LIBRARY_SUFFIX", "");
+    let imp_usage = crate::usage::UsageResolver::new(&no_imp);
+    assert_eq!(
+        imp_usage.artifact(
+            lib_id,
+            rcmake_genex::ArtifactKind::ImportFile,
+            rcmake_genex::ArtifactPart::Full,
+            &ConfigId("Debug".into()),
+        ),
+        None
+    );
+
+    // CMP0141 diagnoses unknown nonempty MSVC_DEBUG_INFORMATION_FORMAT on MSVC ABI.
+    let mut bad_dbg = model.clone();
+    bad_dbg
+        .target_mut(lib_id)
+        .ok_or("lib mut")?
+        .props
+        .set("MSVC_DEBUG_INFORMATION_FORMAT".into(), "BogusFormat".into());
+    assert!(crate::resolve(&bad_dbg, &host, &[ConfigId("Debug".into())]).is_err());
+
+    // CMP0184 diagnoses unknown MSVC_RUNTIME_CHECKS on MSVC ABI, honors empty override.
+    let mut bad_rtc = model.clone();
+    bad_rtc
+        .target_mut(lib_id)
+        .ok_or("lib mut")?
+        .props
+        .set("MSVC_RUNTIME_CHECKS".into(), "BogusCheck".into());
+    assert!(crate::resolve(&bad_rtc, &host, &[ConfigId("Debug".into())]).is_err());
+    let mut empty_rtc = model.clone();
+    empty_rtc
+        .target_mut(lib_id)
+        .ok_or("lib mut")?
+        .props
+        .set("MSVC_RUNTIME_CHECKS".into(), "".into());
+    assert!(crate::resolve(&empty_rtc, &host, &[ConfigId("Debug".into())]).is_ok());
+
+    // PDB_NAME recursion through OUTPUT_NAME reports `PDB_NAME depends on itself`.
+    let mut cyc = model.clone();
+    let t = cyc.target_mut(lib_id).ok_or("lib mut")?;
+    t.props.set("PDB_NAME".into(), "".into());
+    t.props.set(
+        "OUTPUT_NAME".into(),
+        "$<TARGET_PDB_FILE_BASE_NAME:sh>".into(),
+    );
+    let mut cyc_usage = crate::usage::UsageResolver::new(&cyc);
+    let err = rcmake_genex::evaluate(
+        &rcmake_genex::parse(b"$<TARGET_PDB_FILE_BASE_NAME:sh>")?,
+        &ctx,
+        &mut cyc_usage.host(DirId::ROOT),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("PDB_NAME depends on itself"),
+        "unexpected cycle error: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cluster6_and_7_stdlib_cmp0155_bmi_abs_headers_soxr_unity_and_vs_short() -> TestResult {
+    // Cluster 6.3: Windows `/lib/bmi` recognized as absolute destination.
+    let mut bmi_model = fixture("Windows");
+    bmi_model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let mut mod_t = raw_target("m", TargetKind::StaticLibrary);
+    mod_t.sources.push(bt("a.cxx"));
+    let mod_id = bmi_model.add_target(mod_t)?;
+    bmi_model.add_file_set(rcmake_model::FileSet {
+        target: mod_id,
+        name: "mods".into(),
+        kind: rcmake_model::FileSetKind::CxxModules,
+        scope: rcmake_model::UsageScope::Public,
+        base_dirs: vec![bt("/project")],
+        files: vec![bt("a.cxx")],
+        props: Default::default(),
+    })?;
+    bmi_model.add_install(rcmake_model::InstallRule {
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        kind: rcmake_model::InstallKind::Targets {
+            targets: vec![mod_id],
+            export: None,
+        },
+        options: rcmake_model::InstallOptions::default(),
+    });
+    for (idx, arg) in ["TARGETS", "CXX_MODULES_BMI", "DESTINATION", "/lib/bmi"]
+        .into_iter()
+        .enumerate()
+    {
+        bmi_model
+            .global
+            .props
+            .set(format!("_RCMAKE_INSTALL_0_ARG{idx}").into(), arg.into());
+    }
+    bmi_model.global.props.set(
+        "_RCMAKE_INSTALL_0_ABSOLUTE_ACTION".into(),
+        "FATAL_ERROR".into(),
+    );
+    let host = rcmake_host::PureHost::default();
+    assert!(
+        crate::InstallManifest::validate_bmi_destinations(
+            &bmi_model,
+            &[ConfigId::default()],
+            &host,
+        )
+        .is_err()
+    );
+
+    // Cluster 7.1: Empty recorded DESTINATION for FILE_SET HEADERS falls back to generic/default.
+    let mut fs_model = fixture("Linux");
+    fs_model.add_install(rcmake_model::InstallRule {
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        kind: rcmake_model::InstallKind::Targets {
+            targets: vec![],
+            export: None,
+        },
+        options: rcmake_model::InstallOptions::default(),
+    });
+    for (idx, arg) in ["TARGETS", "FILE_SET", "HEADERS", "DESTINATION", ""]
+        .into_iter()
+        .enumerate()
+    {
+        fs_model
+            .global
+            .props
+            .set(format!("_RCMAKE_INSTALL_0_ARG{idx}").into(), arg.into());
+    }
+    let opts = crate::file_sets::options_for_set(&fs_model, 0, b"HEADERS").ok_or("opts")?;
+    assert_eq!(opts.destination, None);
+
+    // Cluster 7.2: Extensionless source property record (`pffft64s`) binds to only one source file.
+    let mut soxr = fixture("Linux");
+    let mut old_p = rcmake_diag::PolicyMap::default();
+    old_p.set(
+        rcmake_diag::PolicyId::new(115),
+        rcmake_diag::PolicyStatus::Old,
+    )?;
+    soxr.dir_mut(DirId::ROOT).final_policies = Some(old_p);
+    soxr.dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/project/pffft64s".into())
+        .or_default()
+        .set("COMPILE_FLAGS".into(), "-O3".into());
+    let mut soxr_lib = raw_target("soxr", TargetKind::StaticLibrary);
+    soxr_lib.sources.push(bt("pffft64s.c"));
+    soxr_lib.sources.push(bt("pffft64s.cpp"));
+    soxr.add_target(soxr_lib)?;
+    host.seed_file(
+        std::path::Path::new("/project/pffft64s.c"),
+        b"int p(){return 0;}",
+    )?;
+    host.seed_file(
+        std::path::Path::new("/project/pffft64s.cpp"),
+        b"int q(){return 1;}",
+    )?;
+    let soxr_res = crate::resolve(&soxr, &host, &[])?;
+    let soxr_tgt = &soxr_res.targets[0];
+    let c_unit = soxr_tgt
+        .compile_units
+        .iter()
+        .find(|u| u.source.value == "/project/pffft64s.c")
+        .ok_or("missing pffft64s.c")?;
+    let cpp_unit = soxr_tgt
+        .compile_units
+        .iter()
+        .find(|u| u.source.value == "/project/pffft64s.cpp")
+        .ok_or("missing pffft64s.cpp")?;
+    assert!(
+        soxr_tgt.compile_groups[c_unit.group]
+            .flags
+            .iter()
+            .any(|f| f.value == "SHELL:-O3"),
+        "extensionless COMPILE_FLAGS must apply to pffft64s.c: {:?}",
+        soxr_tgt.compile_groups[c_unit.group].flags
+    );
+    assert!(
+        !soxr_tgt.compile_groups[cpp_unit.group]
+            .flags
+            .iter()
+            .any(|f| f.value == "SHELL:-O3"),
+        "extensionless COMPILE_FLAGS must not also apply to pffft64s.cpp: {:?}",
+        soxr_tgt.compile_groups[cpp_unit.group].flags
+    );
+
+    // Cluster 7.4 & 7.5: VS SHORT mode uses CMakeFiles/<hash> for PCH & Unity,
+    // and IdeFacts exposes member_sources per unity batch.
+    let mut vs_short = fixture("Windows");
+    vs_short.generator = Some(rcmake_model::GeneratorKind::VisualStudio(
+        rcmake_model::VsVersion::Vs17,
+    ));
+    vs_short.cache.insert(
+        "CMAKE_INTERMEDIATE_DIR_STRATEGY".into(),
+        rcmake_model::CacheEntry {
+            value: "SHORT".into(),
+            ty: rcmake_model::CacheType::String,
+            help: Default::default(),
+            advanced: false,
+            props: Default::default(),
+        },
+    );
+    var(
+        &mut vs_short,
+        "CMAKE_C_COMPILE_OPTIONS_CREATE_PCH",
+        "/Yc<PCH_HEADER>;/Fp<PCH_FILE>",
+    );
+    var(
+        &mut vs_short,
+        "CMAKE_C_COMPILE_OPTIONS_USE_PCH",
+        "/Yu<PCH_HEADER>;/Fp<PCH_FILE>",
+    );
+    let mut u = raw_target("utgt", TargetKind::StaticLibrary);
+    u.props.set("UNITY_BUILD".into(), "ON".into());
+    u.usage
+        .push(rcmake_model::UsageField::PrecompileHeaders, bt("<stdio.h>"));
+    u.sources.push(bt("u1.c"));
+    u.sources.push(bt("u2.c"));
+    vs_short.add_target(u)?;
+    host.seed_file(
+        std::path::Path::new("/project/u1.c"),
+        b"int u1(){return 1;}",
+    )?;
+    host.seed_file(
+        std::path::Path::new("/project/u2.c"),
+        b"int u2(){return 2;}",
+    )?;
+    let vs_res = crate::resolve_with_options(
+        &vs_short,
+        &host,
+        &[ConfigId("Debug".into())],
+        &crate::ResolveOptions {
+            ide: Some(crate::ide::IdeFlavor::VisualStudio),
+            ..Default::default()
+        },
+    )?;
+    let ide = vs_res.targets[0].ide.as_ref().ok_or("missing ide")?;
+    assert_eq!(ide.unity_files.len(), 1);
+    assert!(
+        ide.unity_files[0]
+            .path
+            .windows(12)
+            .any(|w| w == b"/CMakeFiles/"),
+        "VS SHORT unity dir must use CMakeFiles/<hash>: {}",
+        ide.unity_files[0].path
+    );
+    assert_eq!(
+        ide.unity_files[0].member_sources,
+        vec![
+            BString::from("/project/u1.c"),
+            BString::from("/project/u2.c")
+        ]
+    );
+    assert!(
+        ide.pch
+            .iter()
+            .all(|pch| pch.header.windows(12).any(|w| w == b"/CMakeFiles/")),
+        "VS SHORT PCH header must use CMakeFiles/<hash>: {:?}",
+        ide.pch
+    );
+    Ok(())
+}

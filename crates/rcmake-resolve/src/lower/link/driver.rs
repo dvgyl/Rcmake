@@ -191,10 +191,15 @@ pub(super) fn definition_file(
     objects: &[BString],
     language: &[u8],
 ) -> Result<DefinitionFile, ResolveError> {
-    if !matches!(
+    let eligible = matches!(
         target.kind,
-        TargetKind::SharedLibrary | TargetKind::ModuleLibrary | TargetKind::Executable
-    ) {
+        TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+    ) || (target.kind == TargetKind::Executable
+        && target
+            .props
+            .get(b"ENABLE_EXPORTS")
+            .is_some_and(|value| truth::is_on(value)));
+    if !eligible {
         return Ok(DefinitionFile::default());
     }
     let Some(flag) = definition(
@@ -254,7 +259,18 @@ pub(super) fn definition_file(
             file.clone(),
             list.clone(),
         ];
-        if let Some(nm) = definition(model, target.dir, b"CMAKE_NM").filter(|nm| !truth::is_off(nm))
+        let allow_nm = if matches!(
+            model.generator,
+            Some(rcmake_model::GeneratorKind::VisualStudio(_))
+        ) || usage.ide() == Some(crate::ide::IdeFlavor::VisualStudio)
+        {
+            vs_is_clang_cl_toolset(model, target)
+        } else {
+            true
+        };
+        if allow_nm
+            && let Some(nm) =
+                definition(model, target.dir, b"CMAKE_NM").filter(|nm| !truth::is_off(nm))
         {
             argv.push([b"--nm=", nm.as_slice()].concat().into());
         }
@@ -405,12 +421,68 @@ pub(super) fn deduplicate_darwin_flags(flags: &mut [BString]) {
     }
 }
 
+fn vs_is_clang_cl_toolset(model: &ProjectModel, target: &Target) -> bool {
+    let toolset = definition(model, target.dir, b"CMAKE_VS_PLATFORM_TOOLSET")
+        .filter(|value| !value.is_empty())
+        .or_else(|| match &model.generator_spec.parsed {
+            rcmake_model::ParsedToolset::Vs(vs) => {
+                vs.name.as_ref().filter(|value| !value.is_empty())
+            }
+            _ => None,
+        });
+    let Some(toolset) = toolset else {
+        return false;
+    };
+    is_clang_cl_toolset_name(toolset)
+}
+
+fn is_clang_cl_toolset_name(toolset: &[u8]) -> bool {
+    // Matches `cmGlobalVisualStudio10Generator::IsClangClToolset`:
+    // `^[Ll][Ll][Vv][Mm](_v[0-9]+(_xp)?)?$` or `^[Cc][Ll][Aa][Nn][Gg]([Cc][Ll]$|_[0-9])`.
+    if let Some(rest) = toolset
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case(b"llvm"))
+        .and_then(|_| toolset.get(4..))
+    {
+        if rest.is_empty() {
+            return true;
+        }
+        if let Some(after_v) = rest.strip_prefix(b"_v") {
+            let digits = after_v
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if digits > 0 && matches!(after_v.get(digits..), Some(b"" | b"_xp")) {
+                return true;
+            }
+        }
+    }
+    if let Some(rest) = toolset
+        .get(..5)
+        .filter(|prefix| prefix.eq_ignore_ascii_case(b"clang"))
+        .and_then(|_| toolset.get(5..))
+    {
+        return rest.eq_ignore_ascii_case(b"cl")
+            || (rest.first() == Some(&b'_') && rest.get(1).is_some_and(u8::is_ascii_digit));
+    }
+    false
+}
+
 pub(super) fn library_file(arg: &[u8]) -> bool {
     let library_extension = arg.ends_with(b".a")
         || arg.ends_with(b".o")
         || arg.ends_with(b".tbd")
+        || arg.last_chunk::<4>().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case(b".lib") || ext.eq_ignore_ascii_case(b".obj")
+        })
         || shared_library(arg);
+    let slash_switch = arg.starts_with(b"/")
+        && arg
+            .get(1..)
+            .and_then(|rest| rest.split(|&byte| byte == b'/' || byte == b'\\').next())
+            .is_some_and(|first| first.contains(&b':'));
     !arg.starts_with(b"-")
+        && !slash_switch
         && (!arg.starts_with(b"/")
             || arg.get(1..).is_some_and(|arg| {
                 arg.contains(&b'/') || (!arg.contains(&b':') && library_extension)

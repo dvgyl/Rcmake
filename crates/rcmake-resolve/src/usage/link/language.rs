@@ -155,14 +155,42 @@ impl UsageResolver<'_> {
                     library.kind,
                     TargetKind::StaticLibrary | TargetKind::ObjectLibrary
                 )
-                && let Some(facts) = facts(dependency)
             {
                 let objects = if contribution == Contribution::DirectObject {
                     Contribution::DirectObject
                 } else {
                     Contribution::ArchiveObject
                 };
-                dependencies.extend(facts.dependencies.iter().copied().map(|id| (id, objects)));
+                if let Some(facts) = facts(dependency) {
+                    dependencies.extend(facts.dependencies.iter().copied().map(|id| (id, objects)));
+                }
+                if library.kind == TargetKind::StaticLibrary && !library.is_imported() {
+                    let (own_direct, own_flags) =
+                        self.direct_links(dependency, &link_context(dependency, ctx))?;
+                    flags = flags.union(own_flags);
+                    for item in own_direct.iter() {
+                        let entries = match &item.kind {
+                            ResolvedLinkKind::Group { members, .. } => members.as_slice(),
+                            _ => std::slice::from_ref(item.as_ref()),
+                        };
+                        for entry in entries {
+                            match entry.kind {
+                                ResolvedLinkKind::Objects(obj_id) => {
+                                    dependencies.push((obj_id, objects));
+                                }
+                                ResolvedLinkKind::ObjectFile => {
+                                    if let Some(obj_id) = self
+                                        .source_paths()
+                                        .and_then(|paths| paths.object_owner(&entry.text.value))
+                                    {
+                                        dependencies.push((obj_id, objects));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
             let (links, deps) = self.usage_links(dependency, true, ctx)?;
             flags = flags.union(deps);

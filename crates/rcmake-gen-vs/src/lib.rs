@@ -2,6 +2,10 @@
 //!
 //! The command-line generator registry controls host availability. The writers
 //! can also run directly for structural tests on other hosts.
+//!
+//! A target that compiles only C# gets a `.csproj` project. A target from
+//! `include_external_msproject` gets a solution entry for its existing project
+//! file, and the generator writes no project file for it.
 
 #![forbid(unsafe_code)]
 
@@ -14,19 +18,22 @@ use rcmake_gen_common::{
     compile_commands_native::{ConfigDatabase, MultiConfigCompileDatabase},
     write_output,
 };
-use rcmake_host::{FileKind, Follow, Host, SystemInfo, path::from_native};
+use rcmake_host::{FileKind, Follow, Host, Stream, SystemInfo, path::from_native};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetId, VsVersion};
 use rcmake_resolve::{GenerationResult, usage::UsageResolver};
 
-use plan::Project;
+use plan::{Flavor, Project};
 
 pub mod build;
 mod compile_db;
+mod csproj;
 mod cuda;
+mod diag;
 pub mod filters;
 pub mod flags_table;
 pub mod guid;
 mod plan;
+mod project_type;
 pub mod rules;
 pub mod sln;
 pub mod slnx;
@@ -35,7 +42,6 @@ pub mod xml;
 
 pub use build::build_commands;
 
-const CPP_TYPE: &str = "{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}";
 const MSBUILD_NS: &str = "http://schemas.microsoft.com/developer/msbuild/2003";
 
 pub(crate) struct Settings {
@@ -77,7 +83,7 @@ pub fn generate(
 /// need a NuGet package restore before a build.
 ///
 /// A project needs a restore when its target or a direct project dependency
-/// has `VS_PACKAGE_REFERENCES`. The caller stores
+/// has `VS_PACKAGE_REFERENCES` or a .NET SDK-style project. The caller stores
 /// `<name>_REQUIRES_VS_PACKAGE_RESTORE` in the cache for each returned name.
 ///
 /// # Errors
@@ -122,6 +128,7 @@ pub fn generate_with_compile_db(
             .collect::<Vec<_>>()
     });
     let mut diagnostics = Vec::new();
+    let mut errors = Vec::new();
     for project in &plan.projects {
         let facts = project.target.and_then(|id| plan.resolved.get(&id));
         let context = vcxproj::Context {
@@ -133,26 +140,25 @@ pub fn generate_with_compile_db(
             model,
             inputs: &plan.inputs,
         };
+        match project.flavor {
+            Flavor::Native => {}
+            Flavor::CSharp => {
+                let data = csproj::render(&context, host)?;
+                write(host, &project.path(), data.as_bytes())?;
+                continue;
+            }
+            // The external project file already exists.
+            Flavor::External { .. } => continue,
+        }
         let proj_plan = write_project(host, &context, &mut usage, &mut nasm_props_template)?;
+        errors.extend(proj_plan.errors.iter().cloned());
         if let (Some(selected), Some(dbs)) = (export_targets, databases.as_mut())
             && project.target.is_some_and(|id| selected.contains(&id))
         {
             compile_db::collect_project(&context, &proj_plan, result, dbs, &mut diagnostics);
         }
     }
-    if plan.regenerate {
-        let list = format!("{}\n", plan.inputs.join("\n"));
-        write(
-            host,
-            &join(&plan.settings.bin, "CMakeFiles/generate.stamp.depend"),
-            list.as_bytes(),
-        )?;
-        write(
-            host,
-            &join(&plan.settings.bin, "CMakeFiles/generate.stamp"),
-            b"# CMake generation stamp\n",
-        )?;
-    }
+    write_stamps(host, model, &plan.settings, &plan.inputs, plan.regenerate)?;
     for solution in &plan.solutions {
         let data = if version.writes_slnx() {
             slnx::render(solution, &plan.settings, &plan.projects)
@@ -168,12 +174,84 @@ pub fn generate_with_compile_db(
             data.as_bytes(),
         )?;
     }
+    // CMake prints each error when it finds it and fails the generate step at
+    // the end. The caller prints the last error.
+    if let Some((last, others)) = errors.split_last() {
+        for error in others {
+            host.write_out(Stream::Stderr, format!("CMake Error: {error}\n").as_bytes());
+        }
+        return Err(GenError::Invalid(last.as_str().into()));
+    }
     let db = databases.map(|configs| MultiConfigCompileDatabase {
         configs,
         default_index: 0,
         diagnostics,
     });
     Ok((restore_requirements(&plan.projects, model), db))
+}
+
+/// Write the generation stamp files of each directory, as CMake writes them
+/// (`cmLocalVisualStudio7Generator::WriteStampFiles`).
+///
+/// Each directory gets `CMakeFiles/generate.stamp` and
+/// `CMakeFiles/generate.stamp.depend`. The dependency file lists the
+/// listfiles of the directory, sorted and without duplicates, and the glob
+/// verification stamp when the build checks `CONFIGURE_DEPENDS` globs.
+/// `cmake --check-stamp-file <stamp>` regenerates when one of these files is
+/// newer than the stamp. Lines that start with `#` are comments.
+///
+/// The files are written also when their contents do not change, so their
+/// modification time shows the last generation, as CMake does.
+///
+/// When the build system checks itself (`ZERO_CHECK`), the top directory
+/// also gets `CMakeFiles/generate.stamp.list`, which lists the stamp of each
+/// directory for `cmake --check-stamp-list`.
+pub(crate) fn write_stamps(
+    host: &dyn Host,
+    model: &ProjectModel,
+    settings: &Settings,
+    inputs: &[String],
+    regenerate: bool,
+) -> Result<(), GenError> {
+    let glob_stamp = join(&settings.bin, rcmake_gen_common::glob::STAMP);
+    let globs = inputs.contains(&glob_stamp);
+    let mut stamps = Vec::new();
+    for (_, dir) in model.dirs() {
+        let binary = absolute(&settings.bin, &string(&dir.binary_dir));
+        let source = absolute(&settings.source, &string(&dir.source_dir));
+        let mut listfiles: Vec<String> = dir
+            .listfiles
+            .iter()
+            .map(|file| absolute(&source, &string(file)))
+            .collect();
+        if globs {
+            listfiles.push(glob_stamp.clone());
+        }
+        listfiles.sort();
+        listfiles.dedup();
+        let stamp = join(&binary, "CMakeFiles/generate.stamp");
+        write_always(
+            host,
+            &stamp,
+            b"# CMake generation timestamp file for this directory.\n",
+        )?;
+        let mut depend = String::from("# CMake generation dependency list for this directory.\n");
+        for file in &listfiles {
+            depend.push_str(file);
+            depend.push('\n');
+        }
+        write_always(host, &format!("{stamp}.depend"), depend.as_bytes())?;
+        stamps.push(stamp);
+    }
+    if regenerate {
+        let list: String = stamps.iter().map(|stamp| format!("{stamp}\n")).collect();
+        write_always(
+            host,
+            &join(&settings.bin, "CMakeFiles/generate.stamp.list"),
+            list.as_bytes(),
+        )?;
+    }
+    Ok(())
 }
 
 /// Target property that lists NuGet packages as `<name>_<version>` items.
@@ -187,45 +265,37 @@ pub(crate) fn has_package_references(target: &Target) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
-/// Names of the projects whose target, or any transitive project dependency of
-/// it, has package references.
+/// Return `true` when a target needs a NuGet restore by itself: it uses a
+/// .NET SDK-style project (`DOTNET_SDK`), or it has package references.
+fn needs_restore(target: &Target) -> bool {
+    plan::dotnet_sdk(target).is_some() || has_package_references(target)
+}
+
+/// Names of the projects that need a NuGet restore before a build.
+///
+/// As in CMake (`cmVisualStudio10TargetGenerator::UpdateCache`), a project
+/// needs a restore when its target needs one, or when a direct project
+/// dependency needs one. For example, `ALL_BUILD` needs a restore when the
+/// solution has a .NET SDK-style project.
 fn restore_requirements(projects: &[Project], model: &ProjectModel) -> Vec<String> {
-    let mut required = vec![false; projects.len()];
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); projects.len()];
-    let mut pending = Vec::new();
-    for (index, project) in projects.iter().enumerate() {
-        if project
-            .target
-            .and_then(|id| model.target(id))
-            .is_some_and(has_package_references)
-        {
-            if let Some(slot) = required.get_mut(index) {
-                *slot = true;
-            }
-            pending.push(index);
-        }
-        for &dep in &project.dependencies {
-            if let Some(parents) = dependents.get_mut(dep) {
-                parents.push(index);
-            }
-        }
-    }
-    while let Some(node) = pending.pop() {
-        if let Some(parents) = dependents.get(node) {
-            for &parent in parents {
-                if let Some(slot) = required.get_mut(parent)
-                    && !*slot
-                {
-                    *slot = true;
-                    pending.push(parent);
-                }
-            }
-        }
-    }
+    let seeds = projects
+        .iter()
+        .map(|project| {
+            project
+                .target
+                .and_then(|id| model.target(id))
+                .is_some_and(needs_restore)
+        })
+        .collect::<Vec<_>>();
     projects
         .iter()
-        .zip(required)
-        .filter(|&(_, needs)| needs)
+        .zip(&seeds)
+        .filter(|&(project, &seed)| {
+            seed || project
+                .dependencies
+                .iter()
+                .any(|&dep| seeds.get(dep).copied().unwrap_or(false))
+        })
         .map(|(project, _)| project.name.clone())
         .collect()
 }
@@ -418,6 +488,21 @@ impl Settings {
     }
 }
 
+/// Write a file also when its contents do not change, so that its
+/// modification time changes.
+fn write_always(host: &dyn Host, path: &str, data: &[u8]) -> Result<(), GenError> {
+    let native = rcmake_host::path::to_native(path.as_bytes());
+    let error = |error: rcmake_host::HostError| GenError::Write {
+        path: path.into(),
+        message: error.to_string().into(),
+    };
+    if let Some(parent) = native.parent() {
+        host.create_dir_all(parent).map_err(error)?;
+    }
+    host.write(&native, data, rcmake_host::WriteMode::Truncate)
+        .map_err(error)
+}
+
 fn write(host: &dyn Host, path: &str, data: &[u8]) -> Result<(), GenError> {
     let path = rcmake_host::path::to_native(path.as_bytes());
     write_output(host, &path, data)
@@ -482,6 +567,14 @@ fn folder(path: &str) -> String {
 
 fn msbuild_value(value: &str) -> String {
     value.replace(';', "%3B")
+}
+
+/// Escape an item path for an `Include` attribute.
+///
+/// As in CMake, parentheses stay as they are: MSBuild reads them literally
+/// unless they follow `$`, `@`, or `%`, which [`msbuild`] escapes.
+fn msbuild_item(path: &str) -> String {
+    msbuild(path).replace("%28", "(").replace("%29", ")")
 }
 
 fn msbuild(value: &str) -> String {

@@ -4,7 +4,7 @@ use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext, UsageTraversal};
 use rcmake_host::path::to_native;
-use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, UsageField};
+use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, TargetKind, UsageField};
 
 use crate::{
     InterfaceInclude, LinkFragment, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
@@ -21,6 +21,7 @@ use features::Features;
 pub(crate) struct ResolvedLink {
     step: Option<LinkStep>,
     languages: IndexSet<BString>,
+    shared_defines: Vec<BString>,
     position_independent: Option<bool>,
     dependencies: Vec<TargetId>,
     module_links: Vec<TargetId>,
@@ -117,6 +118,35 @@ pub(crate) fn resolve_link(
             .into(),
         )
     })?;
+    if matches!(
+        target.kind,
+        TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+    ) && target
+        .policies
+        .policies
+        .get(rcmake_diag::PolicyId::new(203))
+        == rcmake_diag::PolicyStatus::New
+        && let Some(defs) = lower::definition(
+            model,
+            target.dir,
+            &[
+                b"CMAKE_",
+                language.as_slice(),
+                b"_SHARED_LIBRARY_COMPILE_DEFINITIONS",
+            ]
+            .concat(),
+        )
+    {
+        for def in list::split(defs, list::Empty::Drop) {
+            let def = match def.strip_prefix(b"-D") {
+                Some(stripped) => BString::from(stripped),
+                None => def,
+            };
+            if !def.is_empty() && !link.shared_defines.contains(&def) {
+                link.shared_defines.push(def);
+            }
+        }
+    }
     let options = usage
         .collect_for_result(id, UsageField::LinkOptions, &ctx)?
         .entries;
@@ -380,6 +410,7 @@ pub(crate) fn attach_links(
     inputs: &mut IndexMap<TargetId, TargetInputs>,
     links: Vec<(TargetId, ResolvedLink)>,
     providers: Option<&IndexMap<TargetId, TargetId>>,
+    synthetic_bindings: Option<&crate::cxx_modules::synthetic::SyntheticBindings>,
 ) {
     let std_objects: IndexMap<_, Vec<_>> = providers
         .into_iter()
@@ -403,7 +434,10 @@ pub(crate) fn attach_links(
         .values()
         .filter_map(|target| {
             let info = target.cxx_modules.as_ref()?;
-            (!info.units.is_empty()).then(|| (target.id, info.module_dir.clone()))
+            let plain_interface = target.metadata.kind == TargetKind::InterfaceLibrary
+                && !target.metadata.generator_provided;
+            (!info.units.is_empty() && !plain_interface)
+                .then(|| (target.id, info.module_dir.clone()))
         })
         .collect();
     for (id, link) in links {
@@ -418,6 +452,13 @@ pub(crate) fn attach_links(
                     let include = ide::include(entry, ide::IdeFlavor::Xcode);
                     if !group.includes.contains(&include) {
                         group.includes.push(include);
+                    }
+                }
+                for def in &link.shared_defines {
+                    if !group.defines.iter().any(|entry| entry.value == *def) {
+                        group
+                            .defines
+                            .push(BT::new(def.clone(), rcmake_diag::Backtrace::default()));
                     }
                 }
             }
@@ -436,6 +477,17 @@ pub(crate) fn attach_links(
                     group.includes.push(include.clone());
                 }
             }
+            for def in &link.shared_defines {
+                if !group.defines.iter().any(|entry| entry.value == *def) {
+                    let pos = group.source_define_start.unwrap_or(group.defines.len());
+                    group
+                        .defines
+                        .insert(pos, BT::new(def.clone(), rcmake_diag::Backtrace::default()));
+                    if let Some(start) = &mut group.source_define_start {
+                        *start += 1;
+                    }
+                }
+            }
         }
         inputs.link_languages = link.languages;
         inputs.xcframework_inputs = link.xcframework_inputs;
@@ -445,6 +497,17 @@ pub(crate) fn attach_links(
         inputs.objects.extend(link.objects);
         if let Some(info) = &mut target.cxx_modules {
             let mut linked = link.module_links.into_iter().collect::<IndexSet<_>>();
+            if let Some(redirects) =
+                synthetic_bindings.and_then(|bindings| bindings.get(&target.id))
+            {
+                for &(original, synth) in redirects {
+                    linked.shift_remove(&original);
+                    linked.insert(synth);
+                    if !target.dependencies.contains(&synth) {
+                        target.dependencies.push(synth);
+                    }
+                }
+            }
             if let Some(&id) = providers.and_then(|providers| providers.get(&target.id)) {
                 linked.insert(id);
                 target.dependencies.push(id);
@@ -860,7 +923,32 @@ fn append_link_item(
             }
             return;
         }
-        ResolvedLinkKind::ObjectFile => (quote(value), Libraries),
+        ResolvedLinkKind::ObjectFile => {
+            let text = if model
+                .generator
+                .is_some_and(rcmake_model::GeneratorKind::is_ninja)
+            {
+                let rel = lower::build_relative(model, value);
+                let owner = usage
+                    .source_paths()
+                    .and_then(|paths| paths.object_owner(value))
+                    .or_else(|| {
+                        resolved.iter().find_map(|(&id, target)| {
+                            (target.metadata.kind == TargetKind::ObjectLibrary
+                                && target.compile_units.iter().any(|unit| unit.object == rel))
+                            .then_some(id)
+                        })
+                    })
+                    .and_then(|id| model.target(id));
+                let spelled = owner.map_or(rel.clone(), |owner| {
+                    lower::file_api_object_path(model, owner, config, &rel)
+                });
+                quote(&spelled)
+            } else {
+                quote(value)
+            };
+            (text, Libraries)
+        }
         ResolvedLinkKind::Raw if value.starts_with(b"LINKER:") || value.starts_with(b"SHELL:") => {
             (value.into(), Libraries)
         }

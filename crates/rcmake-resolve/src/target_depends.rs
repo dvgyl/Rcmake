@@ -183,6 +183,19 @@ pub(crate) fn compute(
         .map(|target| ((target.id, &target.config), target))
         .collect();
     let link_items = LinkItems::collect(model, configs, &resolved, &graph.nodes, paths, usage)?;
+    let mut artifact_to_target = IndexMap::<BString, TargetId>::new();
+    for target in targets {
+        for artifact in target
+            .artifacts
+            .file
+            .iter()
+            .chain(target.artifacts.linker_file.iter())
+        {
+            artifact_to_target
+                .entry(crate::lower::build_relative(model, artifact))
+                .or_insert(target.id);
+        }
+    }
     let mut attached = IndexMap::<TargetId, Vec<rcmake_model::CommandId>>::new();
     for (command_id, command) in model.commands() {
         if let CustomCommandKind::Utility(owner)
@@ -195,7 +208,7 @@ pub(crate) fn compute(
     // utility items (`AddTargetDepend` for a target outside the build system).
     for (id, target) in model.targets() {
         if target.is_imported() {
-            let utilities = utility_items(model, (id, target), &[], graphs);
+            let utilities = utility_items(model, (id, target), &[], graphs, &artifact_to_target);
             if !utilities.is_empty() {
                 graph.utilities.insert(id, utilities);
             }
@@ -206,7 +219,7 @@ pub(crate) fn compute(
             continue;
         };
         let commands = attached.get(&id).map_or(&[][..], Vec::as_slice);
-        let utilities = utility_items(model, (id, target), commands, graphs);
+        let utilities = utility_items(model, (id, target), commands, graphs, &artifact_to_target);
         graph.utilities.insert(id, utilities);
         let traced = traced_sources(model, id, target, graphs);
         if !traced.is_empty() {
@@ -499,6 +512,7 @@ fn utility_items(
     (id, target): (TargetId, &Target),
     commands: &[rcmake_model::CommandId],
     graphs: &[BuildGraph],
+    artifact_to_target: &IndexMap<BString, TargetId>,
 ) -> Vec<UtilityItem> {
     // `cmTarget::Utilities` is keyed by name and cross flag. The first entry keeps its backtrace.
     let mut items = IndexMap::<(TargetId, bool), Backtrace>::new();
@@ -512,15 +526,37 @@ fn utility_items(
             add(dependency, false, &entry.backtrace);
         }
     }
+    let mut attached_bare_depends = IndexSet::new();
     for &command_id in commands {
         let Some(command) = model.command(command_id) else {
             continue;
         };
         for graph in graphs {
             add_command_utilities(graph, command_id, &command.backtrace, &mut add);
+            if let Some(utilities) = graph.command_utilities.get(&command_id) {
+                attached_bare_depends.extend(utilities.depends.iter().copied());
+            }
         }
     }
     for graph in graphs {
+        if let Some(graph_idx) = graph.target_ids.iter().position(|&tid| tid == id)
+            && let Some(graph_target) = graph.targets.get(graph_idx)
+        {
+            for &step_idx in &graph_target.steps {
+                if !graph.custom_output_owners.contains_key(&step_idx)
+                    && let Some(crate::BuildStep::Custom(custom)) = graph.steps.get(step_idx)
+                {
+                    for dep in &custom.depends {
+                        if let Some(&owner) = artifact_to_target.get(dep)
+                            && owner != id
+                            && !attached_bare_depends.contains(&owner)
+                        {
+                            add(owner, false, &Backtrace::default());
+                        }
+                    }
+                }
+            }
+        }
         for step in graph.custom_source_steps.get(&id).into_iter().flatten() {
             let Some(command_id) = graph
                 .custom_output_owners
@@ -546,6 +582,23 @@ fn utility_items(
                 _ => {}
             }
             add_command_utilities(graph, command_id, &command.backtrace, &mut add);
+            // Match `cmTargetTraceDependencies.cxx`: an absolute artifact path in
+            // `DEPENDS` matching another target's output records `cross = false`,
+            // while a bare target name in `DEPENDS` records `cross = true`.
+            if let Some(crate::BuildStep::Custom(custom)) = graph.steps.get(*step) {
+                let bare_depends = graph
+                    .command_utilities
+                    .get(&command_id)
+                    .map(|utilities| &utilities.depends);
+                for dep in &custom.depends {
+                    if let Some(&owner) = artifact_to_target.get(dep)
+                        && owner != id
+                        && !bare_depends.is_some_and(|set| set.contains(&owner))
+                    {
+                        add(owner, false, &Backtrace::default());
+                    }
+                }
+            }
         }
     }
     if let Some(reuse) = target
@@ -566,7 +619,7 @@ fn utility_items(
 }
 
 /// Add the utilities of one command: programs and generator expression targets
-/// first, then `DEPENDS` targets without a backtrace (`CheckCustomCommand`).
+/// first, then bare `DEPENDS` targets without a backtrace (`CheckCustomCommand`).
 fn add_command_utilities(
     graph: &BuildGraph,
     command: rcmake_model::CommandId,
@@ -819,6 +872,7 @@ impl Collector<'_> {
         }
         // Each frame is one link interface and the position of its next item.
         let mut stack = vec![(usage.direct_link_items(dependee, true, &ctx)?, 0usize)];
+        let mut interface_objects = Vec::new();
         while let Some((items, position)) = stack.last_mut() {
             let Some(item) = items.get(*position).cloned() else {
                 stack.pop();
@@ -827,9 +881,11 @@ impl Collector<'_> {
             *position += 1;
             // `$<TARGET_OBJECTS>` in a link interface is an object item
             // (`cmLinkInterface::Objects`); a linked object library is a library.
+            // Defer `AddObjectDepends` until after the library items so an object
+            // library already visited as a link dependency does not become a utility.
             if item.kind == ResolvedLinkKind::ObjectFile {
                 if let Some(owner) = object_owner(&item, self.paths) {
-                    self.add_object_depends(depender, owner);
+                    interface_objects.push(owner);
                 }
                 continue;
             }
@@ -844,6 +900,9 @@ impl Collector<'_> {
                     stack.push((usage.direct_link_items(dependency, true, &ctx)?, 0));
                 }
             }
+        }
+        for owner in interface_objects {
+            self.add_object_depends(depender, owner);
         }
         Ok(())
     }
@@ -1616,6 +1675,85 @@ mod tests {
             "singleton optimized component must not retain self-loop a -> a: {a_deps:?}"
         );
         assert_eq!(b_deps, vec![a]);
+        Ok(())
+    }
+
+    #[test]
+    fn command_utilities_preserve_cross_flag_distinction() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use rcmake_diag::PolicyMap;
+        use rcmake_model::{CustomCommand, DirId, TargetOrigin};
+
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let tool = model.add_target(Target::new(
+            "tool".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        ))?;
+        let bare = model.add_target(Target::new(
+            "bare".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        ))?;
+        let app = model.add_target(Target::new(
+            "app".into(),
+            TargetKind::Utility,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        ))?;
+        let cmd = model.add_command(CustomCommand::new(
+            DirId::ROOT,
+            CustomCommandKind::Utility(app),
+            Backtrace::default(),
+            PolicyMap::default(),
+        ))?;
+        let mut graph = BuildGraph::default();
+        graph
+            .steps
+            .push(crate::BuildStep::Custom(crate::CustomStep {
+                depends: vec!["bin/tool".into(), "bin/bare".into()],
+                ..crate::CustomStep::default()
+            }));
+        graph.target_ids.push(app);
+        graph.targets.push(crate::GraphTarget {
+            name: "app".into(),
+            steps: vec![0],
+            depends: Vec::new(),
+            in_all: false,
+        });
+        graph.command_utilities.insert(
+            cmd,
+            crate::CommandUtilities {
+                commands: IndexSet::from([tool]),
+                depends: IndexSet::from([bare]),
+            },
+        );
+        let artifact_to_target = IndexMap::from([
+            (BString::from("bin/tool"), tool),
+            (BString::from("bin/bare"), bare),
+        ]);
+        let app_target = model.target(app).ok_or("missing app")?;
+        let items = utility_items(
+            &model,
+            (app, app_target),
+            &[cmd],
+            &[graph],
+            &artifact_to_target,
+        );
+        let flags: Vec<(TargetId, bool)> =
+            items.iter().map(|item| (item.target, item.cross)).collect();
+        // `COMMAND tool` -> cross = true; bare `DEPENDS bare` -> cross = true;
+        // artifact path `bin/tool` in `DEPENDS` -> cross = false.
+        assert_eq!(flags, vec![(tool, true), (bare, true), (tool, false)]);
         Ok(())
     }
 }

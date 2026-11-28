@@ -623,7 +623,10 @@ impl<'a> UsageResolver<'a> {
                 {
                     continue;
                 }
-                let source_props = crate::sources::properties(dir, &abs);
+                let source_props = this.source_paths.map_or_else(
+                    || crate::sources::properties(dir, &abs),
+                    |paths| paths.properties(dir, &abs),
+                );
                 if source_props.get(b"MACOSX_PACKAGE_LOCATION").is_some()
                     && crate::lower::is_darwin(this.model, target.dir)
                     && crate::ide::bundle_kind(target) != crate::ide::BundleKind::None
@@ -1473,9 +1476,10 @@ impl<'a> UsageResolver<'a> {
                     FileSetKind::Sources if !own => set.scope != UsageScope::Private,
                     _ => {
                         own && (set.scope != UsageScope::Interface
-                            || model
-                                .target(target)
-                                .is_some_and(crate::cxx_modules::is_std_provider))
+                            || model.target(target).is_some_and(|target| {
+                                crate::cxx_modules::is_std_provider(target)
+                                    || crate::cxx_modules::is_synthetic_provider(target)
+                            }))
                     }
                 }
             })

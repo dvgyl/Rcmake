@@ -207,6 +207,34 @@ impl TargetPlan<'_> {
                         );
                     }
                 } else if pch_languages.insert(&group.language) {
+                    if let Some(host) = usage.source_paths().map(|paths| paths.host) {
+                        let compile_pdb = if let Some(copy) = pdb {
+                            Some(copy.destination.clone())
+                        } else if super::super::artifacts::is_msvc(
+                            model,
+                            target.dir,
+                            &group.language,
+                        ) {
+                            Some(super::super::artifacts::compile_pdb(
+                                model, target, config, usage,
+                            )?)
+                        } else {
+                            None
+                        };
+                        if let Some(pdb_path) = compile_pdb.filter(|path| !path.is_empty()) {
+                            let full_pdb =
+                                super::super::join(&model.dir(DirId::ROOT).binary_dir, &pdb_path);
+                            let pdb_dir = if pdb_path.ends_with(b"/") {
+                                rcmake_host::path::to_native(&full_pdb)
+                            } else {
+                                rcmake_host::path::to_native(&full_pdb)
+                                    .parent()
+                                    .map(std::path::Path::to_path_buf)
+                                    .unwrap_or_else(|| rcmake_host::path::to_native(&full_pdb))
+                            };
+                            let _ = host.create_dir_all(&pdb_dir);
+                        }
+                    }
                     for plan in plans {
                         let unit = CompileUnit {
                             source: BT::new(plan.source.clone(), target.backtrace.clone()),

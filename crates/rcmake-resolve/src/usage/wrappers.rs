@@ -77,21 +77,22 @@ impl UsageResolver<'_> {
             && let Some(language) = &ctx.language
         {
             let target = self.target(id)?;
-            let is_msvc = lower::definition(
-                self.model,
-                target.dir,
-                b"CMAKE_MSVC_RUNTIME_LIBRARY_DEFAULT",
-            )
-            .is_some_and(|value| !value.is_empty())
-                && [b"_COMPILER_ID".as_slice(), b"_SIMULATE_ID"]
-                    .iter()
-                    .any(|suffix| {
-                        let key = [b"CMAKE_", language.as_slice(), *suffix].concat();
-                        lower::definition(self.model, target.dir, &key)
-                            .is_some_and(|id| id == b"MSVC")
-                    });
-            if is_msvc {
+            if lower::compile::msvc::targets_msvc_abi(self.model, target.dir, language) {
                 self.validate_msvc_runtime(id, &ctx.config.0, language)?;
+                let _ = lower::compile::msvc::runtime_checks(
+                    self.model,
+                    target,
+                    &ctx.config,
+                    language,
+                    Some(self),
+                )?;
+                let _ = lower::compile::msvc::debug_options(
+                    self.model,
+                    target,
+                    &ctx.config,
+                    language,
+                    Some(self),
+                )?;
             }
         }
         result
@@ -149,11 +150,20 @@ impl UsageResolver<'_> {
             return Ok(());
         }
         let language = BString::from(language);
-        Err(self.toolchain_error(
-            &target.backtrace,
+        let body: BString =
             format!("MSVC_RUNTIME_LIBRARY value '{value}' not known for this {language} compiler.")
-                .into(),
-        ))
+                .into();
+        if let Some(paths) = self.source_paths() {
+            paths.emit(
+                self.model,
+                MessageKind::Error,
+                crate::cxx_modules::generation_location(self.model, target),
+                body.clone(),
+            );
+            Err(ResolveError::Reported(body))
+        } else {
+            Err(ResolveError::Message(body))
+        }
     }
 
     fn toolchain_error(&self, origin: &Backtrace, body: BString) -> ResolveError {

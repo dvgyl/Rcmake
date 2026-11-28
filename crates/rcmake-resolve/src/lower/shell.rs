@@ -64,25 +64,26 @@ pub(super) fn ninja_custom(
     working_dir: Option<BString>,
     verbatim: bool,
 ) -> Invocation {
-    let shell = join_words(argv.iter().enumerate().map(|(index, arg)| {
+    let mut shell = BString::default();
+    for (index, arg) in argv.iter().enumerate() {
+        if index > 0 {
+            shell.push(b' ');
+        }
         if index == 0 {
-            return cmake_posix_quote(arg);
-        }
-        if custom_shell_operator(arg) {
-            return arg.clone();
-        }
-        if verbatim {
-            return cmake_posix_quote(arg);
-        }
-        let mut escaped = BString::default();
-        for &byte in arg.iter() {
-            if byte == b' ' {
-                escaped.push(b'\\');
+            shell.extend_from_slice(&cmake_posix_quote(arg));
+        } else if custom_shell_operator(arg) {
+            shell.extend_from_slice(arg);
+        } else if verbatim {
+            shell.extend_from_slice(&cmake_posix_quote(arg));
+        } else {
+            for &byte in arg.iter() {
+                if byte == b' ' {
+                    shell.push(b'\\');
+                }
+                shell.push(byte);
             }
-            escaped.push(byte);
         }
-        escaped
-    }));
+    }
     Invocation {
         argv,
         shell,
@@ -610,5 +611,17 @@ mod custom_tests {
                 ninja_custom(args.into_iter().map(BString::from).collect(), None, true);
             assert_eq!(invocation.shell, expected);
         }
+    }
+
+    #[test]
+    fn non_verbatim_custom_command_preserves_empty_argument_separators() {
+        let args: Vec<BString> = ["echo", "first", "", "", "last"]
+            .into_iter()
+            .map(BString::from)
+            .collect();
+        let legacy = ninja_custom(args.clone(), None, false);
+        assert_eq!(legacy.shell, "echo first   last");
+        let verbatim = ninja_custom(args, None, true);
+        assert_eq!(verbatim.shell, "echo first \"\" \"\" last");
     }
 }

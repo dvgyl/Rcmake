@@ -69,7 +69,14 @@ impl<'a> Graph<'a> {
                     invocation.argv.iter().any(|arg| {
                         arg.eq_ignore_ascii_case(b"/showIncludes")
                             || arg.eq_ignore_ascii_case(b"-showIncludes")
-                    })
+                    }) || (invocation.argv.is_empty()
+                        && invocation
+                            .shell
+                            .split(|&byte| byte.is_ascii_whitespace())
+                            .any(|arg| {
+                                arg.eq_ignore_ascii_case(b"/showIncludes")
+                                    || arg.eq_ignore_ascii_case(b"-showIncludes")
+                            }))
                 },
                 |format| format == b"msvc",
             )

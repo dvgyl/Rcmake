@@ -40,6 +40,10 @@ pub(in crate::lower) fn prepare(
     let root = &model.dir(DirId::ROOT).binary_dir;
     let from = compile_pdb_path(model, owner, Some(owner_id), true, config, usage)?;
     if owner_id == id {
+        let full_from = join(root, &from);
+        if let Some(parent) = rcmake_host::path::to_native(&full_from).parent() {
+            let _ = host.create_dir_all(parent);
+        }
         return Ok(Some(Copy {
             destination: from,
             step: None,
@@ -119,6 +123,7 @@ fn debug_extensions(
             target,
             &resolved.config,
             &group.language,
+            None,
         )?)
         .chain(group.flags.iter().flat_map(|option| {
             if let Some(shell) = option.value.strip_prefix(b"SHELL:") {

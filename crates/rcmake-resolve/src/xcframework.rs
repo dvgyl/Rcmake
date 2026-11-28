@@ -207,6 +207,7 @@ fn read_plist(host: &dyn Host, plist: &[u8]) -> Option<Value> {
                 stderr: Output::Null,
                 timeout: Some(Duration::from_secs(5)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

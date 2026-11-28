@@ -71,6 +71,7 @@ fn apple_strip(host: &dyn Host, program: &BString, binary: &[u8]) -> bool {
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(5)),
             tee: false,
+            default_error_mode: false,
         },
         4096,
     )

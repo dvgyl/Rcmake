@@ -29,6 +29,7 @@ pub(crate) fn resolve_exports(
     model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
     targets: &[ResolvedTarget],
+    object_dependencies: &IndexMap<(TargetId, ConfigId), Vec<TargetId>>,
     install: &InstallManifest,
     configs: &[ConfigId],
 ) -> Result<Vec<ExportPlan>, ResolveError> {
@@ -126,6 +127,7 @@ pub(crate) fn resolve_exports(
                     model,
                     usage,
                     targets,
+                    object_dependencies,
                     configs,
                     id,
                     Some(install),
@@ -149,6 +151,8 @@ pub(crate) fn resolve_exports(
                 ExportOptions {
                     install: Some(install),
                     legacy_interface,
+                    all_targets: targets,
+                    object_dependencies,
                 },
             )?;
             if let Some(rules) = include_rules.get(&id)
@@ -201,8 +205,15 @@ pub(crate) fn resolve_exports(
         validate_members(model, &members, None)?;
         for &id in &members {
             if plan.android {
-                plan.targets
-                    .push(android_target(model, usage, targets, configs, id, None)?);
+                plan.targets.push(android_target(
+                    model,
+                    usage,
+                    targets,
+                    object_dependencies,
+                    configs,
+                    id,
+                    None,
+                )?);
                 continue;
             }
             let mut target = export_target(
@@ -214,6 +225,8 @@ pub(crate) fn resolve_exports(
                 ExportOptions {
                     install: None,
                     legacy_interface,
+                    all_targets: targets,
+                    object_dependencies,
                 },
             )?;
             packages.extend(export_links::qualify(
@@ -243,6 +256,7 @@ fn android_target(
     model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
     facts: &[ResolvedTarget],
+    object_dependencies: &IndexMap<(TargetId, ConfigId), Vec<TargetId>>,
     configs: &[ConfigId],
     id: TargetId,
     install: Option<&InstallManifest>,
@@ -256,6 +270,8 @@ fn android_target(
         ExportOptions {
             install,
             legacy_interface: false,
+            all_targets: facts,
+            object_dependencies,
         },
     )?;
     target
@@ -596,6 +612,8 @@ fn export_filename(set: &[u8]) -> BString {
 struct ExportOptions<'a> {
     install: Option<&'a InstallManifest>,
     legacy_interface: bool,
+    all_targets: &'a [ResolvedTarget],
+    object_dependencies: &'a IndexMap<(TargetId, ConfigId), Vec<TargetId>>,
 }
 
 impl ResolveError {
@@ -705,6 +723,8 @@ fn export_target<'a>(
     let ExportOptions {
         install,
         legacy_interface,
+        all_targets,
+        object_dependencies,
     } = options;
     let target = model
         .target(id)
@@ -847,11 +867,14 @@ fn export_target<'a>(
                 properties.insert("IMPORTED_SONAME".into(), value);
             }
             if kind == "STATIC" {
-                let languages: IndexSet<_> = facts
-                    .compile_groups
-                    .iter()
-                    .map(|group| &group.language)
-                    .collect();
+                let languages = static_archive_languages(
+                    model,
+                    usage,
+                    id,
+                    facts,
+                    all_targets,
+                    object_dependencies,
+                )?;
                 properties.insert(
                     "IMPORTED_LINK_INTERFACE_LANGUAGES".into(),
                     list::join(languages),
@@ -889,6 +912,94 @@ fn export_target<'a>(
         }
     }
     Ok(exported)
+}
+
+fn static_archive_languages(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    id: TargetId,
+    facts: &ResolvedTarget,
+    all_targets: &[ResolvedTarget],
+    object_dependencies: &IndexMap<(TargetId, ConfigId), Vec<TargetId>>,
+) -> Result<IndexSet<BString>, ResolveError> {
+    let mut languages: IndexSet<BString> = facts
+        .compile_groups
+        .iter()
+        .map(|group| group.language.clone())
+        .collect();
+    let mut visited = IndexSet::new();
+    let mut queue = Vec::new();
+    let mut enqueue_object = |candidate: TargetId, queue: &mut Vec<TargetId>| {
+        if candidate != id
+            && model
+                .target(candidate)
+                .is_some_and(|target| target.kind == TargetKind::ObjectLibrary)
+            && visited.insert(candidate)
+        {
+            queue.push(candidate);
+        }
+    };
+    let enqueue_target_objects = |owner: TargetId,
+                                  usage: &mut UsageResolver<'_>,
+                                  enqueue: &mut dyn FnMut(TargetId, &mut Vec<TargetId>),
+                                  queue: &mut Vec<TargetId>| {
+        if let Some(deps) = object_dependencies.get(&(owner, facts.config.clone())) {
+            for &dep in deps {
+                enqueue(dep, queue);
+            }
+        }
+        let ctx = EvalContext {
+            config: facts.config.clone(),
+            ..EvalContext::default()
+        };
+        if let Ok(items) = usage.ordered_links(owner, &ctx) {
+            for item in &items {
+                let entries = match &item.kind {
+                    crate::usage::ResolvedLinkKind::Group { members, .. } => members.as_slice(),
+                    _ => std::slice::from_ref(item.as_ref()),
+                };
+                for entry in entries {
+                    if let crate::usage::ResolvedLinkKind::Objects(obj_id) = entry.kind {
+                        enqueue(obj_id, queue);
+                    }
+                }
+            }
+        }
+    };
+    enqueue_target_objects(id, usage, &mut enqueue_object, &mut queue);
+    while let Some(obj_id) = queue.pop() {
+        let Some(obj_target) = model.target(obj_id) else {
+            continue;
+        };
+        if obj_target.is_imported() {
+            let prop = b"IMPORTED_LINK_INTERFACE_LANGUAGES";
+            let configured =
+                crate::usage::artifacts::selected_imported_config(obj_target, &facts.config)
+                    .filter(|cfg| !cfg.is_empty())
+                    .map(|cfg| [prop.as_slice(), b"_", &cfg].concat());
+            if let Some(value) = configured
+                .as_ref()
+                .and_then(|key| obj_target.props.get(key))
+                .or_else(|| obj_target.props.get(prop))
+            {
+                languages.extend(list::split(value, list::Empty::Drop));
+            }
+            continue;
+        }
+        if let Some(obj_facts) = all_targets
+            .iter()
+            .find(|candidate| candidate.id == obj_id && candidate.config == facts.config)
+        {
+            languages.extend(
+                obj_facts
+                    .compile_groups
+                    .iter()
+                    .map(|group| group.language.clone()),
+            );
+            enqueue_target_objects(obj_id, usage, &mut enqueue_object, &mut queue);
+        }
+    }
+    Ok(languages)
 }
 
 fn export_properties(

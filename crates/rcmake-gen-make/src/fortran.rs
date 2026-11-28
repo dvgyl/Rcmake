@@ -8,13 +8,14 @@ use std::{
     path::Path,
 };
 
-use rcmake_base::{BString, path_lex::Lexical, shell::quote_always};
+use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_gen_common::GenError;
 use rcmake_host::Host;
 use rcmake_resolve::DependInfo;
 
 use crate::{
-    Word, build_path, check_make_path, make_recipe_text, make_word, phony, rule, write_makefile,
+    MakeDialect, Word, build_path, check_make_path_for, make_recipe_text, make_recipe_text_for,
+    make_word_for, phony_for, quote_arg, rule_for, write_makefile,
 };
 
 /// Inputs for the per-target dependency scan.
@@ -173,35 +174,46 @@ pub(crate) fn cmake_argument(out: &mut Vec<u8>, word: &[u8], list_element: bool)
 ///
 /// Returns an error if a path or the command cannot be written in Make.
 pub(crate) fn include_depend_make(
+    dialect: MakeDialect,
     out: &mut Vec<u8>,
     path: &[u8],
     goal: &[u8],
     cmake: &[u8],
 ) -> Result<(), GenError> {
     let stamp_goal = Lexical::new(Lexical::new(path).parent()).append(b"build");
-    check_make_path(path)?;
-    check_make_path(goal)?;
-    check_make_path(&stamp_goal)?;
+    check_make_path_for(dialect, path)?;
+    check_make_path_for(dialect, goal)?;
+    check_make_path_for(dialect, &stamp_goal)?;
     if cmake.is_empty() {
         return Err(GenError::Invalid("CMAKE_COMMAND is empty.".into()));
     }
-    out.extend_from_slice(b"override CMAKE_COMMAND := ");
-    let mut command = Vec::new();
-    make_recipe_text(&mut command, &quote_always(cmake))?;
-    for byte in command {
-        if byte == b'#' {
-            out.push(b'\\');
+    if dialect.is_nmake() {
+        out.extend_from_slice(b"!IFNDEF CMAKE_COMMAND\nCMAKE_COMMAND = ");
+        make_recipe_text(out, &quote_arg(dialect, cmake))?;
+        out.extend_from_slice(b"\n!ENDIF\n!IF EXIST(\"");
+        make_recipe_text(out, path)?;
+        out.extend_from_slice(b"\")\n!INCLUDE \"");
+        make_recipe_text(out, path)?;
+        out.extend_from_slice(b"\"\n!ENDIF\n");
+    } else {
+        out.extend_from_slice(b"override CMAKE_COMMAND := ");
+        let mut command = Vec::new();
+        make_recipe_text(&mut command, &quote_arg(dialect, cmake))?;
+        for byte in command {
+            if byte == b'#' {
+                out.push(b'\\');
+            }
+            out.push(byte);
         }
-        out.push(byte);
+        out.extend_from_slice(b"\n-include ");
+        make_word_for(dialect, out, path, Word::Input);
+        out.push(b'\n');
     }
-    out.extend_from_slice(b"\n-include ");
-    make_word(out, path, Word::Input);
-    out.push(b'\n');
     if stamp_goal != goal {
-        rule(out, goal, [stamp_goal.as_slice()]);
+        rule_for(dialect, out, goal, [stamp_goal.as_slice()]);
     }
     // A target without providers has no stamp prerequisites.
-    rule(out, &stamp_goal, []);
+    rule_for(dialect, out, &stamp_goal, []);
     Ok(())
 }
 
@@ -214,22 +226,30 @@ pub(crate) fn include_depend_make(
 ///
 /// Returns an error if a dependency or a command cannot be written in Make.
 pub(crate) fn emit_depend(
+    dialect: MakeDialect,
     out: &mut Vec<u8>,
     plan: &DependencyRule<'_>,
     generated_sources: &[BString],
 ) -> Result<(), GenError> {
-    check_make_path(plan.goal)?;
-    check_make_path(plan.depend_info)?;
+    check_make_path_for(dialect, plan.goal)?;
+    check_make_path_for(dialect, plan.depend_info)?;
     for source in generated_sources {
-        check_make_path(source)?;
+        check_make_path_for(dialect, source)?;
     }
-    phony(
+    phony_for(
+        dialect,
         out,
         plan.goal,
         std::iter::once(plan.depend_info)
             .chain(generated_sources.iter().map(|source| source.as_slice())),
     );
-    out.extend_from_slice(b"\t$(SILENT)$(CMAKE_COMMAND) -E cmake_depends \"Unix Makefiles\"");
+    out.extend_from_slice(
+        format!(
+            "\t$(SILENT)$(CMAKE_COMMAND) -E cmake_depends \"{}\"",
+            dialect.generator_name()
+        )
+        .as_bytes(),
+    );
     for arg in [
         plan.source_dir,
         plan.target_source_dir,
@@ -238,7 +258,7 @@ pub(crate) fn emit_depend(
         plan.depend_info,
     ] {
         out.push(b' ');
-        make_recipe_text(out, &quote_always(arg))?;
+        make_recipe_text_for(dialect, out, &quote_arg(dialect, arg))?;
     }
     out.push(b'\n');
     Ok(())
@@ -254,6 +274,7 @@ pub(crate) fn emit_depend(
 ///
 /// Returns an error if the directory or an object path cannot be written in Make.
 pub(crate) fn emit_module_directory(
+    dialect: MakeDialect,
     out: &mut Vec<u8>,
     module_dir: &[u8],
     objects: &[BString],
@@ -261,17 +282,25 @@ pub(crate) fn emit_module_directory(
     if objects.is_empty() {
         return Ok(());
     }
-    check_make_path(module_dir)?;
+    check_make_path_for(dialect, module_dir)?;
     for object in objects.iter().collect::<BTreeSet<_>>() {
-        check_make_path(object)?;
-        make_word(out, object, Word::Target);
-        out.extend_from_slice(b": | ");
-        make_word(out, module_dir, Word::Input);
+        check_make_path_for(dialect, object)?;
+        make_word_for(dialect, out, object, Word::Target);
+        if dialect.is_nmake() {
+            out.extend_from_slice(b": ");
+        } else {
+            out.extend_from_slice(b": | ");
+        }
+        make_word_for(dialect, out, module_dir, Word::Input);
         out.push(b'\n');
     }
-    rule(out, module_dir, []);
-    out.extend_from_slice(b"\t$(SILENT)mkdir -p -- ");
-    make_recipe_text(out, &quote_always(module_dir))?;
+    rule_for(dialect, out, module_dir, []);
+    if dialect.is_nmake() {
+        out.extend_from_slice(b"\t$(SILENT)$(CMAKE_COMMAND) -E make_directory ");
+    } else {
+        out.extend_from_slice(b"\t$(SILENT)mkdir -p -- ");
+    }
+    make_recipe_text_for(dialect, out, &quote_arg(dialect, module_dir))?;
     out.push(b'\n');
     Ok(())
 }
@@ -310,21 +339,37 @@ impl<'a> TargetDepend<'a> {
         )
     }
 
-    pub(crate) fn emit_clean(&self, out: &mut Vec<u8>, cmake: &[u8]) -> Result<(), GenError> {
+    pub(crate) fn emit_clean(
+        &self,
+        dialect: MakeDialect,
+        out: &mut Vec<u8>,
+        cmake: &[u8],
+    ) -> Result<(), GenError> {
         let support = Lexical::new(Lexical::new(&self.target.depend_info).parent());
         let clean = support.append(b"cmake_clean_Fortran.cmake");
-        out.extend_from_slice(b"\t$(SILENT)if test -f ");
-        make_recipe_text(out, &quote_always(&clean))?;
-        out.extend_from_slice(b"; then ");
-        make_recipe_text(out, &quote_always(cmake))?;
-        out.extend_from_slice(b" -P ");
-        make_recipe_text(out, &quote_always(&clean))?;
-        out.extend_from_slice(b"; fi\n");
+        if dialect.is_nmake() {
+            out.extend_from_slice(b"\t$(SILENT)if exist ");
+            make_recipe_text_for(dialect, out, &quote_arg(dialect, &clean))?;
+            out.push(b' ');
+            make_recipe_text_for(dialect, out, &quote_arg(dialect, cmake))?;
+            out.extend_from_slice(b" -P ");
+            make_recipe_text_for(dialect, out, &quote_arg(dialect, &clean))?;
+            out.push(b'\n');
+        } else {
+            out.extend_from_slice(b"\t$(SILENT)if test -f ");
+            make_recipe_text_for(dialect, out, &quote_arg(dialect, &clean))?;
+            out.extend_from_slice(b"; then ");
+            make_recipe_text_for(dialect, out, &quote_arg(dialect, cmake))?;
+            out.extend_from_slice(b" -P ");
+            make_recipe_text_for(dialect, out, &quote_arg(dialect, &clean))?;
+            out.extend_from_slice(b"; fi\n");
+        }
         Ok(())
     }
 
     pub(crate) fn emit(
         &self,
+        dialect: MakeDialect,
         out: &mut Vec<u8>,
         target: &crate::Target<'_>,
         cmake: &[u8],
@@ -335,7 +380,7 @@ impl<'a> TargetDepend<'a> {
         };
         let support = Lexical::new(Lexical::new(&self.target.depend_info).parent());
         let depend_make = support.append(b"depend.make");
-        include_depend_make(out, &depend_make, &target.goal, cmake)?;
+        include_depend_make(dialect, out, &depend_make, &target.goal, cmake)?;
         let produced: HashSet<&[u8]> = target
             .rules
             .iter()
@@ -349,6 +394,7 @@ impl<'a> TargetDepend<'a> {
             .filter(|source| produced.contains(source.as_slice()))
             .collect::<Vec<_>>();
         emit_depend(
+            dialect,
             out,
             &DependencyRule {
                 source_dir: &tdi.dir_top_src,
@@ -367,7 +413,7 @@ impl<'a> TargetDepend<'a> {
                 .iter()
                 .map(|source| build_path(&source.object, build_dir))
                 .collect::<Vec<_>>();
-            emit_module_directory(out, directory, &objects)?;
+            emit_module_directory(dialect, out, directory, &objects)?;
         }
         Ok(())
     }
@@ -381,6 +427,7 @@ mod tests {
     fn depend_goal_uses_the_current_and_top_directories() -> Result<(), GenError> {
         let mut out = Vec::new();
         emit_depend(
+            MakeDialect::Unix,
             &mut out,
             &DependencyRule {
                 source_dir: b"/source tree",
@@ -392,7 +439,13 @@ mod tests {
             },
             &["generated $unit.f90".into()],
         )?;
-        include_depend_make(&mut out, b"obj/depend.make", b"obj/all", b"/my tools/cmake")?;
+        include_depend_make(
+            MakeDialect::Unix,
+            &mut out,
+            b"obj/depend.make",
+            b"obj/all",
+            b"/my tools/cmake",
+        )?;
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("obj/depend: obj/DependInfo.cmake generated\\ $$unit.f90\n"));
         assert!(text.contains("$(CMAKE_COMMAND) -E cmake_depends \"Unix Makefiles\" '/source tree' '/source tree/sub' '/build' '/build/sub' 'obj/DependInfo.cmake'\n"));
@@ -405,6 +458,7 @@ mod tests {
     fn module_directory_does_not_make_objects_out_of_date() -> Result<(), GenError> {
         let mut out = Vec::new();
         emit_module_directory(
+            MakeDialect::Unix,
             &mut out,
             b"module files",
             &["obj/uses.o".into(), "obj/defines.o".into()],

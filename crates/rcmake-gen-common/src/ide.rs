@@ -22,7 +22,7 @@ pub enum UtilityKind {
     RunTests,
     /// `package` (Xcode) or `PACKAGE` (Visual Studio).
     Package,
-    /// `package_source` (Xcode) or `PACKAGE_SOURCE` (Visual Studio).
+    /// `package_source` (Xcode only; Visual Studio does not emit `PACKAGE_SOURCE`).
     PackageSource,
 }
 
@@ -88,7 +88,7 @@ pub fn utility_targets(
     if has_file("CPackConfig.cmake") {
         out.push(named("package", UtilityKind::Package));
     }
-    if has_file("CPackSourceConfig.cmake") {
+    if !upper && has_file("CPackSourceConfig.cmake") {
         out.push(named("package_source", UtilityKind::PackageSource));
     }
     out
@@ -373,8 +373,7 @@ mod tests {
                 b"ALL_BUILD".as_slice(),
                 b"INSTALL",
                 b"RUN_TESTS",
-                b"PACKAGE",
-                b"PACKAGE_SOURCE"
+                b"PACKAGE"
             ]
         );
     }

@@ -54,8 +54,7 @@ impl UsageResolver<'_> {
                     self.target(target)?,
                     property,
                     &values,
-                    property != b"INTERFACE_SOURCES"
-                        && windows_path_rules(self.model, dir, Some(paths)),
+                    windows_path_rules(self.model, dir, Some(paths)),
                 )
             {
                 result.flags.head_sensitive = true;

@@ -22,8 +22,18 @@ impl Settings {
         self.values.remove(key)
     }
 
+    /// Return `true` when no setting is set.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.values.is_empty() && self.lists.is_empty() && self.options.is_empty()
+    }
+
     pub(crate) fn has(&self, key: &str) -> bool {
         self.values.contains_key(key)
+    }
+
+    /// Read one property value.
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(String::as_str)
     }
 
     pub(crate) fn list_values(&self, key: &str) -> &[String] {
@@ -42,6 +52,12 @@ impl Settings {
         self.lists.entry(key).or_default().push(value);
     }
 
+    /// Make sure that list `key` is written, also without values, so that it
+    /// inherits the MSBuild value with `%(key)`.
+    pub(crate) fn inherit(&mut self, key: &'static str) {
+        self.lists.entry(key).or_default();
+    }
+
     pub(crate) fn list_unique(&mut self, key: &'static str, value: String) {
         let values = self.lists.entry(key).or_default();
         let seen = self
@@ -51,6 +67,21 @@ impl Settings {
             .or_insert_with(|| values.iter().cloned().collect());
         if seen.insert(value.clone()) {
             values.push(value);
+        }
+    }
+
+    /// Append `value` to a `;`-separated property value, as MSBuild reads a
+    /// flag that can repeat, such as `/FI`.
+    pub(crate) fn join(&mut self, key: &'static str, value: &str) {
+        let value = msbuild_value(value);
+        match self.values.get_mut(key) {
+            Some(existing) if !existing.is_empty() => {
+                existing.push(';');
+                existing.push_str(&value);
+            }
+            _ => {
+                self.values.insert(key, value);
+            }
         }
     }
 
@@ -108,7 +139,9 @@ impl Settings {
         }
         for (key, values) in &self.lists {
             let values = values.join(";");
-            let value = if *key == "PreprocessorDefinitions" {
+            let value = if values.is_empty() {
+                format!("%({key})")
+            } else if *key == "PreprocessorDefinitions" {
                 format!("%({key});{values}")
             } else {
                 format!("{values};%({key})")
@@ -133,6 +166,16 @@ pub(crate) fn compile(flags: impl IntoIterator<Item = String>, toolset: &str) ->
             .strip_prefix(['-', '/'])
             .or_else(|| flag.starts_with("std:").then_some(flag.as_str()));
         match key {
+            Some("FI") => match flags.next() {
+                Some(value) => settings.join("ForcedIncludeFiles", &value),
+                None => settings.option(&flag),
+            },
+            Some(key) if key.starts_with("FI") => {
+                settings.join(
+                    "ForcedIncludeFiles",
+                    key.strip_prefix("FI").unwrap_or_default(),
+                );
+            }
             Some("D" | "I") => {
                 let property = if key == Some("D") {
                     "PreprocessorDefinitions"
@@ -232,6 +275,21 @@ fn compile_property(flag: &str, toolset: &str) -> Option<(&'static str, &'static
         "Zc:inline-" => ("RemoveUnreferencedCodeData", "false"),
         "Zc:preprocessor" => ("UseStandardPreprocessor", "true"),
         "Zc:preprocessor-" => ("UseStandardPreprocessor", "false"),
+        "Qspectre" => ("SpectreMitigation", "Spectre"),
+        "Qspectre-" => ("SpectreMitigation", "false"),
+        "Qspectre-load" => ("SpectreMitigation", "SpectreLoad"),
+        "Qspectre-load-cf" => ("SpectreMitigation", "SpectreLoadCF"),
+        "clr" => ("CompileAsManaged", "true"),
+        "clr:pure" => ("CompileAsManaged", "Pure"),
+        "clr:safe" => ("CompileAsManaged", "Safe"),
+        "clr:netcore" => ("CLRSupport", "NetCore"),
+        "ZW" => ("CompileAsWinRT", "true"),
+        "ZW:nostdlib" => ("WinRTNoStdLib", "true"),
+        "guard:cf" => ("ControlFlowGuard", "Guard"),
+        "guard:ehcont" => ("GuardEHContMetadata", "true"),
+        "guard:ehcont-" => ("GuardEHContMetadata", "false"),
+        "sdl" => ("SDLCheck", "true"),
+        "sdl-" => ("SDLCheck", "false"),
         _ => return None,
     })
 }
@@ -265,6 +323,18 @@ pub(crate) fn link(flags: impl IntoIterator<Item = String>, archive: bool) -> Se
             "MANIFEST" if !archive => settings.set("GenerateManifest", "true"),
             "MANIFEST:NO" if !archive => settings.set("GenerateManifest", "false"),
             "LTCG" if archive => settings.set("LinkTimeCodeGeneration", "true"),
+            upper if !archive && link_property(upper).is_some() => {
+                if let Some((property, value)) = link_property(upper) {
+                    settings.set(property, value);
+                }
+            }
+            upper if !archive && upper.starts_with("VERSION:") => {
+                settings.set("Version", key.get("VERSION:".len()..).unwrap_or_default());
+            }
+            upper if !archive && upper.starts_with("NODEFAULTLIB:") => {
+                let library = key.get("NODEFAULTLIB:".len()..).unwrap_or_default();
+                settings.list("IgnoreSpecificDefaultLibraries", msbuild_value(library));
+            }
             _ if !archive && key.contains(':') => {
                 let (name, value) = key.split_once(':').unwrap_or_default();
                 if let Some(property) = match name.to_ascii_uppercase().as_str() {
@@ -296,6 +366,35 @@ pub(crate) fn link(flags: impl IntoIterator<Item = String>, archive: bool) -> Se
         }
     }
     settings
+}
+
+/// Map a linker switch without a value, in upper case, to an MSBuild
+/// property, as the `v143_Link.json` flag table of CMake maps it.
+fn link_property(upper: &str) -> Option<(&'static str, &'static str)> {
+    Some(match upper {
+        "NXCOMPAT" => ("DataExecutionPrevention", "true"),
+        "NXCOMPAT:NO" => ("DataExecutionPrevention", "false"),
+        "DYNAMICBASE" => ("RandomizedBaseAddress", "true"),
+        "DYNAMICBASE:NO" => ("RandomizedBaseAddress", "false"),
+        "SAFESEH" => ("ImageHasSafeExceptionHandlers", "true"),
+        "SAFESEH:NO" => ("ImageHasSafeExceptionHandlers", "false"),
+        "ERRORREPORT:PROMPT" => ("LinkErrorReporting", "PromptImmediately"),
+        "ERRORREPORT:QUEUE" => ("LinkErrorReporting", "QueueForNextLogin"),
+        "ERRORREPORT:SEND" => ("LinkErrorReporting", "SendErrorReport"),
+        "ERRORREPORT:NONE" => ("LinkErrorReporting", "NoErrorReport"),
+        "LARGEADDRESSAWARE" => ("LargeAddressAware", "true"),
+        "LARGEADDRESSAWARE:NO" => ("LargeAddressAware", "false"),
+        "OPT:REF" => ("OptimizeReferences", "true"),
+        "OPT:NOREF" => ("OptimizeReferences", "false"),
+        "OPT:ICF" => ("EnableCOMDATFolding", "true"),
+        "OPT:NOICF" => ("EnableCOMDATFolding", "false"),
+        "NODEFAULTLIB" => ("IgnoreAllDefaultLibraries", "true"),
+        "NOENTRY" => ("NoEntryPoint", "true"),
+        "FIXED" => ("FixedBaseAddress", "true"),
+        "FIXED:NO" => ("FixedBaseAddress", "false"),
+        "PROFILE" => ("Profile", "true"),
+        _ => return None,
+    })
 }
 
 // Split a flag string. Preserve backslashes in Windows paths and decode POSIX quotes

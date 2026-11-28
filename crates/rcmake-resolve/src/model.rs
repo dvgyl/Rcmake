@@ -90,6 +90,10 @@ pub struct ConfigureMetadata {
     pub generated_files: Vec<BString>,
     /// Auxiliary paths that the build system removes on clean.
     pub clean_files: Vec<BString>,
+    /// Whether `--compile-no-warning-as-error` was active during configure.
+    pub ignore_compile_warning_as_error: bool,
+    /// Whether `--link-no-warning-as-error` was active during configure.
+    pub ignore_link_warning_as_error: bool,
 }
 
 /// Compiler facts of one language (`toolchains-v1`).

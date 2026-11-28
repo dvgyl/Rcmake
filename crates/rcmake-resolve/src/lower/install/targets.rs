@@ -276,6 +276,10 @@ pub(super) fn lower(
                     {
                         continue;
                     }
+                    let declared_optional = options.optional;
+                    if file_type == b"STATIC_LIBRARY" {
+                        options.optional = true;
+                    }
                     if per_config && installs {
                         options.configurations = vec![target.config.0.clone()];
                     }
@@ -288,9 +292,11 @@ pub(super) fn lower(
                     let path = file_path(&model.dir(DirId::ROOT).binary_dir, file);
                     let kind = file_action(file_type, vec![path.0.clone()], &options);
                     let action = make_action(&options, default, kind);
+                    let mut projection_action = action.clone();
+                    projection_action.optional = declared_optional;
                     projection.add(
                         manifest,
-                        &action,
+                        &projection_action,
                         file_type == b"STATIC_LIBRARY",
                         NamelinkMode::None,
                         vec![path],
@@ -320,8 +326,9 @@ pub(super) fn lower(
             } else {
                 crate::ide::BundleKind::None
             };
+            let dll = super::super::artifacts::is_dll_platform(model, raw.dir);
             let Some((mut class, file_type, fallback)) =
-                target_install_kind(target.metadata.kind, &layout)
+                target_install_kind(target.metadata.kind, &layout, dll)
             else {
                 continue;
             };
@@ -473,6 +480,17 @@ pub(super) fn lower(
                     let change = as_code(edit.render(&action.destination, name, configured));
                     (check, Some(change))
                 });
+                let ios_combined_action = installed
+                    .as_ref()
+                    .filter(|_| ios_install_combined_enabled(model, raw))
+                    .map(|name| {
+                        as_code(ios_install_combined_code(
+                            &raw.name,
+                            &action.destination,
+                            name,
+                            configured,
+                        ))
+                    });
                 let strip_action = if matches!(layout, crate::ide::BundleKind::App { .. }) {
                     None
                 } else {
@@ -481,7 +499,44 @@ pub(super) fn lower(
                 manifest.actions.extend(check);
                 manifest.actions.push(action);
                 manifest.actions.extend(change);
+                manifest.actions.extend(ios_combined_action);
                 manifest.actions.extend(strip_action);
+            }
+            if !runtime_only
+                && raw.kind == TargetKind::Executable
+                && dll
+                && raw
+                    .props
+                    .get(b"ENABLE_EXPORTS")
+                    .is_some_and(|value| truth::is_on(value))
+                && let Some(import_file) = &artifacts.import_file
+            {
+                let mut archive = groups
+                    .get(b"ARCHIVE".as_slice())
+                    .map_or_else(|| rule.options.clone(), |group| group.merge(&rule.options));
+                if archive
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| !path.is_empty())
+                {
+                    let archive_installs = matches_config(&archive, &target.config);
+                    if archive_installs || per_config {
+                        archive.optional = true;
+                        if per_config && archive_installs {
+                            archive.configurations = vec![target.config.0.clone()];
+                        }
+                        eval_destination(&mut archive, raw.dir, &target.config, rule, eval)?;
+                        let path = file_path(bin, import_file);
+                        let default_lib = definition(model, rule.dir, b"CMAKE_INSTALL_LIBDIR")
+                            .map_or(b"lib".as_slice(), |value| value.as_slice());
+                        let kind = file_action(b"STATIC_LIBRARY", vec![path.0.clone()], &archive);
+                        let action = make_action(&archive, default_lib, kind);
+                        projection.add(manifest, &action, true, NamelinkMode::None, vec![path]);
+                        if archive_installs {
+                            manifest.actions.push(action);
+                        }
+                    }
+                }
             }
             if !runtime_only
                 && layout == crate::ide::BundleKind::None
@@ -595,59 +650,94 @@ pub(super) fn lower(
             else {
                 continue;
             };
-            let files: Vec<_> = list::split(headers, list::Empty::Drop)
-                .iter()
-                .map(|path| join(source, path))
-                .collect();
-            if !files.is_empty() {
-                let options = groups
-                    .get(key)
-                    .map_or_else(|| options.clone(), |extra| extra.merge(options));
-                // A header without its own destination installs to the
-                // default only when no artifact destination is given.
-                let own_destination = options
-                    .destination
-                    .as_ref()
-                    .is_some_and(|path| !path.is_empty());
-                if !own_destination && (key == b"RESOURCE" || plan.artifacts_specified) {
+            let expand_headers = super::has_genex(headers);
+            let eval_headers = |config: &ConfigId| -> Result<Vec<BString>, ResolveError> {
+                let evaluated = if expand_headers {
+                    let context = rcmake_genex::EvalContext {
+                        config: config.clone(),
+                        head: Some(crate::usage::handle(*id)),
+                        current: Some(crate::usage::handle(*id)),
+                        site: rcmake_genex::EvalSite {
+                            backtrace: rule.backtrace.clone(),
+                            property: Some(key.into()),
+                        },
+                        ..rcmake_genex::EvalContext::default()
+                    };
+                    let mut usage = crate::usage::UsageResolver::new(model);
+                    rcmake_genex::evaluate(
+                        &rcmake_genex::parse(headers)?,
+                        &context,
+                        &mut usage.host(raw.dir),
+                    )?
+                    .0
+                } else {
+                    headers.clone()
+                };
+                Ok(list::split(&evaluated, list::Empty::Drop)
+                    .iter()
+                    .map(|path| join(source, path))
+                    .collect())
+            };
+            let options = groups
+                .get(key)
+                .map_or_else(|| options.clone(), |extra| extra.merge(options));
+            // A header without its own destination installs to the
+            // default only when no artifact destination is given.
+            let own_destination = options
+                .destination
+                .as_ref()
+                .is_some_and(|path| !path.is_empty());
+            if !own_destination && (key == b"RESOURCE" || plan.artifacts_specified) {
+                continue;
+            }
+            let default = definition(model, rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")
+                .map_or(b"include".as_slice(), |value| value.as_slice());
+            let mut options = options;
+            if !configs.is_empty() {
+                options.destination.get_or_insert_with(|| default.into());
+            }
+            for target in &matching {
+                let files = eval_headers(&target.config)?;
+                if files.is_empty() {
                     continue;
                 }
-                let default = definition(model, rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")
-                    .map_or(b"include".as_slice(), |value| value.as_slice());
-                let mut options = options;
-                if !configs.is_empty() {
-                    options.destination.get_or_insert_with(|| default.into());
-                }
-                for target in &matching {
-                    let mut resolved = options.clone();
-                    eval_destination(&mut resolved, rule.dir, &target.config, rule, eval)?;
-                    let action = make_action(
-                        &resolved,
-                        default,
-                        InstallActionKind::Code(BString::default()),
-                    );
-                    facts.file_installers.push(TargetFileInstaller {
-                        rule: index,
-                        target: *id,
-                        config: target.config.clone(),
-                        kind: file_kind,
-                        destination: action.destination,
-                        component: action.component,
-                        optional: action.optional,
-                        exclude_from_all: action.exclude_from_all,
-                        configurations: action.configurations,
-                        files: files.clone(),
-                    });
-                }
-                for config in action_configs(configs, &options, false, multi) {
-                    let mut options = options.clone();
-                    if let Some(config) = config {
-                        eval_destination(&mut options, rule.dir, config, rule, eval)?;
-                        if multi {
-                            options.configurations = vec![config.0.clone()];
-                        }
+                let mut resolved = options.clone();
+                eval_destination(&mut resolved, rule.dir, &target.config, rule, eval)?;
+                let action = make_action(
+                    &resolved,
+                    default,
+                    InstallActionKind::Code(BString::default()),
+                );
+                facts.file_installers.push(TargetFileInstaller {
+                    rule: index,
+                    target: *id,
+                    config: target.config.clone(),
+                    kind: file_kind,
+                    destination: action.destination,
+                    component: action.component,
+                    optional: action.optional,
+                    exclude_from_all: action.exclude_from_all,
+                    configurations: action.configurations,
+                    files,
+                });
+            }
+            for config in action_configs(configs, &options, expand_headers, multi) {
+                let mut options = options.clone();
+                let files = if let Some(config) = config {
+                    eval_destination(&mut options, rule.dir, config, rule, eval)?;
+                    if multi {
+                        options.configurations = vec![config.0.clone()];
                     }
-                    let kind = file_action(b"FILE", files.clone(), &options);
+                    eval_headers(config)?
+                } else {
+                    let fallback = configs
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| ConfigId(BString::default()));
+                    eval_headers(&fallback)?
+                };
+                if !files.is_empty() {
+                    let kind = file_action(b"FILE", files, &options);
                     manifest.actions.push(make_action(&options, default, kind));
                 }
             }
@@ -766,6 +856,7 @@ type TargetInstallKind = (&'static [u8], &'static [u8], (&'static [u8], &'static
 fn target_install_kind(
     kind: TargetKind,
     layout: &crate::ide::BundleKind,
+    dll: bool,
 ) -> Option<TargetInstallKind> {
     use crate::ide::BundleKind;
     match layout {
@@ -798,7 +889,11 @@ fn target_install_kind(
         TargetKind::ModuleLibrary => Some((
             b"LIBRARY",
             b"MODULE_LIBRARY",
-            (b"CMAKE_INSTALL_LIBDIR", b"lib"),
+            if dll {
+                (b"CMAKE_INSTALL_BINDIR", b"bin")
+            } else {
+                (b"CMAKE_INSTALL_LIBDIR", b"lib")
+            },
         )),
         _ => None,
     }
@@ -817,7 +912,9 @@ fn artifact_paths<'a>(
     if !group.is_some_and(|group| group.namelink_only) {
         paths.extend(artifacts.file.iter().chain(&artifacts.soname_file));
     }
-    if group.is_none_or(|group| !group.namelink_skip && (!group.namelink_only || has_namelink)) {
+    if group.is_none_or(|group| !group.namelink_skip && (!group.namelink_only || has_namelink))
+        && artifacts.linker_file != artifacts.import_file
+    {
         paths.extend(&artifacts.linker_file);
     }
     paths
@@ -832,4 +929,87 @@ fn take_namelink<'a, 'g>(
     let linker = artifacts.linker_file.as_ref()?;
     let soname = artifacts.soname_file.as_ref()?;
     (soname != linker && files.shift_remove(linker)).then_some((component, linker))
+}
+
+fn ios_install_combined_enabled(model: &ProjectModel, target: &Target) -> bool {
+    if model.generator != Some(GeneratorKind::Xcode)
+        || !matches!(
+            target.kind,
+            TargetKind::Executable
+                | TargetKind::StaticLibrary
+                | TargetKind::SharedLibrary
+                | TargetKind::ModuleLibrary
+        )
+    {
+        return false;
+    }
+    let embedded = matches!(
+        super::super::apple::system(model, target.dir),
+        b"iOS" | b"tvOS" | b"watchOS" | b"visionOS"
+    ) || definition(model, target.dir, b"CMAKE_OSX_SYSROOT").is_some_and(|sdk| {
+        let name = Lexical::new(sdk).filename().to_ascii_lowercase();
+        [
+            b"iphone".as_slice(),
+            b"appletv",
+            b"watch",
+            b"xros",
+            b"xrsimulator",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    });
+    if !embedded {
+        return false;
+    }
+    if let Some(version) = definition(model, target.dir, b"XCODE_VERSION")
+        .or_else(|| definition(model, DirId::ROOT, b"XCODE_VERSION"))
+        .and_then(|value| rcmake_base::version::Version::parse_strict(value))
+        && version.major() < 6
+    {
+        return false;
+    }
+    match target
+        .props
+        .get(b"IOS_INSTALL_COMBINED")
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => truth::is_on(value),
+        None => definition(model, target.dir, b"CMAKE_IOS_INSTALL_COMBINED")
+            .is_some_and(|value| truth::is_on(value)),
+    }
+}
+
+fn ios_install_combined_code(
+    target_name: &[u8],
+    destination: &[u8],
+    installed_name: &[u8],
+    configured: bool,
+) -> BString {
+    let indent: &[u8] = if configured { b"    " } else { b"  " };
+    let mut path = BString::from("\"$ENV{DESTDIR}");
+    if !destination.starts_with(b"/") && !Lexical::windows(destination).absolute() {
+        path.extend_from_slice(b"${CMAKE_INSTALL_PREFIX}/");
+    }
+    super::cmake_quoted_content(&mut path, destination);
+    if !destination.is_empty() && !destination.ends_with(b"/") {
+        path.push(b'/');
+    }
+    super::cmake_quoted_content(&mut path, installed_name);
+    path.push(b'"');
+    let mut out = BString::from("if(EXISTS ");
+    out.extend_from_slice(&path);
+    out.extend_from_slice(b" AND NOT IS_SYMLINK ");
+    out.extend_from_slice(&path);
+    out.extend_from_slice(b")\n");
+    out.extend_from_slice(indent);
+    out.extend_from_slice(b"  include(CMakeIOSInstallCombined)\n");
+    out.extend_from_slice(indent);
+    out.extend_from_slice(b"  ios_install_combined(");
+    super::cmake_quote(&mut out, target_name);
+    out.push(b' ');
+    out.extend_from_slice(&path);
+    out.extend_from_slice(b")\n");
+    out.extend_from_slice(indent);
+    out.extend_from_slice(b"endif()");
+    out
 }

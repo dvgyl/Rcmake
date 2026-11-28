@@ -6,7 +6,7 @@ use rcmake_gen_common::ide::{BuildCommand, BuildRequest, Jobs};
 use rcmake_host::{Host, ReadRange, path::to_native};
 use rcmake_model::{Cache, GeneratorKind, VsVersion};
 
-use crate::{CPP_TYPE, default_platform, solution_ext, string, windows, xml};
+use crate::{default_platform, project_type, solution_ext, string, windows, xml};
 
 /// Suffix of the `STATIC` cache entry that marks a project for package restore.
 pub const RESTORE_SUFFIX: &str = "_REQUIRES_VS_PACKAGE_RESTORE";
@@ -127,20 +127,24 @@ pub fn build_commands_with_restore(
             if clean {
                 argv.extend([solution.as_str().into(), "/t:Clean".into()]);
             } else {
-                let path = if target.contains(['/', '\\']) {
-                    windows(target)
-                } else {
-                    let name = target.strip_suffix(".vcxproj").unwrap_or(target);
-                    solution_data
-                        .as_deref()
-                        .and_then(|data| project_path(data, version, name))
-                        .unwrap_or_else(|| target.into())
-                };
-                argv.push(if path.to_ascii_lowercase().ends_with(".vcxproj") {
-                    path.into()
-                } else {
-                    format!("{path}.vcxproj").into()
+                // A solution entry gives the project file, which can also be
+                // a `.csproj` file or an external project.
+                let found = (!target.contains(['/', '\\']))
+                    .then(|| target.strip_suffix(".vcxproj").unwrap_or(target))
+                    .and_then(|name| {
+                        solution_data
+                            .as_deref()
+                            .and_then(|data| project_path(data, version, name))
+                    });
+                let path = found.unwrap_or_else(|| {
+                    let path = windows(target);
+                    if path.to_ascii_lowercase().ends_with(".vcxproj") {
+                        path
+                    } else {
+                        format!("{path}.vcxproj")
+                    }
                 });
+                argv.push(path.into());
                 if let Some(flag) = restore_flag(restore, cache, target) {
                     argv.push(flag.into());
                 }
@@ -201,29 +205,44 @@ fn restore_flag(mode: RestoreMode, cache: &Cache, target: &str) -> Option<&'stat
     }
 }
 
+/// Find the project file of a target in the solution text.
+///
+/// A `.slnx` entry has no name. As in CMake, its file name without the last
+/// extension gives the name, and a later entry replaces an earlier entry with
+/// the same name. So `include_external_msproject(ext external.csproj)` is
+/// found as `external`, not as `ext`. A `.sln` entry has a name, and folder
+/// entries are skipped.
+///
+/// The build passes the solution configuration and platform also for a
+/// project that the solution maps to other values, as CMake does.
 fn project_path(solution: &str, version: VsVersion, target: &str) -> Option<String> {
     if version.writes_slnx() {
-        return solution.lines().find_map(|line| {
-            // The solution writer puts the Path attribute first.
-            let (path, _) = line
-                .trim_start()
-                .strip_prefix("<Project Path=\"")?
-                .split_once('"')?;
-            let path = xml::unescape_attribute(path);
-            let (name, extension) = path.rsplit(['/', '\\']).next()?.rsplit_once('.')?;
-            (extension.eq_ignore_ascii_case("vcxproj") && name.eq_ignore_ascii_case(target))
-                .then(|| windows(&path))
-        });
+        return solution
+            .lines()
+            .filter_map(|line| {
+                // The solution writer puts the Path attribute first.
+                let (path, _) = line
+                    .trim_start()
+                    .strip_prefix("<Project Path=\"")?
+                    .split_once('"')?;
+                let path = xml::unescape_attribute(path);
+                let file = path.rsplit(['/', '\\']).next()?;
+                let name = file.rsplit_once('.').map_or(file, |(name, _)| name);
+                name.eq_ignore_ascii_case(target).then(|| windows(&path))
+            })
+            .next_back();
     }
     solution.lines().find_map(|line| {
         let (kind, fields) = line.strip_prefix("Project(\"")?.split_once("\") = \"")?;
-        if !kind.eq_ignore_ascii_case(CPP_TYPE) {
+        if kind
+            .trim_matches(['{', '}'])
+            .eq_ignore_ascii_case(project_type::FOLDER)
+        {
             return None;
         }
         let (name, fields) = fields.split_once("\", \"")?;
         let (path, _) = fields.rsplit_once("\", \"")?;
-        let (_, extension) = path.rsplit_once('.')?;
-        (extension.eq_ignore_ascii_case("vcxproj") && name.eq_ignore_ascii_case(target))
+        name.eq_ignore_ascii_case(target)
             .then(|| windows(&path.replace("\"\"", "\"")))
     })
 }

@@ -11,6 +11,8 @@ pub(crate) struct Rule {
     pub(crate) outputs: Vec<String>,
     pub(crate) message: String,
     pub(crate) always: bool,
+    /// MSBuild can run this rule in parallel with others (`BuildInParallel`).
+    pub(crate) parallel: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +45,7 @@ impl From<&IdeCustomStep> for Rule {
                 .as_ref()
                 .map_or_else(String::new, |value| string(value)),
             always: step.always_run || step.outputs.is_empty(),
+            parallel: false,
         }
     }
 }
@@ -65,8 +68,15 @@ fn batch_arg(arg: &str) -> String {
     quote(&arg.replace('%', "%%"))
 }
 
-pub(crate) fn script(commands: &[Command]) -> String {
+/// Write the batch script of an MSBuild custom build step or build event.
+///
+/// `run_path` is the `CMAKE_MSVCIDE_RUN_PATH` value of the directory that
+/// owns the commands. As in CMake, the script adds it to the front of `PATH`
+/// inside `setlocal`, after the first change of the working directory. See
+/// [`set_path`] for the batch quoting.
+pub(crate) fn script(commands: &[Command], run_path: Option<&str>) -> String {
     let mut lines = vec!["setlocal DisableDelayedExpansion".to_owned()];
+    let mut run_path = run_path;
     for command in commands {
         let Some((program, args)) = command.argv.split_first() else {
             continue;
@@ -74,6 +84,9 @@ pub(crate) fn script(commands: &[Command]) -> String {
         if !command.dir.is_empty() {
             lines.push(format!("cd /D {}", batch_arg(&windows(&command.dir))));
             lines.push("if errorlevel 1 exit /b %errorlevel%".into());
+        }
+        if let Some(path) = run_path.take() {
+            lines.push(set_path(path));
         }
         let program = batch_arg(&windows(program));
         let prefix = if program
@@ -101,9 +114,25 @@ pub(crate) fn script(commands: &[Command]) -> String {
     msbuild(&lines.join("\r\n")).replace("%24%28Configuration%29", "$(Configuration)")
 }
 
-pub(crate) fn metadata(xml: &mut Writer, rule: &Rule, condition: &str) {
+/// Write the batch line that adds `run_path` to the front of `PATH`.
+///
+/// CMake writes the value without change, so a `&` in a path such as
+/// `C:\R&D\tools` splits the line into two commands. This line quotes the
+/// whole assignment, so `&`, `|`, `<`, `>`, and `^` stay text. It doubles
+/// each `%`, so `%TEMP%` stays text and is not expanded. A `"` cannot be part
+/// of a Windows path, so it is removed. For example, `C:\R&D;%TEMP%` gives
+/// `set "PATH=C:\R&D;%%TEMP%%;%PATH%"`.
+pub(crate) fn set_path(run_path: &str) -> String {
+    let path = run_path.replace('"', "").replace('%', "%%");
+    format!("set \"PATH={path};%PATH%\"")
+}
+
+pub(crate) fn metadata(xml: &mut Writer, rule: &Rule, condition: &str, run_path: Option<&str>) {
     let attrs = [("Condition", condition)];
-    xml.text("Command", &attrs, &script(&rule.commands));
+    if rule.parallel {
+        xml.text("BuildInParallel", &attrs, "true");
+    }
+    xml.text("Command", &attrs, &script(&rule.commands, run_path));
     if !rule.message.is_empty() {
         xml.text("Message", &attrs, &msbuild(&rule.message));
     }
@@ -154,34 +183,38 @@ pub(crate) fn verify_globs(
         })
 }
 
-pub(crate) fn regeneration(settings: &Settings, project: &Project, inputs: &[String]) -> Rule {
-    let stamp = join(&settings.bin, "CMakeFiles/generate.stamp");
+/// The rule of `ZERO_CHECK`, which checks the build system before each
+/// build, as CMake writes it.
+///
+/// The rule runs `cmake -S<source> -B<binary> --check-stamp-list
+/// CMakeFiles/generate.stamp.list --vs-solution-file <solution>` in the top
+/// binary directory, followed by `extra` arguments. Its inputs are all
+/// listfiles, and its outputs are the generation stamps of all directories.
+pub(crate) fn regeneration(
+    settings: &Settings,
+    project: &Project,
+    inputs: &[String],
+    (stamps, solution, extra): (&[String], &str, &[String]),
+) -> Rule {
+    let mut argv = vec![
+        settings.cmake.clone(),
+        format!("-S{}", settings.source),
+        format!("-B{}", settings.bin),
+        "--check-stamp-list".into(),
+        "CMakeFiles/generate.stamp.list".into(),
+        "--vs-solution-file".into(),
+        solution.to_owned(),
+    ];
+    argv.extend(extra.iter().cloned());
     Rule {
-        commands: vec![
-            Command {
-                argv: vec![
-                    settings.cmake.clone(),
-                    "-S".into(),
-                    settings.source.clone(),
-                    "-B".into(),
-                    settings.bin.clone(),
-                    "--regenerate-during-build".into(),
-                ],
-                dir: project.dir.clone(),
-            },
-            Command {
-                argv: vec![
-                    settings.cmake.clone(),
-                    "-E".into(),
-                    "touch".into(),
-                    stamp.clone(),
-                ],
-                dir: project.dir.clone(),
-            },
-        ],
+        commands: vec![Command {
+            argv,
+            dir: project.dir.clone(),
+        }],
         inputs: inputs.to_vec(),
-        outputs: vec![stamp],
-        message: "Check the build system".into(),
+        outputs: stamps.to_vec(),
+        message: "Checking Build System".into(),
         always: false,
+        parallel: false,
     }
 }

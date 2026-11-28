@@ -4,7 +4,7 @@ use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate};
-use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId};
 
 use super::artifacts::{build_relative, is_darwin, is_msvc};
 use super::compile::language_flags;
@@ -81,20 +81,60 @@ fn join_link_flags(pieces: impl IntoIterator<Item = BString>) -> BString {
     out
 }
 
+fn win32_executable(
+    model: &ProjectModel,
+    target_id: Option<TargetId>,
+    target: &Target,
+    config: &ConfigId,
+    language: &[u8],
+    usage: Option<&mut UsageResolver<'_>>,
+) -> Result<bool, ResolveError> {
+    let Some(raw) = target.props.get(b"WIN32_EXECUTABLE") else {
+        return Ok(false);
+    };
+    if !raw.windows(2).any(|part| part == b"$<") {
+        return Ok(truth::is_on(raw));
+    }
+    let handle = target_id
+        .or_else(|| model.find_target(target.dir, &target.name))
+        .map(crate::usage::handle);
+    let ctx = EvalContext {
+        config: config.clone(),
+        head: handle,
+        current: handle,
+        link_language: Some(language.into()),
+        language: Some(language.into()),
+        traversal: UsageTraversal::Link,
+        ..EvalContext::default()
+    };
+    let evaluate_prop = |usage: &mut UsageResolver<'_>| {
+        let ast = usage.parse_genex(raw)?;
+        evaluate(&ast, &ctx, &mut usage.host(target.dir))
+            .map(|(value, _)| truth::is_on(&value))
+            .map_err(ResolveError::from)
+    };
+    match usage {
+        Some(usage) => evaluate_prop(usage),
+        None => evaluate_prop(&mut UsageResolver::new(model)),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Executable extra-flag resolution evaluates WIN32_EXECUTABLE per target, config, and language."
+)]
 fn executable_extra_flags(
     model: &ProjectModel,
+    target_id: Option<TargetId>,
     target: &Target,
     config: &ConfigId,
     language: &[u8],
     wrapper: &LinkerDriver<'_>,
     policy_181_new: bool,
+    usage: Option<&mut UsageResolver<'_>>,
 ) -> Result<BString, ResolveError> {
     let mut extra = BString::default();
-    let form = if target
-        .props
-        .get(b"WIN32_EXECUTABLE")
-        .is_some_and(|value| truth::is_on(value))
-    {
+    let form = if win32_executable(model, target_id, target, config, language, usage)? {
         b"_CREATE_WIN32_EXE".as_slice()
     } else {
         b"_CREATE_CONSOLE_EXE"
@@ -161,16 +201,74 @@ fn executable_extra_flags(
     Ok(extra)
 }
 
-/// Return the untagged flag fragments and IPO status of a codemodel link step.
+/// Return effective `POSITION_INDEPENDENT_CODE` for `target`, checking the
+/// target property and transitive compile-usage (`compatibility_targets`)
+/// `INTERFACE_POSITION_INDEPENDENT_CODE` entries — excluding `$<LINK_ONLY:...>`.
+fn effective_position_independent(
+    model: &ProjectModel,
+    target_id: TargetId,
+    target: &Target,
+    config: &ConfigId,
+    language: &[u8],
+    usage: Option<&mut UsageResolver<'_>>,
+) -> Option<bool> {
+    if let Some(value) = target.props.get(b"POSITION_INDEPENDENT_CODE") {
+        return Some(truth::is_on(value));
+    }
+    if let Some(usage) = usage {
+        let ctx = EvalContext {
+            config: config.clone(),
+            traversal: UsageTraversal::Compile,
+            link_language: Some(language.into()),
+            head: Some(crate::usage::handle(target_id)),
+            ..EvalContext::default()
+        };
+        let deps = usage.compile_targets(target_id, &ctx).unwrap_or_default();
+        let mut resolved = None;
+        for dep_id in deps {
+            if dep_id == target_id {
+                continue;
+            }
+            let Some(dep) = model.target(dep_id) else {
+                continue;
+            };
+            let Some(raw) = dep.props.get(b"INTERFACE_POSITION_INDEPENDENT_CODE") else {
+                continue;
+            };
+            let value = if rcmake_genex::find_genex(raw).is_some() {
+                let mut host = usage.host(dep.dir);
+                rcmake_genex::parse(raw)
+                    .and_then(|expr| evaluate(&expr, &ctx, &mut host))
+                    .map(|(val, _)| val)
+                    .unwrap_or_else(|_| raw.clone())
+            } else {
+                raw.clone()
+            };
+            if !value.is_empty() {
+                resolved = Some(truth::is_on(&value));
+            }
+        }
+        if resolved.is_some() {
+            return resolved;
+        }
+    }
+    None
+}
+
+/// Return the untagged flag fragments before link options, post-option flag
+/// fragments (such as PIE flags), and IPO status of a codemodel link step.
 pub fn codemodel_link_flags(
     model: &ProjectModel,
+    target_id: TargetId,
     target: &Target,
     config: &ConfigId,
     link: &LinkStep,
-) -> Result<(Vec<BString>, bool), ResolveError> {
+    usage: Option<&mut UsageResolver<'_>>,
+) -> Result<(Vec<BString>, Vec<BString>, bool), ResolveError> {
     let kind = link.kind;
     let language = link.language.as_slice();
     let mut flags = Vec::new();
+    let mut post_flags = Vec::new();
     let policy = Flags::new(model, target, language);
     let ipo = policy.ipo(config);
     let wrapper = LinkerDriver::new(model, target, language);
@@ -206,7 +304,7 @@ pub fn codemodel_link_flags(
             append_flag(&mut target_flags, &wrapper.driver_flags(value));
         }
         push_non_empty(&mut flags, &target_flags);
-        return Ok((flags, ipo));
+        return Ok((flags, post_flags, ipo));
     }
     let split_swift = super::swift::is_split_build(model, target);
     if kind == LinkKind::Executable {
@@ -286,13 +384,27 @@ pub fn codemodel_link_flags(
         }
     }
     push_non_empty(&mut flags, &linker_flags);
+    let mut usage = usage;
     if kind == LinkKind::Executable {
-        let extra =
-            executable_extra_flags(model, target, config, language, &wrapper, policy_new(181))?;
+        let extra = executable_extra_flags(
+            model,
+            Some(target_id),
+            target,
+            config,
+            language,
+            &wrapper,
+            policy_new(181),
+            usage.as_deref_mut(),
+        )?;
         // CMake checks `!extraFlags.empty()` before trimming, so `BUILD_SHARED_LIBS=ON`
         // with no other extra flags emits `{"fragment": "", "role": "flags"}`.
         if !extra.is_empty() {
             flags.push(extra.trim_ascii().into());
+        }
+        let pic = effective_position_independent(model, target_id, target, config, language, usage);
+        let pie = policy.pie_link(pic);
+        if !pie.is_empty() {
+            push_non_empty(&mut post_flags, &join_link_flags(pie));
         }
     } else {
         let mut extra = BString::default();
@@ -308,7 +420,7 @@ pub fn codemodel_link_flags(
         }
         push_non_empty(&mut flags, &extra);
     }
-    Ok((flags, ipo))
+    Ok((flags, post_flags, ipo))
 }
 
 pub(super) struct LoweredLink {
@@ -506,11 +618,13 @@ pub(super) fn link(
     if kind == LinkKind::Executable {
         flags.push(executable_extra_flags(
             model,
+            Some(resolved.id),
             target,
             config,
             language,
             &wrapper,
             policy_new(181),
+            Some(usage),
         )?);
     } else {
         let raw_flags = kind.target_flags_property();
@@ -713,9 +827,18 @@ pub(super) fn link(
         BString::default()
     };
     let shared_flags_key = [b"CMAKE_SHARED_LIBRARY_", language, b"_FLAGS"].concat();
-    let output = quote(&step.output);
+    let ninja_posix = model.generator.is_some_and(GeneratorKind::is_ninja)
+        && !super::shell::windows_host(model, target.dir);
+    let quote_path = |path: &[u8]| {
+        if ninja_posix {
+            super::shell::cmake_posix_quote(path)
+        } else {
+            quote(path)
+        }
+    };
+    let output = quote_path(&step.output);
     let output_ext = Lexical::new(&step.output).stem_extension(true).1;
-    let output_base = quote(step.output.strip_suffix(output_ext).unwrap_or(&step.output));
+    let output_base = quote_path(step.output.strip_suffix(output_ext).unwrap_or(&step.output));
     let object_dir = super::object_dir(model, target, config);
     let swift_defines = swift_group
         .map(|group| super::compile::formatted_defines(model, target, config, group))
@@ -1107,6 +1230,7 @@ pub(super) fn link(
     if kind == LinkKind::Executable
         && let (Some(file), Some(linker)) = (&artifacts.file, &artifacts.linker_file)
         && file != linker
+        && artifacts.import_file.as_ref() != Some(linker)
     {
         invocations.push(direct(
             vec![
@@ -1191,9 +1315,10 @@ fn link_libraries(
         .fragments
         .iter()
         .filter(|f| f.role != LinkFragmentRole::Flags);
-    let mut libraries = linked_libraries(step);
+    let windows = super::shell::windows_host(model, target.dir);
+    let mut libraries = linked_libraries(step, windows);
     let feature_files =
-        feature_wrapped_library_files(model, target, config, step, usage, &libraries);
+        feature_wrapped_library_files(model, target, config, step, usage, &libraries, windows);
     libraries.extend(feature_files);
     let named = frameworks::named_framework_files(model, target, config, step, &libraries);
     libraries.extend(named);
@@ -1373,17 +1498,24 @@ fn feature_wrapped_library_files(
     step: &LinkStep,
     usage: &mut UsageResolver<'_>,
     existing: &[BString],
+    windows: bool,
 ) -> Vec<BString> {
     let has_wrapped_feature = step.fragments.iter().any(|fragment| {
         fragment.role == LinkFragmentRole::Libraries
             && (fragment.text.value.starts_with(b"-Wl,")
                 || fragment.text.value.starts_with(b"LINKER:")
-                || simple_args(&fragment.text.value).is_some_and(|args| {
+                || fragment.text.value.windows(14).any(|window| {
+                    window.eq_ignore_ascii_case(b"/wholearchive:")
+                        || window.eq_ignore_ascii_case(b"-wholearchive:")
+                })
+                || link_fragment_args(&fragment.text.value, windows).is_some_and(|args| {
                     args.iter().any(|arg| {
                         arg.starts_with(b"-Wl,")
                             || takes_separate_non_file_arg(arg)
-                            || arg.starts_with(b"-WHOLEARCHIVE:")
-                            || arg.starts_with(b"/WHOLEARCHIVE:")
+                            || arg.get(..14).is_some_and(|prefix| {
+                                prefix.eq_ignore_ascii_case(b"-wholearchive:")
+                                    || prefix.eq_ignore_ascii_case(b"/wholearchive:")
+                            })
                     })
                 }))
     });
@@ -1414,10 +1546,30 @@ fn feature_wrapped_library_files(
             crate::usage::ResolvedLinkKind::Raw if library_file(&item.text.value) => {
                 Some(build_relative(model, &item.text.value))
             }
-            crate::usage::ResolvedLinkKind::Library(dep) => model
-                .target(*dep)
-                .and_then(|producer| super::compute_artifacts(model, producer, config).linker_file)
-                .map(|file| build_relative(model, &file)),
+            crate::usage::ResolvedLinkKind::Library(dep) => {
+                let producer = model.target(*dep);
+                let file = if producer.is_some_and(|producer| {
+                    !producer.is_imported()
+                        && is_darwin(model, producer.dir)
+                        && matches!(
+                            crate::ide::bundle_kind(producer),
+                            crate::ide::BundleKind::Framework { .. }
+                        )
+                }) {
+                    usage.artifact(
+                        *dep,
+                        rcmake_genex::ArtifactKind::File,
+                        rcmake_genex::ArtifactPart::Full,
+                        config,
+                    )
+                } else {
+                    usage
+                        .ide_artifacts(*dep, config)
+                        .ok()
+                        .and_then(|(artifacts, _)| artifacts.linker_file.or(artifacts.file))
+                };
+                file.map(|file| build_relative(model, &file))
+            }
             _ => None,
         };
         if let Some(path) = path
@@ -1439,14 +1591,18 @@ fn feature_wrapped_library_files(
     files
 }
 
-fn linked_libraries(step: &LinkStep) -> Vec<BString> {
+fn link_fragment_args(text: &[u8], windows: bool) -> Option<Vec<BString>> {
+    simple_args(text).or_else(|| windows.then(|| super::shell::windows_arguments(text)))
+}
+
+fn linked_libraries(step: &LinkStep, windows: bool) -> Vec<BString> {
     let mut libraries = Vec::new();
     for fragment in step
         .fragments
         .iter()
         .filter(|f| f.role == LinkFragmentRole::Libraries)
     {
-        let Some(args) = simple_args(&fragment.text.value) else {
+        let Some(args) = link_fragment_args(&fragment.text.value, windows) else {
             continue;
         };
         // A raw multi-word `-Wl,...` flag item passed via `target_link_libraries`
@@ -1541,21 +1697,28 @@ mod tests {
         let cfg = ConfigId("Release".into());
 
         // e1: BUILD_SHARED_LIBS=ON, no exports, no LINK_FLAGS -> emits empty "" fragment.
-        let (m, t) = make_model(true, false, "", "");
-        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        let (mut m, t) = make_model(true, false, "", "");
+        let app_id = m.add_target(t).unwrap();
+        let t = m.target(app_id).unwrap();
+        let (frags, post, _) = codemodel_link_flags(&m, app_id, t, &cfg, &step, None).unwrap();
         assert_eq!(frags, vec![BString::from("-Wl,--elf"), BString::from("")]);
+        assert!(post.is_empty());
 
         // e2: BUILD_SHARED_LIBS=ON, no exports, LINK_FLAGS="-Wl,--lf" -> trimmed "-Wl,--lf".
-        let (m, t) = make_model(true, false, "", "-Wl,--lf");
-        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        let (mut m, t) = make_model(true, false, "", "-Wl,--lf");
+        let app_id = m.add_target(t).unwrap();
+        let t = m.target(app_id).unwrap();
+        let (frags, _, _) = codemodel_link_flags(&m, app_id, t, &cfg, &step, None).unwrap();
         assert_eq!(
             frags,
             vec![BString::from("-Wl,--elf"), BString::from("-Wl,--lf")]
         );
 
         // e3: BUILD_SHARED_LIBS=ON, ENABLE_EXPORTS=ON, shared_link="", LINK_FLAGS="-Wl,--lf" -> 3 spaces.
-        let (m, t) = make_model(true, true, "", "-Wl,--lf");
-        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        let (mut m, t) = make_model(true, true, "", "-Wl,--lf");
+        let app_id = m.add_target(t).unwrap();
+        let t = m.target(app_id).unwrap();
+        let (frags, _, _) = codemodel_link_flags(&m, app_id, t, &cfg, &step, None).unwrap();
         assert_eq!(
             frags,
             vec![
@@ -1565,8 +1728,10 @@ mod tests {
         );
 
         // e4: BUILD_SHARED_LIBS=ON, ENABLE_EXPORTS=ON, shared_link="-rdynamic", LINK_FLAGS="-Wl,--lf".
-        let (m, t) = make_model(true, true, "-rdynamic", "-Wl,--lf");
-        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        let (mut m, t) = make_model(true, true, "-rdynamic", "-Wl,--lf");
+        let app_id = m.add_target(t).unwrap();
+        let t = m.target(app_id).unwrap();
+        let (frags, _, _) = codemodel_link_flags(&m, app_id, t, &cfg, &step, None).unwrap();
         assert_eq!(
             frags,
             vec![
@@ -1576,8 +1741,10 @@ mod tests {
         );
 
         // e5: BUILD_SHARED_LIBS=OFF, ENABLE_EXPORTS=ON, shared_link="", LINK_FLAGS="-Wl,--lf".
-        let (m, t) = make_model(false, true, "", "-Wl,--lf");
-        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        let (mut m, t) = make_model(false, true, "", "-Wl,--lf");
+        let app_id = m.add_target(t).unwrap();
+        let t = m.target(app_id).unwrap();
+        let (frags, _, _) = codemodel_link_flags(&m, app_id, t, &cfg, &step, None).unwrap();
         assert_eq!(
             frags,
             vec![
@@ -1587,14 +1754,74 @@ mod tests {
         );
 
         // e6: BUILD_SHARED_LIBS=OFF, ENABLE_EXPORTS=ON, shared_link="-rdynamic", LINK_FLAGS="-Wl,--lf".
-        let (m, t) = make_model(false, true, "-rdynamic", "-Wl,--lf");
-        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        let (mut m, t) = make_model(false, true, "-rdynamic", "-Wl,--lf");
+        let app_id = m.add_target(t).unwrap();
+        let t = m.target(app_id).unwrap();
+        let (frags, _, _) = codemodel_link_flags(&m, app_id, t, &cfg, &step, None).unwrap();
         assert_eq!(
             frags,
             vec![
                 BString::from("-Wl,--elf"),
                 BString::from("-Wl,--export-dynamic -rdynamic  -Wl,--lf"),
             ]
+        );
+
+        // e7: CMP0083=NEW + POSITION_INDEPENDENT_CODE=ON emits PIE flags in post_flags.
+        let (mut m, mut t) = make_model(false, false, "", "");
+        let root = m.dir_mut(DirId::ROOT);
+        root.vars
+            .insert("CMAKE_C_LINK_PIE_SUPPORTED".into(), "YES".into());
+        root.vars
+            .insert("CMAKE_C_LINK_OPTIONS_PIE".into(), "-fPIE;-pie".into());
+        let _ = t
+            .policies
+            .policies
+            .set(PolicyId::new(83), PolicyStatus::New);
+        t.props.set("POSITION_INDEPENDENT_CODE".into(), "ON".into());
+        let app_id = m.add_target(t).unwrap();
+        let t = m.target(app_id).unwrap();
+        let (_, post, _) = codemodel_link_flags(&m, app_id, t, &cfg, &step, None).unwrap();
+        assert_eq!(post, vec![BString::from("-fPIE -pie")]);
+
+        // e8: $<LINK_ONLY:pic_lib> must NOT leak INTERFACE_POSITION_INDEPENDENT_CODE
+        // into File API PIE flags when the linker omits it.
+        let (mut m, mut t) = make_model(false, false, "", "");
+        let root = m.dir_mut(DirId::ROOT);
+        root.vars
+            .insert("CMAKE_C_LINK_PIE_SUPPORTED".into(), "YES".into());
+        root.vars
+            .insert("CMAKE_C_LINK_OPTIONS_PIE".into(), "-fPIE;-pie".into());
+        let _ = t
+            .policies
+            .policies
+            .set(PolicyId::new(83), PolicyStatus::New);
+        let mut pic_lib = Target::new(
+            "pic_lib".into(),
+            TargetKind::InterfaceLibrary,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        pic_lib
+            .props
+            .set("INTERFACE_POSITION_INDEPENDENT_CODE".into(), "ON".into());
+        let _ = m.add_target(pic_lib).unwrap();
+        t.usage.link_libraries = Some(vec![rcmake_model::LinkItem {
+            text: rcmake_model::BT::new("$<LINK_ONLY:pic_lib>".into(), Default::default()),
+            lookup_dir: DirId::ROOT,
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
+            scope: None,
+        }]);
+        let app_id = m.add_target(t).unwrap();
+        let mut usage = UsageResolver::new(&m);
+        let t = m.target(app_id).unwrap();
+        let (_, post_link_only, _) =
+            codemodel_link_flags(&m, app_id, t, &cfg, &step, Some(&mut usage)).unwrap();
+        assert!(
+            post_link_only.is_empty(),
+            "$<LINK_ONLY:...> must not leak PIE flags into codemodel: {post_link_only:?}"
         );
 
         // Static archive includes STATIC_LIBRARY_FLAGS and STATIC_LIBRARY_FLAGS_<CONFIG>.
@@ -1612,13 +1839,16 @@ mod tests {
             .set("STATIC_LIBRARY_FLAGS".into(), "-Wl,--st".into());
         st.props
             .set("STATIC_LIBRARY_FLAGS_RELEASE".into(), "-Wl,--strel".into());
+        let sid = sm.add_target(st).unwrap();
+        let st = sm.target(sid).unwrap();
         let sstep = LinkStep {
             kind: LinkKind::StaticArchive,
             language: "C".into(),
             fragments: Vec::new(),
             output: "libfoo.a".into(),
         };
-        let (sfrags, _) = codemodel_link_flags(&sm, &st, &cfg, &sstep).unwrap();
+        let (sfrags, spost, _) = codemodel_link_flags(&sm, sid, st, &cfg, &sstep, None).unwrap();
         assert_eq!(sfrags, vec![BString::from("-Wl,--st -Wl,--strel")]);
+        assert!(spost.is_empty());
     }
 }

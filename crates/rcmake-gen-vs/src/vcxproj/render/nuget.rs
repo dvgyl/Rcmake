@@ -9,7 +9,7 @@ use crate::{PACKAGE_REFERENCES, string, xml::Writer};
 ///
 /// Each list element has the form `<name>_<version>`. The version follows
 /// the last `_`. An element without `_` gives no pair.
-pub(super) fn references(value: &[u8]) -> Vec<(String, String)> {
+pub(crate) fn references(value: &[u8]) -> Vec<(String, String)> {
     list::split(value, list::Empty::Drop)
         .iter()
         .filter_map(|element| {
@@ -25,7 +25,7 @@ pub(super) fn references(value: &[u8]) -> Vec<(String, String)> {
 ///
 /// CMake writes the group when the list has elements, also when no element
 /// has a version.
-pub(super) fn write(xml: &mut Writer, target: &Target) {
+pub(crate) fn write(xml: &mut Writer, target: &Target) {
     let Some(value) = target.props.get(PACKAGE_REFERENCES) else {
         return;
     };

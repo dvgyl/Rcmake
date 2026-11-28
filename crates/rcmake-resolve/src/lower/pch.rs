@@ -5,7 +5,7 @@ use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetKind, UsageField};
 
-use super::{definition, expand_rule, join, object_dir, policy_flags::Flags};
+use super::{definition, expand_rule, join, policy_flags::Flags};
 use crate::{
     CompileUnit, PchDetails, PchSource, ResolveError, ResolvedTarget,
     cxx_modules::generation_location,
@@ -253,13 +253,22 @@ impl Plans {
                     Some(build),
                 ))
             };
-            if owner == resolved.id && languages.insert(&group.language) {
-                result.create.extend(plans.iter().map(|plan| PchSource {
-                    path: plan.source.clone(),
-                    header: plan.header.clone(),
-                    group: unit.group,
-                    flags: flags(PchFlags::Create(plan)),
-                }));
+            if languages.insert(&group.language) {
+                if owner == resolved.id {
+                    result.create.extend(plans.iter().map(|plan| PchSource {
+                        path: plan.source.clone(),
+                        header: plan.header.clone(),
+                        group: unit.group,
+                        flags: flags(PchFlags::Create(plan)),
+                    }));
+                } else {
+                    result.create.extend(plans.iter().map(|plan| PchSource {
+                        path: BString::default(),
+                        header: plan.header.clone(),
+                        group: unit.group,
+                        flags: BString::default(),
+                    }));
+                }
             }
             result
                 .use_flags
@@ -501,22 +510,21 @@ fn plan(
         |arch| [b"cmake_pch_", arch.as_slice()].concat().into(),
     );
     let arch_name = [&stem, name.strip_prefix(b"cmake_pch").unwrap_or(name)].concat();
-    let dir = object_dir(model, target, config);
+    let support_dir = super::artifacts::cmf_support_dir(model, target);
+    let dir = if model.generator.is_some_and(GeneratorKind::multi_config) && !config.0.is_empty() {
+        join(&support_dir, &config.0)
+    } else {
+        support_dir.clone()
+    };
     let relative = join(&dir, &arch_name);
     let root = &model.dir(DirId::ROOT).binary_dir;
     let header = join(root, &relative);
-    let support_dir =
-        if model.generator.is_some_and(GeneratorKind::multi_config) && !config.0.is_empty() {
-            rcmake_base::path_lex::Lexical::new(&dir).parent()
-        } else {
-            dir.as_slice()
-        };
     let source_stem = if linked {
         stem.as_slice()
     } else {
         arch_name.as_slice()
     };
-    let source = join(root, &join(support_dir, &[source_stem, suffix].concat()));
+    let source = join(root, &join(&support_dir, &[source_stem, suffix].concat()));
     let companion_object = linked.then(|| super::object_path(model, target, config, &source));
     let artifact = if let Some(object) = &companion_object {
         let stem = object

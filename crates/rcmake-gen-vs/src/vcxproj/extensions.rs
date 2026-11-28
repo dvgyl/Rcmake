@@ -355,6 +355,27 @@ impl<'a> Context<'a> {
     }
 
     pub(super) fn write_tool_item(&self, xml: &mut crate::xml::Writer, item: &Item, plan: &Plan) {
+        // A source that no configuration builds, such as a CUDA unity member,
+        // is still an item, so the project and the filters agree.
+        if !item.configs.is_empty() && item.configs.values().all(|config| config.excluded) {
+            let conditions = self
+                .settings
+                .configs
+                .iter()
+                .map(|name| self.settings.condition(name))
+                .collect::<Vec<_>>();
+            let source = SourceOptions {
+                path: &item.path,
+                excluded_conditions: &conditions,
+                ..Default::default()
+            };
+            match item.kind {
+                Kind::Masm => cuda::assembler_item(xml, Assembler::Masm, &source),
+                Kind::Nasm => cuda::assembler_item(xml, Assembler::Nasm, &source),
+                _ => cuda::cuda_item(xml, &source),
+            }
+            return;
+        }
         for (name, config) in &item.configs {
             if config.excluded {
                 continue;
@@ -420,7 +441,21 @@ impl<'a> Context<'a> {
             };
             let flags = options.join(" ");
             let condition = self.settings.condition(name);
+            // The element has the condition of this configuration, so the
+            // `VS_SETTINGS` values of the configuration have no condition.
+            let metadata = item
+                .settings
+                .iter()
+                .filter(|setting| {
+                    setting
+                        .config
+                        .as_deref()
+                        .is_none_or(|only| only == name.as_str())
+                })
+                .map(|setting| (setting.name.as_str(), setting.value.as_str()))
+                .collect::<Vec<_>>();
             let source = SourceOptions {
+                metadata: &metadata,
                 path: &item.path,
                 condition: Some(&condition),
                 includes: &includes,
@@ -440,7 +475,7 @@ impl<'a> Context<'a> {
     }
 }
 
-fn gen_error(error: rcmake_resolve::ResolveError) -> GenError {
+pub(super) fn gen_error(error: rcmake_resolve::ResolveError) -> GenError {
     GenError::Invalid(error.to_string().into())
 }
 

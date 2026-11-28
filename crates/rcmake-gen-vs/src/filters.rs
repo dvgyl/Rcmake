@@ -42,17 +42,26 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
     if !plan.items.is_empty() {
         xml.start("ItemGroup", &[]);
         for item in plan.items.values() {
-            let path = msbuild(&windows(&item.path));
+            let path = crate::msbuild_item(&windows(&item.path));
             let attrs = [("Include", path.as_str())];
             if item.group.is_empty() {
-                xml.empty(item.kind.tag(), &attrs);
+                xml.empty(item.tag(), &attrs);
             } else {
-                xml.start(item.kind.tag(), &attrs);
+                xml.start(item.tag(), &attrs);
                 xml.text("Filter", &[], &msbuild(&item.group));
                 xml.end();
             }
         }
         xml.end();
+    }
+    if let Some(props) = ctx
+        .project
+        .target
+        .and_then(|id| ctx.model.target(id))
+        .and_then(|target| target.props.get(b"VS_FILTER_PROPS"))
+        .filter(|value| !value.is_empty())
+    {
+        crate::vcxproj::write_props_import(&mut xml, &windows(&crate::string(props)));
     }
     xml.finish()
 }

@@ -41,19 +41,14 @@ fn arguments(invocation: &Invocation) -> Option<(&BString, &[BString])> {
     .then_some((program, args))
 }
 
-pub(crate) fn ordinary_rule(scanned: bool, depfile: bool) -> &'static [u8] {
-    match (scanned, depfile) {
-        (false, false) => b"COMPILE",
-        (false, true) => b"COMPILE_DEPFILE",
-        (true, false) => b"CXX_COMPILE_SCANNED",
-        (true, true) => b"CXX_COMPILE_SCANNED_DEPFILE",
-    }
-}
+const MSVC_INSTRUMENTED_RULE: &[u8] = b"COMPILE_MSVC_INSTRUMENTED";
 
 pub(crate) fn compile(
     invocation: &Invocation,
     scanned: bool,
     depfile: bool,
+    msvc: bool,
+    commands: &Commands,
 ) -> (&'static [u8], Option<Vec<u8>>) {
     let (ordinary, instrumented, _) = match (scanned, depfile) {
         (false, false) => COMPILE_RULE,
@@ -64,14 +59,24 @@ pub(crate) fn compile(
     let Some((_, args)) = arguments(invocation) else {
         return (ordinary, None);
     };
-    let mut command = Vec::new();
-    for (index, arg) in args.iter().enumerate() {
-        if index != 0 {
-            command.push(b' ');
+    let command = if commands.windows() {
+        commands.argv(args)
+    } else {
+        let mut command = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if index != 0 {
+                command.push(b' ');
+            }
+            shell_word(arg, &mut command);
         }
-        shell_word(arg, &mut command);
-    }
-    (instrumented, Some(command))
+        command
+    };
+    let rule = if msvc {
+        MSVC_INSTRUMENTED_RULE
+    } else {
+        instrumented
+    };
+    (rule, Some(command))
 }
 
 const LAUNCHED_COMPILE_RULE: Rule = (b"COMPILE", b"COMPILE_LAUNCHED", false);
@@ -86,6 +91,8 @@ const LAUNCHED_SCANNED_DEPFILE_RULE: Rule = (
     b"CXX_COMPILE_SCANNED_DEPFILE_LAUNCHED",
     true,
 );
+const LAUNCHED_MSVC_RULE: &[u8] = b"COMPILE_MSVC_LAUNCHED";
+const LAUNCHED_SCANNED_MSVC_RULE: &[u8] = b"CXX_COMPILE_SCANNED_MSVC_LAUNCHED";
 
 const LAUNCHED_RULES: [Rule; 4] = [
     LAUNCHED_COMPILE_RULE,
@@ -290,18 +297,154 @@ fn parse_literal_program(input: &[u8]) -> Option<(usize, BString)> {
     Some((pos, BString::from(out)))
 }
 
-fn launch_parts(invocation: &Invocation) -> Option<(BString, &[u8], &[u8])> {
+/// Scan the next Windows command-line token starting at `pos` in `input`
+/// without stripping backslashes in unquoted Windows paths.
+fn next_windows_token(input: &[u8], mut pos: usize) -> Option<(usize, usize, Vec<u8>, bool)> {
+    while let Some(&byte) = input.get(pos) {
+        if byte.is_ascii_whitespace() {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    if pos >= input.len() {
+        return None;
+    }
+    let start = pos;
+    let mut out = Vec::new();
+    let mut quoted = false;
+    let mut in_double = false;
+    while let Some(&byte) = input.get(pos) {
+        if matches!(byte, b'\n' | b'\r' | b'\0') {
+            return None;
+        }
+        if in_double {
+            match byte {
+                b'"' => {
+                    in_double = false;
+                    pos += 1;
+                }
+                b'\\' => {
+                    let mut slashes = 0usize;
+                    while input.get(pos + slashes) == Some(&b'\\') {
+                        slashes += 1;
+                    }
+                    if input.get(pos + slashes) == Some(&b'"') {
+                        out.extend(std::iter::repeat_n(b'\\', slashes / 2));
+                        if slashes % 2 == 1 {
+                            out.push(b'"');
+                            pos += slashes + 1;
+                        } else {
+                            pos += slashes;
+                        }
+                    } else {
+                        out.extend(std::iter::repeat_n(b'\\', slashes));
+                        pos += slashes;
+                    }
+                }
+                _ => {
+                    out.push(byte);
+                    pos += 1;
+                }
+            }
+        } else {
+            match byte {
+                b if b.is_ascii_whitespace() => break,
+                b'"' => {
+                    quoted = true;
+                    in_double = true;
+                    pos += 1;
+                }
+                b'\\' => {
+                    let mut slashes = 0usize;
+                    while input.get(pos + slashes) == Some(&b'\\') {
+                        slashes += 1;
+                    }
+                    if input.get(pos + slashes) == Some(&b'"') {
+                        quoted = true;
+                        out.extend(std::iter::repeat_n(b'\\', slashes / 2));
+                        if slashes % 2 == 1 {
+                            out.push(b'"');
+                            pos += slashes + 1;
+                        } else {
+                            pos += slashes;
+                        }
+                    } else {
+                        out.extend(std::iter::repeat_n(b'\\', slashes));
+                        pos += slashes;
+                    }
+                }
+                _ => {
+                    out.push(byte);
+                    pos += 1;
+                }
+            }
+        }
+    }
+    if in_double {
+        return None;
+    }
+    Some((start, pos, out, quoted))
+}
+
+fn parse_literal_program_windows(input: &[u8]) -> Option<(usize, BString)> {
+    let (_, end, out, quoted) = next_windows_token(input, 0)?;
+    if out.is_empty() || out.contains(&b'%') {
+        return None;
+    }
+    if !quoted
+        && out
+            .iter()
+            .any(|&byte| matches!(byte, b'&' | b'|' | b'<' | b'>' | b'^' | b'(' | b')'))
+    {
+        return None;
+    }
+    Some((end, BString::from(out)))
+}
+
+fn split_windows_args(input: &[u8]) -> Option<Vec<BString>> {
+    let mut args = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < input.len() {
+        let rest = input.get(cursor..)?;
+        if rest.iter().all(u8::is_ascii_whitespace) {
+            break;
+        }
+        let (_, end, word, quoted) = next_windows_token(input, cursor)?;
+        if !quoted
+            && word
+                .iter()
+                .any(|&byte| matches!(byte, b'&' | b'|' | b'<' | b'>'))
+        {
+            return None;
+        }
+        args.push(BString::from(word));
+        cursor = end;
+    }
+    Some(args)
+}
+
+fn launch_parts(invocation: &Invocation, windows: bool) -> Option<(BString, &[u8], &[u8])> {
     if invocation.working_dir.is_some() {
         return None;
     }
     let shell = invocation.shell.as_slice();
-    let (after_prog, program) = parse_literal_program(shell)?;
-    let (_, after_flag, flag, _) = next_shell_token(shell, after_prog)?;
+    let (after_prog, program) = if windows {
+        parse_literal_program_windows(shell)?
+    } else {
+        parse_literal_program(shell)?
+    };
+    let next_token = if windows {
+        next_windows_token
+    } else {
+        next_shell_token
+    };
+    let (_, after_flag, flag, _) = next_token(shell, after_prog)?;
     if flag.as_slice() != b"--launch" {
         return None;
     }
     let mut cursor = after_flag;
-    while let Some((tok_start, tok_end, tok_value, tok_quoted)) = next_shell_token(shell, cursor) {
+    while let Some((tok_start, tok_end, tok_value, tok_quoted)) = next_token(shell, cursor) {
         if !tok_quoted && tok_value.as_slice() == b"--" {
             let launch_args = shell.get(after_flag..tok_start)?.trim_ascii();
             let command = shell.get(tok_end..)?.trim_ascii_start();
@@ -335,6 +478,7 @@ fn compile_step_invocation<'a>(
 /// first-seen order, returning both the ordered list and a program-to-slot map.
 pub(crate) fn collect_launchers(
     result: &GenerationResult,
+    windows: bool,
 ) -> (Vec<BString>, BTreeMap<BString, usize>) {
     let mut ordered = Vec::new();
     let mut slots = BTreeMap::new();
@@ -343,7 +487,7 @@ pub(crate) fn collect_launchers(
             let Some(invocation) = compile_step_invocation(graph, step_index, step) else {
                 continue;
             };
-            if let Some((program, _, _)) = launch_parts(invocation)
+            if let Some((program, _, _)) = launch_parts(invocation, windows)
                 && !slots.contains_key(&program)
             {
                 let slot = ordered.len();
@@ -361,14 +505,24 @@ pub(crate) fn launched(
     launcher_slots: &BTreeMap<BString, usize>,
     scanned: bool,
     depfile: bool,
+    msvc: bool,
+    commands: &Commands,
 ) -> Option<LaunchedCompile> {
-    let (program, launch_args, rest) = launch_parts(invocation)?;
+    let (program, launch_args, rest) = launch_parts(invocation, commands.windows())?;
     let &slot = launcher_slots.get(&program)?;
-    let (_, base_rule, _) = match (scanned, depfile) {
-        (false, false) => LAUNCHED_COMPILE_RULE,
-        (false, true) => LAUNCHED_DEPFILE_RULE,
-        (true, false) => LAUNCHED_SCANNED_RULE,
-        (true, true) => LAUNCHED_SCANNED_DEPFILE_RULE,
+    let base_rule = if msvc {
+        if scanned {
+            LAUNCHED_SCANNED_MSVC_RULE
+        } else {
+            LAUNCHED_MSVC_RULE
+        }
+    } else {
+        match (scanned, depfile) {
+            (false, false) => LAUNCHED_COMPILE_RULE.1,
+            (false, true) => LAUNCHED_DEPFILE_RULE.1,
+            (true, false) => LAUNCHED_SCANNED_RULE.1,
+            (true, true) => LAUNCHED_SCANNED_DEPFILE_RULE.1,
+        }
     };
     let rule = launched_rule_name(base_rule, slot);
     let (launcher, command) = match compiler_launcher {
@@ -386,12 +540,45 @@ pub(crate) fn launched(
         }
         _ => (None, rest.to_vec()),
     };
+    let (launch_args, launcher, command) = if commands.windows() {
+        let launch_argv = split_windows_args(launch_args)?;
+        let launcher = match launcher {
+            Some(prefix) => {
+                let argv = split_windows_args(&prefix)?;
+                Some(commands.argv(&argv).into())
+            }
+            None => None,
+        };
+        let cmd_argv = split_windows_args(&command)?;
+        (
+            commands.argv(&launch_argv).into(),
+            launcher,
+            commands.argv(&cmd_argv),
+        )
+    } else {
+        (launch_args.into(), launcher, command)
+    };
     Some(LaunchedCompile {
         rule,
-        launch_args: launch_args.into(),
+        launch_args,
         launcher,
         command,
     })
+}
+
+fn push_program_ninja(out: &mut Vec<u8>, bytes: &[u8], commands: &Commands) {
+    if commands.windows() {
+        let mut word = Vec::new();
+        commands.word(bytes, &mut word);
+        for byte in word {
+            if byte == b'$' {
+                out.push(b'$');
+            }
+            out.push(byte);
+        }
+    } else {
+        push_double_quoted_ninja(out, bytes);
+    }
 }
 
 fn push_double_quoted_ninja(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -429,7 +616,7 @@ pub(crate) fn emit_rules(
             ninja.0.extend_from_slice(b"\nrule ");
             ninja.0.extend_from_slice(rule);
             ninja.0.extend_from_slice(b"\n  command = ");
-            push_double_quoted_ninja(&mut ninja.0, program.as_slice());
+            push_program_ninja(&mut ninja.0, program.as_slice(), commands);
             ninja
                 .0
                 .extend_from_slice(b" --instrument $COMMAND\n  description = $DESC\n");
@@ -439,12 +626,21 @@ pub(crate) fn emit_rules(
                     .extend_from_slice(b"  depfile = $DEP_FILE\n  deps = gcc\n");
             }
         }
+        if commands.windows() {
+            ninja.0.extend_from_slice(b"\nrule ");
+            ninja.0.extend_from_slice(MSVC_INSTRUMENTED_RULE);
+            ninja.0.extend_from_slice(b"\n  command = ");
+            push_program_ninja(&mut ninja.0, program.as_slice(), commands);
+            ninja.0.extend_from_slice(
+                b" --instrument $COMMAND\n  description = $DESC\n  deps = msvc\n",
+            );
+        }
     }
-    let (programs, _) = collect_launchers(result);
+    let (programs, _) = collect_launchers(result, commands.windows());
     let build_dir_bytes = in_build_dir.then(|| path::from_native(build_dir));
     for (slot, program) in programs.iter().enumerate() {
         let mut command = Vec::new();
-        push_double_quoted_ninja(&mut command, program.as_slice());
+        push_program_ninja(&mut command, program.as_slice(), commands);
         command.extend_from_slice(b" --launch $LAUNCH_ARGS -- $LAUNCHER $COMMAND");
         let command = match &build_dir_bytes {
             Some(dir) => commands.in_directory(&command, dir),
@@ -461,6 +657,18 @@ pub(crate) fn emit_rules(
                 ninja
                     .0
                     .extend_from_slice(b"  depfile = $DEP_FILE\n  deps = gcc\n");
+            }
+        }
+        if commands.windows() {
+            for base_rule in [LAUNCHED_MSVC_RULE, LAUNCHED_SCANNED_MSVC_RULE] {
+                let rule = launched_rule_name(base_rule, slot);
+                ninja.0.extend_from_slice(b"\nrule ");
+                ninja.0.extend_from_slice(&rule);
+                ninja.0.extend_from_slice(b"\n  command = ");
+                ninja.0.extend_from_slice(&command);
+                ninja
+                    .0
+                    .extend_from_slice(b"\n  description = $DESC\n  deps = msvc\n");
             }
         }
     }

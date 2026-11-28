@@ -614,6 +614,31 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         }
         self.resolver.object_directory(self.id(target)?, config)
     }
+
+    fn artifact_base_name_without_postfix(
+        &self,
+        target: TargetHandle,
+        kind: ArtifactKind,
+        config: &ConfigId,
+    ) -> Option<BString> {
+        if kind == ArtifactKind::PdbFile {
+            return self
+                .resolver
+                .pdb_base_name_without_postfix(self.id(target)?, config)
+                .ok()
+                .flatten();
+        }
+        let mut path = self.artifact(target, kind, ArtifactPart::BaseName, config)?;
+        let mut property = config.0.to_ascii_uppercase();
+        property.extend_from_slice(b"_POSTFIX");
+        if let Some(postfix) = self.raw_property(target, &property)
+            && path.ends_with(&postfix)
+        {
+            let length = path.len() - postfix.len();
+            path.truncate(length);
+        }
+        Some(path)
+    }
     fn link_closure(
         &mut self,
         target: TargetHandle,
@@ -621,7 +646,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
     ) -> Result<Vec<TargetHandle>, GenexError> {
         let id = self.id(target).ok_or_else(missing_target)?;
         self.resolver
-            .link_targets(id, ctx)
+            .runtime_link_targets(id, ctx)
             .map(|targets| targets.into_iter().map(handle).collect())
             .map_err(genex_error)
     }
@@ -734,6 +759,11 @@ impl GenexHost for ModelGenexHost<'_, '_> {
     fn target_policy(&self, target: TargetHandle, policy: &[u8]) -> Option<bool> {
         let target = self.resolver.model.target(self.id(target)?)?;
         Some(target.policies.policies.get(PolicyId::parse(policy)?) == PolicyStatus::New)
+    }
+
+    fn target_policy_status(&self, target: TargetHandle, policy: PolicyId) -> Option<PolicyStatus> {
+        let target = self.resolver.model.target(self.id(target)?)?;
+        Some(target.policies.policies.get(policy))
     }
 }
 

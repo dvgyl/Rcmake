@@ -402,6 +402,7 @@ if(NOT location STREQUAL "#,
                     stderr: Output::Capture,
                     timeout: Some(Duration::from_secs(20)),
                     tee: false,
+                    default_error_mode: false,
                 },
                 &mut |_, _| {},
             )

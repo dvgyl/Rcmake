@@ -306,6 +306,66 @@ impl<'a> UsageResolver<'a> {
         Ok(targets)
     }
 
+    pub(crate) fn runtime_link_targets(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<TargetId>, ResolveError> {
+        let items = self.ordered_runtime_links(target, ctx)?;
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for item in items {
+            for dep in item.edge_targets() {
+                if seen.insert(dep) {
+                    targets.push(dep);
+                }
+            }
+        }
+        Ok(targets)
+    }
+
+    pub(crate) fn interface_link_targets(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<TargetId>, ResolveError> {
+        let mut ctx = context(target, ctx, UsageTraversal::Link);
+        ctx.head.get_or_insert(handle(target));
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        if self
+            .target(target)
+            .is_ok_and(|raw| !raw.is_imported() && raw.kind != TargetKind::InterfaceLibrary)
+        {
+            let (direct, _) = self.direct_links(target, &ctx)?;
+            targets.extend(
+                direct
+                    .iter()
+                    .flat_map(|item| item.edge_targets())
+                    .filter(|id| seen.insert(*id)),
+            );
+        }
+        let (iface, _) = self.usage_links(target, true, &ctx)?;
+        targets.extend(
+            iface
+                .iter()
+                .flat_map(|item| item.edge_targets())
+                .filter(|id| seen.insert(*id)),
+        );
+        let mut index = 0;
+        while let Some(&id) = targets.get(index) {
+            let (links, _) = self.usage_links(id, true, &ctx)?;
+            targets.extend(
+                links
+                    .iter()
+                    .flat_map(|item| item.edge_targets())
+                    .filter(|id| seen.insert(*id)),
+            );
+            index += 1;
+        }
+        Ok(targets)
+    }
+
     pub(crate) fn compile_targets(
         &mut self,
         target: TargetId,

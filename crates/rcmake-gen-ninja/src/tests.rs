@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use rcmake_base::BString;
 use rcmake_host::{Follow, Host, PureHost, ReadRange};
 use rcmake_resolve::{
-    ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, LinkKind, LinkStep,
+    ArtifactSet, BuildGraph, BuildStep, CustomStep, GraphTarget, Invocation, LinkFragment,
+    LinkFragmentRole, LinkKind, LinkStep,
 };
 
 use super::{
@@ -4197,14 +4198,14 @@ fn link_depends_no_shared_and_single_config_clean_additional()
     let implicit_part = before_oo.split('|').nth(1).unwrap_or("");
     let oo = app_edge.split("||").nth(1).unwrap_or("");
 
-    // Normal and imported SHARED targets without explicit LINK_DEPENDS move to order-only.
+    // Normal and imported SHARED targets without explicit LINK_DEPENDS are omitted from implicit inputs.
     assert!(
         !implicit_part.contains("libs1.so") && !implicit_part.contains("/opt/lib/libimp.so"),
         "shared library targets must not appear in implicit inputs when LINK_DEPENDS_NO_SHARED=ON:\n{app_edge}"
     );
     assert!(
-        oo.contains("libs1.so") && oo.contains("/opt/lib/libimp.so"),
-        "shared library targets must move to order-only inputs:\n{app_edge}"
+        oo.contains("libs1.so") && !oo.contains("/opt/lib/libimp.so"),
+        "normal shared library target must stay in order-only inputs while imported shared library is absent:\n{app_edge}"
     );
     // Static libraries, direct raw shared library paths, UNKNOWN imported targets, and
     // explicit LINK_DEPENDS on a linked shared target all stay in implicit inputs.
@@ -4681,6 +4682,343 @@ fn colliding_output_name_does_not_leak_order_only_deps_across_targets()
             && !shell_edge.contains("obj.cpp.o")
             && shell_edge.ends_with("|| src/libduckdb.so"),
         "shared library `duckdb` must not attach its dependencies to `shell`'s output `duckdb`: {shell_edge}"
+    );
+    Ok(())
+}
+
+#[test]
+fn dir_all_includes_interface_targets_and_aliases_keep_first_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_diag::{Backtrace, PolicyMap};
+    use rcmake_model::{DirId, ProjectModel, Target, TargetKind, TargetOrigin};
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    let sub = model.add_directory(
+        DirId::ROOT,
+        "/work/src/sub".into(),
+        "/work/build/sub".into(),
+        Backtrace::default(),
+    )?;
+    model.dir_mut(sub).exclude_from_all = true;
+
+    let mut intf = Target::new(
+        "sub_intf".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Normal,
+        sub,
+        Backtrace::default(),
+        PolicyMap::default(),
+    );
+    intf.sources
+        .push(rcmake_model::BT::new("a.h".into(), Backtrace::default()));
+    let intf_id = model.add_target(intf)?;
+
+    let first_id = model.add_target(Target::new(
+        "mylib".into(),
+        TargetKind::SharedLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Backtrace::default(),
+        PolicyMap::default(),
+    ))?;
+    let second_id = model.add_target(Target::new(
+        "mylib2".into(),
+        TargetKind::SharedLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Backtrace::default(),
+        PolicyMap::default(),
+    ))?;
+
+    let graph = BuildGraph {
+        steps: vec![
+            BuildStep::Link {
+                inputs: Vec::new(),
+                implicit_inputs: Vec::new(),
+                step: LinkStep {
+                    kind: LinkKind::SharedLibrary,
+                    language: "CXX".into(),
+                    fragments: Vec::new(),
+                    output: "lib/libmylib.so".into(),
+                },
+                invocations: vec![Invocation::default()],
+            },
+            BuildStep::Link {
+                inputs: Vec::new(),
+                implicit_inputs: Vec::new(),
+                step: LinkStep {
+                    kind: LinkKind::SharedLibrary,
+                    language: "CXX".into(),
+                    fragments: Vec::new(),
+                    output: "lib2/libmylib.so".into(),
+                },
+                invocations: vec![Invocation::default()],
+            },
+        ],
+        targets: vec![
+            GraphTarget {
+                name: "sub_intf".into(),
+                steps: Vec::new(),
+                depends: Vec::new(),
+                in_all: false,
+            },
+            GraphTarget {
+                name: "mylib".into(),
+                steps: vec![0],
+                depends: Vec::new(),
+                in_all: true,
+            },
+            GraphTarget {
+                name: "mylib2".into(),
+                steps: vec![1],
+                depends: Vec::new(),
+                in_all: true,
+            },
+        ],
+        target_ids: vec![intf_id, first_id, second_id],
+        ..BuildGraph::default()
+    };
+    let make_resolved = |id, name: &str, kind, file: Option<&str>| rcmake_resolve::ResolvedTarget {
+        id,
+        config: rcmake_genex::ConfigId::default(),
+        metadata: rcmake_resolve::TargetMetadata {
+            name: name.into(),
+            kind,
+            source_dir: "/work/src".into(),
+            binary_dir: "/work/build".into(),
+            backtrace: Backtrace::default(),
+            folder: None,
+            exclude_from_all: false,
+            generator_provided: false,
+        },
+        artifacts: ArtifactSet {
+            file: file.map(Into::into),
+            ..ArtifactSet::default()
+        },
+        compile_groups: Vec::new(),
+        compile_units: Vec::new(),
+        link: None,
+        dependencies: Vec::new(),
+        cxx_modules: None,
+        fortran: None,
+        ide: None,
+    };
+    let result = GenerationResult {
+        targets: vec![
+            make_resolved(intf_id, "sub_intf", TargetKind::InterfaceLibrary, None),
+            make_resolved(
+                first_id,
+                "mylib",
+                TargetKind::SharedLibrary,
+                Some("/work/build/lib/libmylib.so"),
+            ),
+            make_resolved(
+                second_id,
+                "mylib2",
+                TargetKind::SharedLibrary,
+                Some("/work/build/lib2/libmylib.so"),
+            ),
+        ],
+        graphs: vec![graph],
+        ..GenerationResult::default()
+    };
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let build = read(&host, "build.ninja");
+
+    assert!(
+        build.contains("build sub/all: phony sub/sub_intf"),
+        "excluded directory `all` must include source-bearing interface target:\n{build}"
+    );
+    assert!(
+        build.contains("build libmylib.so: phony lib/libmylib.so"),
+        "duplicate artifact filename alias must keep first target:\n{build}"
+    );
+    Ok(())
+}
+
+#[test]
+fn wave5b_windows_dll_alias_link_warning_rerun_and_multi_start_instrument()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_diag::Backtrace;
+    use rcmake_genex::ConfigId;
+    use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetKind, TargetOrigin};
+    use rcmake_resolve::{ResolvedTarget, TargetMetadata};
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/source".into(), "/work/build".into());
+    model.generator = Some(GeneratorKind::NinjaMultiConfig);
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_SYSTEM_NAME".into(), "Windows".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_COMMAND".into(), "cmake".into());
+
+    let shared_id = model.add_target(Target::new(
+        "simpleshared".into(),
+        TargetKind::SharedLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Backtrace::default(),
+        Default::default(),
+    ))?;
+    let mut result = GenerationResult {
+        configs: vec![ConfigId("Debug".into())],
+        metadata: rcmake_resolve::ConfigureMetadata {
+            listfiles: vec!["/work/source/CMakeLists.txt".into()],
+            cmake_command: Some("cmake".into()),
+            ignore_link_warning_as_error: true,
+            ..Default::default()
+        },
+        ..GenerationResult::default()
+    };
+    result.targets.push(ResolvedTarget {
+        id: shared_id,
+        config: ConfigId("Debug".into()),
+        metadata: TargetMetadata {
+            name: "simpleshared".into(),
+            kind: TargetKind::SharedLibrary,
+            source_dir: "/work/source".into(),
+            binary_dir: "/work/build".into(),
+            backtrace: Backtrace::default(),
+            folder: None,
+            exclude_from_all: false,
+            generator_provided: false,
+        },
+        artifacts: ArtifactSet {
+            file: Some("/work/build/Debug/simpleshared.dll".into()),
+            linker_file: Some("/work/build/Debug/simpleshared.lib".into()),
+            import_file: Some("/work/build/Debug/simpleshared.lib".into()),
+            ..ArtifactSet::default()
+        },
+        compile_groups: Vec::new(),
+        compile_units: Vec::new(),
+        link: None,
+        dependencies: Vec::new(),
+        cxx_modules: None,
+        fortran: None,
+        ide: None,
+    });
+    result.graphs.push(BuildGraph {
+        config: ConfigId("Debug".into()),
+        steps: vec![BuildStep::Link {
+            implicit_inputs: Vec::new(),
+            inputs: vec!["s.obj".into()],
+            step: LinkStep {
+                kind: LinkKind::SharedLibrary,
+                language: "C".into(),
+                fragments: Vec::new(),
+                output: "Debug/simpleshared.dll".into(),
+            },
+            invocations: vec![Invocation {
+                argv: vec!["ctest".into(), "--instrument".into(), "link".into()],
+                shell: "ctest --instrument link".into(),
+                ..Invocation::default()
+            }],
+        }],
+        targets: vec![GraphTarget {
+            name: "simpleshared".into(),
+            steps: vec![0],
+            in_all: true,
+            ..GraphTarget::default()
+        }],
+        target_ids: vec![shared_id],
+        ..BuildGraph::default()
+    });
+    super::generate_multi_config_with_model(&result, &host, dir, &model)?;
+    let impl_debug = read(&host, "CMakeFiles/impl-Debug.ninja");
+    assert!(
+        impl_debug.contains("build simpleshared.dll$:Debug: phony Debug/simpleshared.dll"),
+        "Windows runtime DLL alias missing:\n{impl_debug}"
+    );
+    assert!(
+        impl_debug.contains("--regenerate-during-build --link-no-warning-as-error"),
+        "RERUN_CMAKE must carry --link-no-warning-as-error:\n{impl_debug}"
+    );
+    assert!(
+        impl_debug.contains("build start_instrument: START_INSTRUMENT CMakeFiles/instrument"),
+        "Multi-config Ninja must emit START_INSTRUMENT edge:\n{impl_debug}"
+    );
+    Ok(())
+}
+
+#[test]
+fn wave5b_wholearchive_fragment_is_not_mistaken_for_prerequisite()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{DirId, GeneratorKind, ProjectModel};
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/source".into(), "/work/build".into());
+    model.generator = Some(GeneratorKind::Ninja);
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_SYSTEM_NAME".into(), "Windows".into());
+
+    let graph = BuildGraph {
+        steps: vec![BuildStep::Link {
+            implicit_inputs: Vec::new(),
+            inputs: vec!["main.obj".into(), "foo.lib".into()],
+            step: LinkStep {
+                kind: LinkKind::Executable,
+                language: "C".into(),
+                fragments: vec![LinkFragment {
+                    role: LinkFragmentRole::Libraries,
+                    text: rcmake_model::BT::new("/WHOLEARCHIVE:foo.lib".into(), Default::default()),
+                }],
+                output: "app.exe".into(),
+            },
+            invocations: vec![Invocation {
+                argv: vec![
+                    "link.exe".into(),
+                    "/out:app.exe".into(),
+                    "main.obj".into(),
+                    "/WHOLEARCHIVE:foo.lib".into(),
+                ],
+                shell: "link.exe /out:app.exe main.obj /WHOLEARCHIVE:foo.lib".into(),
+                ..Invocation::default()
+            }],
+        }],
+        targets: vec![GraphTarget {
+            name: "app".into(),
+            steps: vec![0],
+            in_all: true,
+            ..GraphTarget::default()
+        }],
+        ..BuildGraph::default()
+    };
+    let result = GenerationResult {
+        graphs: vec![graph],
+        ..GenerationResult::default()
+    };
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let build = read(&host, "build.ninja");
+    let app_edge = build
+        .lines()
+        .find(|line| line.starts_with("build app.exe: LINK_EXECUTABLE"))
+        .ok_or("missing app.exe link edge")?;
+    let before_oo = app_edge.split("||").next().unwrap_or("");
+    let implicit_part = before_oo.split('|').nth(1).unwrap_or("");
+    assert!(
+        implicit_part.contains("foo.lib"),
+        "real archive foo.lib must appear in Ninja prerequisites:\n{app_edge}"
+    );
+    assert!(
+        !app_edge.contains("/WHOLEARCHIVE:"),
+        "/WHOLEARCHIVE: flag must never appear in Ninja prerequisites:\n{app_edge}"
+    );
+    assert!(
+        build.contains("/WHOLEARCHIVE:foo.lib"),
+        "/WHOLEARCHIVE:foo.lib must stay in the Ninja link command:\n{build}"
     );
     Ok(())
 }

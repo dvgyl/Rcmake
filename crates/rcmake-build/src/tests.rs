@@ -252,6 +252,7 @@ fn builds_and_links_c_with_native_host() -> Result<(), Box<dyn std::error::Error
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(15)),
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     )?;

@@ -1231,7 +1231,7 @@ fn relative_custom_dependencies_resolve_to_source_files_or_generated_outputs() -
         recipe.depends,
         [
             "/src/source.txt",
-            "/src/both.txt",
+            "both.txt",
             "generated.txt",
             "byproduct.txt",
             "missing.txt"
@@ -2984,6 +2984,887 @@ fn ninja_unity_build_orders_generated_sources_without_synthetic_unity_targets() 
             Some(BuildStep::Custom(custom)) if custom.outputs.iter().any(|o| o == "gen.c")
         )),
         "target u must keep ownership of generated source custom step"
+    );
+    Ok(())
+}
+
+#[test]
+fn compatible_link_library_features_ignore_private_shared_dep_features() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    for (k, v) in [
+        ("CMAKE_C_LINK_LIBRARY_USING_feat1_SUPPORTED", "TRUE"),
+        ("CMAKE_C_LINK_LIBRARY_USING_feat1", "<LIBRARY>"),
+        ("CMAKE_C_LINK_LIBRARY_USING_feat2_SUPPORTED", "TRUE"),
+        ("CMAKE_C_LINK_LIBRARY_USING_feat2", "<LIBRARY>"),
+    ] {
+        model.global.props.set(k.into(), v.into());
+    }
+    let dep1 = target("dep1", TargetKind::SharedLibrary, &["empty.c"]);
+    let mut dep2 = target("dep2", TargetKind::SharedLibrary, &["empty.c"]);
+    dep2.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("$<LINK_LIBRARY:feat1,dep1>"));
+    let mut lib1 = target("lib1", TargetKind::SharedLibrary, &["empty.c"]);
+    lib1.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("$<LINK_LIBRARY:feat2,dep1,dep2>"));
+    model.add_target(dep1)?;
+    model.add_target(dep2)?;
+    model.add_target(lib1)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/empty.c"), b"int e(void){return 0;}\n")?;
+    let result = resolve(&model, &host, &[])?;
+    assert!(result.targets.iter().any(|t| t.metadata.name == "lib1"));
+    Ok(())
+}
+
+#[test]
+fn feature_wrapped_apple_framework_uses_bundle_artifact_path() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    model
+        .global
+        .props
+        .set("CMAKE_SYSTEM_NAME".into(), "Darwin".into());
+    model.global.props.set(
+        "CMAKE_C_LINK_LIBRARY_USING_FRAMEWORK_SUPPORTED".into(),
+        "TRUE".into(),
+    );
+    model.global.props.set(
+        "CMAKE_C_LINK_LIBRARY_USING_FRAMEWORK".into(),
+        "-framework <LIBRARY>".into(),
+    );
+    let mut fw = target("myfw", TargetKind::SharedLibrary, &["empty.c"]);
+    fw.props.set("FRAMEWORK".into(), "TRUE".into());
+    let mut app = target("app", TargetKind::Executable, &["empty.c"]);
+    app.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("$<LINK_LIBRARY:FRAMEWORK,myfw>"));
+    model.add_target(fw)?;
+    model.add_target(app)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/empty.c"), b"int main(void){return 0;}\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let link_inputs = result.graphs[0]
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            BuildStep::Link { step, inputs, .. } if step.output == "app" => Some(inputs),
+            _ => None,
+        })
+        .ok_or("missing app link step")?;
+    assert!(
+        link_inputs
+            .iter()
+            .any(|p| p == "myfw.framework/Versions/A/myfw"),
+        "expected bundle framework artifact in link inputs: {link_inputs:?}"
+    );
+    assert!(
+        !link_inputs.iter().any(|p| p.ends_with(b"libmyfw.dylib")),
+        "must not add non-existent libmyfw.dylib: {link_inputs:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cxx_modules_synthesizes_cached_providers_for_msvc_runtime_variants() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    clang_scan(&mut model);
+    for (k, v) in [
+        (
+            "CMAKE_MSVC_RUNTIME_LIBRARY_DEFAULT",
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL",
+        ),
+        (
+            "CMAKE_CXX_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreaded",
+            "-runtime-MultiThreaded",
+        ),
+        (
+            "CMAKE_CXX_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDLL",
+            "-runtime-MultiThreadedDLL",
+        ),
+    ] {
+        model.global.props.set(k.into(), v.into());
+    }
+    let prov = Target::new(
+        "runtime-module".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Imported(rcmake_model::ImportedVisibility::Global),
+        DirId::ROOT,
+        backtrace(1),
+        Default::default(),
+    );
+    let prov_id = model.add_target(prov)?;
+    model.add_file_set(FileSet {
+        target: prov_id,
+        name: "modules".into(),
+        kind: FileSetKind::CxxModules,
+        scope: UsageScope::Interface,
+        base_dirs: vec![entry("/src")],
+        files: vec![entry("module.cxx")],
+        props: Default::default(),
+    })?;
+
+    for (name, runtime) in [
+        ("mt", Some("MultiThreaded")),
+        ("mtdll", Some("MultiThreadedDLL")),
+        ("empty_rt", Some("")),
+        ("default_rt", None),
+    ] {
+        let mut consumer = target(name, TargetKind::ObjectLibrary, &["main.cxx"]);
+        consumer.props.set("CXX_STANDARD".into(), "20".into());
+        consumer
+            .props
+            .set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
+        if let Some(rt) = runtime {
+            consumer.props.set("MSVC_RUNTIME_LIBRARY".into(), rt.into());
+        }
+        consumer
+            .usage
+            .link_libraries
+            .get_or_insert_with(Vec::new)
+            .push(link_item("runtime-module"));
+        model.add_target(consumer)?;
+    }
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/module.cxx"), b"export module m;\n")?;
+    host.seed_file(Path::new("/src/main.cxx"), b"int main() { return 0; }\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let synth_targets: Vec<_> = result.graphs[0]
+        .targets
+        .iter()
+        .filter(|t| t.name.starts_with(b"runtime-module@synth_"))
+        .collect();
+    // default_rt resolves to MultiThreadedDLL and reuses mtdll's cached provider -> 3 unique providers!
+    assert_eq!(
+        synth_targets.len(),
+        3,
+        "expected 3 deduplicated synthetic providers, got: {:?}",
+        synth_targets.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    let mut saw_mt = false;
+    let mut saw_mtdll = false;
+    let mut saw_empty = false;
+    for synth in synth_targets {
+        let cmd = synth
+            .steps
+            .iter()
+            .find_map(|&idx| match result.graphs[0].steps.get(idx) {
+                Some(BuildStep::Compile { invocation, .. }) => Some(invocation.shell.to_string()),
+                _ => None,
+            })
+            .ok_or("missing synthetic compile step")?;
+        if cmd.contains("-runtime-MultiThreadedDLL") {
+            saw_mtdll = true;
+        } else if cmd.contains("-runtime-MultiThreaded") {
+            saw_mt = true;
+        } else {
+            saw_empty = true;
+        }
+    }
+    assert!(saw_mt && saw_mtdll && saw_empty);
+    Ok(())
+}
+
+#[test]
+fn msvc_system_include_respects_cmake_include_system_flag() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    for (k, v) in [
+        ("CMAKE_SYSTEM_NAME", "Windows"),
+        ("CMAKE_C_COMPILER", "cl.exe"),
+        ("CMAKE_C_COMPILER_ID", "MSVC"),
+        ("CMAKE_INCLUDE_FLAG_C", "-I"),
+        ("CMAKE_INCLUDE_SYSTEM_FLAG_C", ""),
+    ] {
+        model.global.props.set(k.into(), v.into());
+    }
+    let mut dep_inc = Target::new(
+        "sys_iface".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        backtrace(1),
+        Default::default(),
+    );
+    dep_inc
+        .usage
+        .push(UsageField::InterfaceIncludeDirectories, entry("/sysinc"));
+    dep_inc.usage.push(
+        UsageField::InterfaceSystemIncludeDirectories,
+        entry("/sysinc"),
+    );
+    model.add_target(dep_inc)?;
+    let mut app = target("app", TargetKind::ObjectLibrary, &["main.c"]);
+    app.usage
+        .push(UsageField::IncludeDirectories, entry("/inc"));
+    app.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("sys_iface"));
+    model.add_target(app)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.c"), b"int main(void){return 0;}\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let cmd = result.graphs[0]
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            BuildStep::Compile { invocation, .. } => Some(invocation.shell.to_string()),
+            _ => None,
+        })
+        .ok_or("missing compile step")?;
+    assert!(
+        !cmd.contains("-isystem"),
+        "MSVC must not emit -isystem: {cmd}"
+    );
+    assert!(
+        cmd.contains("-I/sysinc"),
+        "expected fallback -I for system include: {cmd}"
+    );
+
+    // When CMAKE_INCLUDE_SYSTEM_FLAG_C is set to -external:I, honor it.
+    model
+        .global
+        .props
+        .set("CMAKE_INCLUDE_SYSTEM_FLAG_C".into(), "-external:I".into());
+    let result2 = resolve(&model, &host, &[])?;
+    let cmd2 = result2.graphs[0]
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            BuildStep::Compile { invocation, .. } => Some(invocation.shell.to_string()),
+            _ => None,
+        })
+        .ok_or("missing compile step 2")?;
+    assert!(
+        cmd2.contains("-external:I/sysinc"),
+        "expected -external:I: {cmd2}"
+    );
+    Ok(())
+}
+
+#[test]
+fn dll_name_with_soversion_suffixes_only_runtime_dll() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    model
+        .global
+        .props
+        .set("CMAKE_SYSTEM_NAME".into(), "Windows".into());
+    model
+        .global
+        .props
+        .set("CMAKE_SHARED_LIBRARY_NAME_WITH_VERSION".into(), "ON".into());
+
+    let mut lib_on = target("exA", TargetKind::SharedLibrary, &["a.c"]);
+    lib_on.props.set("SOVERSION".into(), "2".into());
+    lib_on
+        .props
+        .set("DLL_NAME_WITH_SOVERSION".into(), "ON".into());
+
+    let mut lib_fallback = target("exB", TargetKind::SharedLibrary, &["a.c"]);
+    lib_fallback.props.set("SOVERSION".into(), "3".into());
+
+    let mut lib_off = target("exC", TargetKind::SharedLibrary, &["a.c"]);
+    lib_off.props.set("SOVERSION".into(), "4".into());
+    lib_off
+        .props
+        .set("DLL_NAME_WITH_SOVERSION".into(), "OFF".into());
+
+    model.add_target(lib_on)?;
+    model.add_target(lib_fallback)?;
+    model.add_target(lib_off)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.c"), b"int a(void){return 0;}\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let find = |name: &str| {
+        result
+            .targets
+            .iter()
+            .find(|t| t.metadata.name == name)
+            .expect("target")
+    };
+    assert!(
+        find("exA")
+            .artifacts
+            .file
+            .as_deref()
+            .is_some_and(|p| p.ends_with(b"exA-2.dll"))
+    );
+    assert!(
+        find("exA")
+            .artifacts
+            .import_file
+            .as_deref()
+            .is_some_and(|p| p.ends_with(b"exA.lib"))
+    );
+    assert!(
+        find("exB")
+            .artifacts
+            .file
+            .as_deref()
+            .is_some_and(|p| p.ends_with(b"exB-3.dll"))
+    );
+    assert!(
+        find("exC")
+            .artifacts
+            .file
+            .as_deref()
+            .is_some_and(|p| p.ends_with(b"exC.dll"))
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_msvc_runtime_library_reports_generation_file_line_zero() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    model
+        .global
+        .props
+        .set("CMAKE_C_COMPILER_ID".into(), "MSVC".into());
+    model.global.props.set(
+        "CMAKE_MSVC_RUNTIME_LIBRARY_DEFAULT".into(),
+        "MultiThreadedDLL".into(),
+    );
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.props
+        .set("MSVC_RUNTIME_LIBRARY".into(), "BogusValue".into());
+    model.add_target(app)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.c"), b"int main(void){return 0;}\n")?;
+    let err = resolve(&model, &host, &[]);
+    assert!(err.is_err());
+    let stderr = host.stream_bytes(rcmake_host::Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("CMake Error in CMakeLists.txt:"),
+        "expected generation-time CMakeLists.txt header, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("MSVC_RUNTIME_LIBRARY value 'BogusValue' not known for this C compiler.")
+    );
+    Ok(())
+}
+
+#[test]
+fn object_path_max_shortens_overlong_directory_with_md5() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    model
+        .global
+        .props
+        .set("CMAKE_OBJECT_PATH_MAX".into(), "130".into());
+    let deep = "very_long_directory_one/very_long_directory_two/very_long_directory_three/very_long_directory_four/file.c";
+    let lib = target("mylib", TargetKind::StaticLibrary, &[deep]);
+    model.add_target(lib)?;
+
+    let host = PureHost::default();
+    host.seed_file(&Path::new("/src").join(deep), b"int f(void){return 0;}\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let obj = &result.targets[0].compile_units[0].object;
+    assert!(
+        !obj.windows(b"very_long_directory_one".len())
+            .any(|w| w == b"very_long_directory_one"),
+        "expected hashed directory portion, got: {obj}"
+    );
+    assert!(
+        obj.ends_with(b"/file.c.o"),
+        "expected filename preserved after hash dir, got: {obj}"
+    );
+    Ok(())
+}
+
+#[test]
+fn static_archive_export_and_link_language_include_object_library_languages() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let obj = target("cpp_objs", TargetKind::ObjectLibrary, &["obj.cpp"]);
+    let mut slib = target("slib", TargetKind::StaticLibrary, &["csrc.c"]);
+    slib.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("cpp_objs"));
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("slib"));
+    let _obj_id = model.add_target(obj)?;
+    let slib_id = model.add_target(slib)?;
+    model.add_target(app)?;
+    model.exports.insert(
+        "slib_exp".into(),
+        ExportSet {
+            name: "slib_exp".into(),
+            targets: vec![slib_id],
+            install_rules: vec![0],
+        },
+    );
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(10),
+        kind: InstallKind::Targets {
+            targets: vec![slib_id],
+            export: Some("slib_exp".into()),
+        },
+        options: InstallOptions {
+            destination: Some("lib".into()),
+            ..Default::default()
+        },
+    });
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(11),
+        kind: InstallKind::Export {
+            set: "slib_exp".into(),
+            namespace: BString::default(),
+            file: Some("exp.cmake".into()),
+            cxx_modules_directory: None,
+        },
+        options: InstallOptions {
+            destination: Some("lib/cmake".into()),
+            ..Default::default()
+        },
+    });
+
+    let host = PureHost::default();
+    host.seed_file(
+        Path::new("/src/obj.cpp"),
+        b"extern \"C\" int f(){return 0;}\n",
+    )?;
+    host.seed_file(Path::new("/src/csrc.c"), b"int c(void){return 0;}\n")?;
+    host.seed_file(Path::new("/src/main.c"), b"int main(void){return 0;}\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let app_link = result
+        .targets
+        .iter()
+        .find(|t| t.metadata.name == "app")
+        .and_then(|t| t.link.as_ref())
+        .ok_or("missing app link")?;
+    assert_eq!(app_link.language, "CXX");
+    let exported = &result.exports[0].targets[0];
+    let langs = exported
+        .config_properties
+        .values()
+        .next()
+        .and_then(|props| props.get(b"IMPORTED_LINK_INTERFACE_LANGUAGES".as_slice()))
+        .ok_or("missing IMPORTED_LINK_INTERFACE_LANGUAGES")?;
+    assert!(
+        langs.windows(3).any(|w| w == b"CXX"),
+        "expected CXX in static export languages: {langs}"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_public_header_evaluates_generator_expressions_per_config() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::NinjaMultiConfig);
+    let mut lib = target("mylib", TargetKind::StaticLibrary, &["a.c"]);
+    lib.props.set(
+        "PUBLIC_HEADER".into(),
+        "$<$<CONFIG:Debug>:dbg.h>;common.h;$<$<BOOL:OFF>:skipped.h>".into(),
+    );
+    let id = model.add_target(lib)?;
+    model.add_install(rcmake_model::InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(20),
+        kind: rcmake_model::InstallKind::Targets {
+            targets: vec![id],
+            export: None,
+        },
+        options: rcmake_model::InstallOptions::default(),
+    });
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.c"), b"int a(void){return 0;}\n")?;
+    let result = resolve(
+        &model,
+        &host,
+        &[ConfigId("Debug".into()), ConfigId("Release".into())],
+    )?;
+    let debug_headers: Vec<_> = result
+        .install
+        .actions
+        .iter()
+        .filter(|a| a.configurations == [BString::from("Debug")])
+        .filter_map(|a| match &a.kind {
+            InstallActionKind::Files {
+                file_type, files, ..
+            } if file_type == b"FILE" => Some(files.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let release_headers: Vec<_> = result
+        .install
+        .actions
+        .iter()
+        .filter(|a| a.configurations == [BString::from("Release")])
+        .filter_map(|a| match &a.kind {
+            InstallActionKind::Files {
+                file_type, files, ..
+            } if file_type == b"FILE" => Some(files.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(
+        debug_headers,
+        vec![BString::from("/src/dbg.h"), BString::from("/src/common.h")]
+    );
+    assert_eq!(release_headers, vec![BString::from("/src/common.h")]);
+    Ok(())
+}
+
+#[test]
+fn ios_install_combined_emits_post_copy_action_on_xcode_ios() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Xcode);
+    model
+        .global
+        .props
+        .set("CMAKE_SYSTEM_NAME".into(), "iOS".into());
+    model
+        .global
+        .props
+        .set("CMAKE_IOS_INSTALL_COMBINED".into(), "YES".into());
+    model
+        .global
+        .props
+        .set("XCODE_VERSION".into(), "16.0".into());
+    let lib = target("foo_static", TargetKind::StaticLibrary, &["a.c"]);
+    let id = model.add_target(lib)?;
+    model.add_install(rcmake_model::InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(25),
+        kind: rcmake_model::InstallKind::Targets {
+            targets: vec![id],
+            export: None,
+        },
+        options: rcmake_model::InstallOptions::default(),
+    });
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.c"), b"int a(void){return 0;}\n")?;
+    let result = resolve(&model, &host, &[ConfigId("Debug".into())])?;
+    let combined = result
+        .install
+        .actions
+        .iter()
+        .find_map(|action| match &action.kind {
+            InstallActionKind::Code(code)
+                if code
+                    .windows(b"ios_install_combined".len())
+                    .any(|w| w == b"ios_install_combined") =>
+            {
+                Some(code.to_string())
+            }
+            _ => None,
+        });
+    let code = combined.ok_or("missing ios_install_combined install action")?;
+    assert!(code.contains("include(CMakeIOSInstallCombined)"));
+    assert!(code.contains("ios_install_combined(\"foo_static\""));
+    Ok(())
+}
+
+#[test]
+fn cxx_modules_synthetic_key_separates_definitions_and_module_sources() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    clang_scan(&mut model);
+
+    let mut prov = Target::new(
+        "param_mod".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Imported(ImportedVisibility::Global),
+        DirId::ROOT,
+        backtrace(1),
+        Default::default(),
+    );
+    prov.usage.push(
+        UsageField::InterfaceCompileDefinitions,
+        entry("MODE=$<TARGET_PROPERTY:CUSTOM_MODE>"),
+    );
+    let prov_id = model.add_target(prov)?;
+    model.add_file_set(FileSet {
+        target: prov_id,
+        name: "modules".into(),
+        kind: FileSetKind::CxxModules,
+        scope: UsageScope::Interface,
+        base_dirs: vec![entry("/src")],
+        files: vec![entry("$<TARGET_PROPERTY:CUSTOM_MOD_SRC>")],
+        props: Default::default(),
+    })?;
+
+    for (name, mode, mod_src) in [
+        ("c1", "A", "mod_a.cxx"),
+        ("c2", "B", "mod_a.cxx"),
+        ("c3", "A", "mod_b.cxx"),
+        ("c4", "A", "mod_a.cxx"),
+    ] {
+        let mut consumer = target(name, TargetKind::ObjectLibrary, &["main.cxx"]);
+        consumer.props.set("CXX_STANDARD".into(), "20".into());
+        consumer
+            .props
+            .set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
+        consumer.props.set("CUSTOM_MODE".into(), mode.into());
+        consumer.props.set("CUSTOM_MOD_SRC".into(), mod_src.into());
+        consumer
+            .usage
+            .link_libraries
+            .get_or_insert_with(Vec::new)
+            .push(link_item("param_mod"));
+        model.add_target(consumer)?;
+    }
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/mod_a.cxx"), b"export module a;\n")?;
+    host.seed_file(Path::new("/src/mod_b.cxx"), b"export module b;\n")?;
+    host.seed_file(Path::new("/src/main.cxx"), b"int main() { return 0; }\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let synths: Vec<_> = result
+        .targets
+        .iter()
+        .filter(|t| t.metadata.name.starts_with(b"param_mod@synth_"))
+        .collect();
+    // c1 & c4 share one provider; c2 (different def) and c3 (different module source) get distinct ones.
+    assert_eq!(
+        synths.len(),
+        3,
+        "expected 3 distinct synthetic providers, got: {:?}",
+        synths.iter().map(|t| &t.metadata.name).collect::<Vec<_>>()
+    );
+    let has_def_b = synths.iter().any(|t| {
+        t.compile_groups
+            .iter()
+            .any(|g| g.defines.iter().any(|d| d.value == "MODE=B"))
+    });
+    let has_mod_b = synths.iter().any(|t| {
+        t.compile_units
+            .iter()
+            .any(|u| u.source.value.ends_with(b"/mod_b.cxx"))
+    });
+    assert!(has_def_b, "expected synthetic provider with MODE=B");
+    assert!(has_mod_b, "expected synthetic provider compiling mod_b.cxx");
+    Ok(())
+}
+
+#[test]
+fn cxx_modules_transitive_imported_providers_wire_synthetic_dependencies() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    clang_scan(&mut model);
+
+    let mod_b = Target::new(
+        "mod_b".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Imported(ImportedVisibility::Global),
+        DirId::ROOT,
+        backtrace(1),
+        Default::default(),
+    );
+    let mod_b_id = model.add_target(mod_b)?;
+    model.add_file_set(FileSet {
+        target: mod_b_id,
+        name: "modules".into(),
+        kind: FileSetKind::CxxModules,
+        scope: UsageScope::Interface,
+        base_dirs: vec![entry("/src")],
+        files: vec![entry("b.cxx")],
+        props: Default::default(),
+    })?;
+
+    let mut mod_a = Target::new(
+        "mod_a".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Imported(ImportedVisibility::Global),
+        DirId::ROOT,
+        backtrace(2),
+        Default::default(),
+    );
+    mod_a
+        .usage
+        .interface_link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("mod_b"));
+    let mod_a_id = model.add_target(mod_a)?;
+    model.add_file_set(FileSet {
+        target: mod_a_id,
+        name: "modules".into(),
+        kind: FileSetKind::CxxModules,
+        scope: UsageScope::Interface,
+        base_dirs: vec![entry("/src")],
+        files: vec![entry("a.cxx")],
+        props: Default::default(),
+    })?;
+
+    let mut app = target("app", TargetKind::ObjectLibrary, &["main.cxx"]);
+    app.props.set("CXX_STANDARD".into(), "20".into());
+    app.props.set("CXX_SCAN_FOR_MODULES".into(), "ON".into());
+    app.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("mod_a"));
+    model.add_target(app)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/b.cxx"), b"export module b;\n")?;
+    host.seed_file(Path::new("/src/a.cxx"), b"export module a; import b;\n")?;
+    host.seed_file(
+        Path::new("/src/main.cxx"),
+        b"import a; int main() { return 0; }\n",
+    )?;
+    let result = resolve(&model, &host, &[])?;
+
+    let synth_a = result
+        .targets
+        .iter()
+        .find(|t| t.metadata.name == "mod_a@synth_0")
+        .ok_or("missing mod_a@synth_0")?;
+    let synth_b = result
+        .targets
+        .iter()
+        .find(|t| t.metadata.name == "mod_b@synth_0")
+        .ok_or("missing mod_b@synth_0")?;
+    let synth_b_dir = synth_b
+        .cxx_modules
+        .as_ref()
+        .ok_or("missing synth_b cxx_modules")?
+        .module_dir
+        .clone();
+    let synth_a_modules = synth_a
+        .cxx_modules
+        .as_ref()
+        .ok_or("missing synth_a cxx_modules")?;
+    assert!(
+        synth_a.dependencies.contains(&synth_b.id),
+        "mod_a@synth_0 must depend on mod_b@synth_0: {:?}",
+        synth_a.dependencies
+    );
+    assert!(
+        synth_a_modules.linked_target_dirs.contains(&synth_b_dir),
+        "mod_a@synth_0 must read mod_b@synth_0 module dir {synth_b_dir}: {:?}",
+        synth_a_modules.linked_target_dirs
+    );
+    Ok(())
+}
+
+#[test]
+fn static_archive_add_dependencies_object_library_does_not_add_cxx_language() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+
+    let cxx_objs = target("cxx_objs", TargetKind::ObjectLibrary, &["obj.cpp"]);
+    let mut c_archive = target("c_archive", TargetKind::StaticLibrary, &["csrc.c"]);
+    // Plain build-order dependency (`add_dependencies(c_archive cxx_objs)`), NOT archived objects.
+    c_archive.utility_deps.push(entry("cxx_objs"));
+    model.add_target(cxx_objs)?;
+    let archive_id = model.add_target(c_archive)?;
+
+    model.exports.insert(
+        "c_exp".into(),
+        ExportSet {
+            name: "c_exp".into(),
+            targets: vec![archive_id],
+            install_rules: vec![0],
+        },
+    );
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(10),
+        kind: InstallKind::Targets {
+            targets: vec![archive_id],
+            export: Some("c_exp".into()),
+        },
+        options: InstallOptions {
+            destination: Some("lib".into()),
+            ..Default::default()
+        },
+    });
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(11),
+        kind: InstallKind::Export {
+            set: "c_exp".into(),
+            namespace: BString::default(),
+            file: Some("c_exp.cmake".into()),
+            cxx_modules_directory: None,
+        },
+        options: InstallOptions {
+            destination: Some("lib/cmake".into()),
+            ..Default::default()
+        },
+    });
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/obj.cpp"), b"int f() { return 0; }\n")?;
+    host.seed_file(Path::new("/src/csrc.c"), b"int c(void) { return 0; }\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let exported = &result.exports[0].targets[0];
+    let langs = exported
+        .config_properties
+        .values()
+        .next()
+        .and_then(|props| props.get(b"IMPORTED_LINK_INTERFACE_LANGUAGES".as_slice()))
+        .ok_or("missing IMPORTED_LINK_INTERFACE_LANGUAGES")?;
+    assert_eq!(
+        langs.as_slice(),
+        b"C",
+        "add_dependencies on CXX object library must not pollute C archive languages: {langs}"
+    );
+    Ok(())
+}
+
+#[test]
+fn object_path_max_falls_through_to_full_name_hash_when_dir_hash_still_overlong() -> TestResult {
+    // Long binary dir so `<root>/<obj_dir>/<32-char-md5>/<file>.c.o` still exceeds 128,
+    // forcing fallthrough to `<32-char-md5>.o`.
+    let long_build = "/out/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut model = project_with_roots("/src", long_build);
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    model
+        .global
+        .props
+        .set("CMAKE_OBJECT_PATH_MAX".into(), "128".into());
+    let deep = "very_long_directory_one/very_long_directory_two/medium_file_name.c";
+    let lib = target("mylib", TargetKind::StaticLibrary, &[deep]);
+    model.add_target(lib)?;
+
+    let host = PureHost::default();
+    host.seed_file(&Path::new("/src").join(deep), b"int f(void){return 0;}\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let obj = &result.targets[0].compile_units[0].object;
+    let obj_dir = result.targets[0]
+        .artifacts
+        .object_dir
+        .as_deref()
+        .ok_or("missing object_dir")?;
+    let rel = obj
+        .strip_prefix(obj_dir.as_slice())
+        .and_then(|rest| rest.strip_prefix(b"/"))
+        .ok_or("object not under object_dir")?;
+    assert!(
+        !rel.contains(&b'/'),
+        "expected full-name MD5 hash without subdir slash, got: {obj}"
+    );
+    assert!(
+        rel.ends_with(b".o") && rel.len() == 34,
+        "expected 32-char MD5 + '.o', got: {rel:?}"
+    );
+    assert!(
+        long_build.len() + 1 + obj.len() <= 128,
+        "full object path still exceeded limit 128: {long_build}/{obj}"
     );
     Ok(())
 }

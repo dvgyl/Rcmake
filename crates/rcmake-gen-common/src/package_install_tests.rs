@@ -488,6 +488,7 @@ fn cmake_451_matches_package_install_outputs() -> TestResult {
                 stderr: Output::Capture,
                 timeout: Some(Duration::from_secs(40)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )?;

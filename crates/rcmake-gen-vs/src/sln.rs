@@ -2,9 +2,7 @@
 
 use std::{collections::BTreeMap, fmt::Write};
 
-use crate::{CPP_TYPE, Project, Settings, plan::Solution, relative, windows};
-
-const FOLDER_TYPE: &str = "{2150E333-8FDC-42A3-9474-1A3956D46DE8}";
+use crate::{Project, Settings, plan::Solution, project_type, windows};
 
 pub(crate) fn render(solution: &Solution, settings: &Settings, projects: &[Project]) -> String {
     let mut out = String::with_capacity(projects.len().saturating_mul(256) + 512);
@@ -19,20 +17,30 @@ pub(crate) fn render(solution: &Solution, settings: &Settings, projects: &[Proje
             &project.name,
         )
     });
-    for (path, guid) in &solution.folders {
-        let name = field(path.rsplit('/').next().unwrap_or(path));
-        let path = field(&windows(path));
+    for (folder, guid) in &solution.folders {
+        let name = field(folder.rsplit('/').next().unwrap_or(folder));
+        let path = field(&windows(folder));
         let _ = write!(
             out,
-            "Project(\"{FOLDER_TYPE}\") = \"{name}\", \"{path}\", \"{guid}\"\r\nEndProject\r\n"
+            "Project(\"{{{}}}\") = \"{name}\", \"{path}\", \"{guid}\"\r\n",
+            project_type::FOLDER
         );
+        if let Some(items) = solution.items.get(folder) {
+            out.push_str("\tProjectSection(SolutionItems) = preProject\r\n");
+            for item in items {
+                let _ = write!(out, "\t\t{item} = {item}\r\n");
+            }
+            out.push_str("\tEndProjectSection\r\n");
+        }
+        out.push_str("EndProject\r\n");
     }
     for project in &members {
         let name = field(&project.name);
-        let path = field(&windows(&relative(&solution.dir, &project.path())));
+        let path = field(&windows(&project.path_from(&solution.dir)));
         let _ = write!(
             out,
-            "Project(\"{CPP_TYPE}\") = \"{name}\", \"{path}\", \"{}\"\r\n",
+            "Project(\"{{{}}}\") = \"{name}\", \"{path}\", \"{}\"\r\n",
+            field(&project.type_id),
             project.guid
         );
         out.push_str("\tProjectSection(ProjectDependencies) = postProject\r\n");
@@ -51,14 +59,17 @@ pub(crate) fn render(solution: &Solution, settings: &Settings, projects: &[Proje
         "\tEndGlobalSection\r\n\tGlobalSection(ProjectConfigurationPlatforms) = postSolution\r\n",
     );
     for project in members {
+        let guid = &project.guid;
         for (index, config) in settings.configs.iter().enumerate() {
             let cfg = format!("{config}|{platform}");
-            let _ = write!(out, "\t\t{}.{cfg}.ActiveCfg = {cfg}\r\n", project.guid);
-            if project.build.get(index) == Some(&true) {
-                let _ = write!(out, "\t\t{}.{cfg}.Build.0 = {cfg}\r\n", project.guid);
+            // An external project can map the configuration and the platform.
+            let target = format!("{}|{}", project.config(index, config), project.platform);
+            let _ = write!(out, "\t\t{guid}.{cfg}.ActiveCfg = {target}\r\n");
+            if solution.builds(project, index) {
+                let _ = write!(out, "\t\t{guid}.{cfg}.Build.0 = {target}\r\n");
             }
             if project.deploy.get(index) == Some(&true) {
-                let _ = write!(out, "\t\t{}.{cfg}.Deploy.0 = {cfg}\r\n", project.guid);
+                let _ = write!(out, "\t\t{guid}.{cfg}.Deploy.0 = {target}\r\n");
             }
         }
     }
@@ -89,11 +100,39 @@ pub(crate) fn render(solution: &Solution, settings: &Settings, projects: &[Proje
         }
         out.push_str("\tEndGlobalSection\r\n");
     }
-    let _ = write!(
-        out,
-        "\tGlobalSection(ExtensibilityGlobals) = postSolution\r\n\t\tSolutionGuid = {}\r\n\tEndGlobalSection\r\n\tGlobalSection(ExtensibilityAddIns) = postSolution\r\n\tEndGlobalSection\r\nEndGlobal\r\n",
-        solution.guid
-    );
+    for section in &solution.sections {
+        let scope = if section.post { "post" } else { "pre" };
+        let _ = write!(
+            out,
+            "\tGlobalSection({}) = {scope}Solution\r\n",
+            section.name
+        );
+        for (key, value) in &section.entries {
+            let _ = write!(out, "\t\t{key} = {value}\r\n");
+        }
+        // CMake adds the solution GUID to a user `ExtensibilityGlobals`
+        // section that does not set one.
+        if section.post
+            && section.name == "ExtensibilityGlobals"
+            && !section.entries.iter().any(|(key, _)| key == "SolutionGuid")
+        {
+            let _ = write!(out, "\t\tSolutionGuid = {}\r\n", solution.guid);
+        }
+        out.push_str("\tEndGlobalSection\r\n");
+    }
+    if !solution.overrides("ExtensibilityGlobals") {
+        let _ = write!(
+            out,
+            "\tGlobalSection(ExtensibilityGlobals) = postSolution\r\n\t\tSolutionGuid = {}\r\n\tEndGlobalSection\r\n",
+            solution.guid
+        );
+    }
+    if !solution.overrides("ExtensibilityAddIns") {
+        out.push_str(
+            "\tGlobalSection(ExtensibilityAddIns) = postSolution\r\n\tEndGlobalSection\r\n",
+        );
+    }
+    out.push_str("EndGlobal\r\n");
     out
 }
 

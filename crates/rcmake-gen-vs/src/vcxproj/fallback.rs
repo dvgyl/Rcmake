@@ -484,6 +484,7 @@ impl Context<'_> {
                 .map_or_else(String::new, |value| config_value(value)),
             always: matches!(command.kind, CustomCommandKind::Utility(_))
                 || command.outputs.is_empty(),
+            parallel: false,
         }
     }
 }
@@ -564,5 +565,6 @@ fn invocation_rule(step: &CustomStep) -> Rule {
             .as_ref()
             .map_or_else(String::new, |value| string(value)),
         always: step.outputs.is_empty(),
+        parallel: false,
     }
 }

@@ -1,4 +1,4 @@
-//! Build file generator for Unix Makefiles.
+//! Build file generator for Unix Makefiles and NMake Makefiles.
 
 #![forbid(unsafe_code)]
 
@@ -12,9 +12,9 @@ mod progress;
 mod recipe;
 mod response;
 mod subdirectories;
-use recipe::{make_recipe_text, shell_invocation, write_step};
+use recipe::{make_recipe_text, make_recipe_text_for, shell_invocation_for, write_step};
 
-pub use build::build_commands;
+pub use build::{build_commands, build_commands_for_dialect, build_commands_nmake};
 use plan_step::plan_step;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -41,6 +41,33 @@ const GLOBAL_TARGETS: &[&[u8]] = &[
     b"cmake_check_build_system",
 ];
 
+/// Makefile syntax and shell dialect emitted by [`rcmake-gen-make`](crate).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MakeDialect {
+    /// POSIX `/bin/sh` + GNU/BSD `make` (`Unix Makefiles`).
+    #[default]
+    Unix,
+    /// Windows `cmd.exe` + Microsoft `nmake` (`NMake Makefiles`).
+    NMake,
+}
+
+impl MakeDialect {
+    /// Return `true` when emitting `NMake Makefiles`.
+    #[must_use]
+    pub const fn is_nmake(self) -> bool {
+        matches!(self, Self::NMake)
+    }
+
+    /// Exact CMake generator name for this dialect.
+    #[must_use]
+    pub const fn generator_name(self) -> &'static str {
+        match self {
+            Self::Unix => "Unix Makefiles",
+            Self::NMake => "NMake Makefiles",
+        }
+    }
+}
+
 /// Write the top-level `Makefile`, `CMakeFiles/Makefile2`, and per-target build files.
 ///
 /// Use the first graph because Unix Makefiles supports one configuration.
@@ -49,7 +76,7 @@ pub fn generate_unix_makefiles(
     host: &dyn Host,
     build_dir: &Path,
 ) -> Result<(), GenError> {
-    generate_impl(result, host, build_dir, None)
+    generate_with_dialect(result, host, build_dir, None, MakeDialect::Unix)
 }
 
 pub use generate_unix_makefiles as generate;
@@ -62,19 +89,41 @@ pub fn generate_with_model(
     build_dir: &Path,
     model: &ProjectModel,
 ) -> Result<(), GenError> {
-    generate_impl(result, host, build_dir, Some(model))
+    generate_with_dialect(result, host, build_dir, Some(model), MakeDialect::Unix)
 }
 
-fn generate_impl(
+/// Write `NMake Makefiles` (`Makefile`, `CMakeFiles/Makefile2`, and per-target build files).
+pub fn generate_nmake_makefiles(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+) -> Result<(), GenError> {
+    generate_with_dialect(result, host, build_dir, None, MakeDialect::NMake)
+}
+
+/// Write `NMake Makefiles` with targets that build the inputs of install rules
+/// and tests.
+pub fn generate_nmake_with_model(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    model: &ProjectModel,
+) -> Result<(), GenError> {
+    generate_with_dialect(result, host, build_dir, Some(model), MakeDialect::NMake)
+}
+
+/// Write Makefiles for `dialect` (`Unix Makefiles` or `NMake Makefiles`).
+pub fn generate_with_dialect(
     result: &GenerationResult,
     host: &dyn Host,
     build_dir: &Path,
     model: Option<&ProjectModel>,
+    dialect: MakeDialect,
 ) -> Result<(), GenError> {
     let build_dir = host.initial_cwd().join(build_dir);
     let empty = BuildGraph::default();
     let graph = result.graphs.first().unwrap_or(&empty);
-    let mut targets = plan_targets(result, graph, &build_dir, model)?;
+    let mut targets = plan_targets(result, graph, &build_dir, model, dialect)?;
     response::prepare(&mut targets, &build_dir, host)?;
     let cmake_command = result
         .metadata
@@ -89,7 +138,7 @@ fn generate_impl(
         Some(command) => command.clone(),
         None => host
             .current_exe()
-            .map(|exe| path::from_native(&exe))
+            .map(|exe| path::from_native_cmake(&exe))
             .map_err(|error| GenError::Write {
                 path: "Makefile".into(),
                 message: error.to_string().into(),
@@ -105,6 +154,7 @@ fn generate_impl(
         &prep,
         (model, report_progress),
         verify_globs,
+        dialect,
     )?;
     let mut dispatch = dispatch(
         graph,
@@ -112,11 +162,13 @@ fn generate_impl(
         &prep,
         report_progress && target_messages(model),
         &result.metadata.clean_files,
+        &cmake,
+        dialect,
     )?;
     let languages = rcmake_resolve::progress::compile_languages(result, graph);
     let build_files = targets
         .iter()
-        .map(|target| build_file(target, &languages, &build_dir, &cmake, host))
+        .map(|target| build_file(target, &languages, &build_dir, &cmake, host, dialect))
         .collect::<Result<Vec<_>, _>>()?;
 
     for (target, contents) in targets.iter().zip(build_files) {
@@ -127,18 +179,23 @@ fn generate_impl(
     }
     if let Some(model) = model {
         subdirectories::write(
-            host,
-            &build_dir,
-            model,
-            result,
-            &targets,
-            (&mut top, &mut dispatch),
+            subdirectories::Context {
+                host,
+                build: &build_dir,
+                model,
+                result,
+                targets: &targets,
+                cmake: &cmake,
+                dialect,
+            },
+            &mut top,
+            &mut dispatch,
         )?;
     }
     write_makefile(host, &build_dir, MAKEFILE2, &dispatch)?;
     write_makefile(host, &build_dir, b"Makefile", &top)?;
     if let Some(model) = model {
-        directory_info::write(host, model)?;
+        directory_info::write(host, model, dialect)?;
     }
     if !result.metadata.listfiles.is_empty() {
         let stamp = build_dir.join(path::to_native(REGEN_STAMP));
@@ -221,6 +278,7 @@ fn plan_targets<'a>(
     graph: &'a BuildGraph,
     build_dir: &Path,
     project: Option<&ProjectModel>,
+    dialect: MakeDialect,
 ) -> Result<Vec<Target<'a>>, GenError> {
     let mut targets = Vec::with_capacity(graph.targets.len());
     let resolved: BTreeMap<_, _> = result
@@ -232,7 +290,7 @@ fn plan_targets<'a>(
     let mut names = BTreeMap::new();
     for (index, target) in graph.targets.iter().enumerate() {
         let name = target.name.as_slice();
-        check_make_path(name)?;
+        check_make_path_for(dialect, name)?;
         let directory_codegen = name.ends_with(b"/codegen")
             && !name.starts_with(b"/")
             && !name
@@ -468,11 +526,35 @@ fn write_makefile(
     rcmake_gen_common::write_output(host, &destination, contents)
 }
 
-fn makefile() -> Vec<u8> {
-    b"# Generated by Rcmake.\n.SUFFIXES:\nSHELL = /bin/sh\n\
+fn makefile_header(dialect: MakeDialect, cmake: Option<&[u8]>) -> Result<Vec<u8>, GenError> {
+    if !dialect.is_nmake() {
+        return Ok(b"# Generated by Rcmake.\n.SUFFIXES:\nSHELL = /bin/sh\n\
 SILENT = $(SILENT_$(VERBOSE))\nSILENT_ = @\n\
 MAKE_SILENT = $(MAKE_SILENT_$(VERBOSE))\nMAKE_SILENT_ = -s\n\n"
-        .to_vec()
+            .to_vec());
+    }
+    let mut out = b"# Generated by Rcmake.\n\
+!IF \"$(OS)\" == \"Windows_NT\"\n\
+NULL=\n\
+!ELSE\n\
+NULL=nul\n\
+!ENDIF\n\
+SHELL = cmd.exe\n\
+!IF \"$(VERBOSE)\" == \"\"\n\
+SILENT = @\n\
+MAKE_SILENT = /nologo\n\
+!ELSE\n\
+SILENT =\n\
+MAKE_SILENT =\n\
+!ENDIF\n"
+        .to_vec();
+    if let Some(cmake) = cmake {
+        out.push_str(b"!IFNDEF CMAKE_COMMAND\nCMAKE_COMMAND = ");
+        make_recipe_text_for(dialect, &mut out, &quote_cmd(cmake))?;
+        out.push_str(b"\n!ENDIF\n");
+    }
+    out.push(b'\n');
+    Ok(out)
 }
 
 /// Return whether each target reports its completion. The `TARGET_MESSAGES`
@@ -489,6 +571,7 @@ fn target_messages(model: Option<&ProjectModel>) -> bool {
         .is_none_or(|value| !rcmake_base::truth::is_off(value))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn top_level(
     result: &GenerationResult,
     graph: &BuildGraph,
@@ -497,43 +580,55 @@ fn top_level(
     prep: &prep::Targets,
     (model, report_progress): (Option<&ProjectModel>, bool),
     verify_globs: bool,
+    dialect: MakeDialect,
 ) -> Result<Vec<u8>, GenError> {
-    let mut out = makefile();
-    // Separate entry points can build the same target. Submakes still run in parallel.
-    out.push_str(b".NOTPARALLEL:\nCMAKE_COMMAND ?= ");
-    let mut cmake_value = Vec::new();
-    make_recipe_text(&mut cmake_value, &quote_always(cmake))?;
-    for byte in cmake_value {
-        if byte == b'#' {
-            out.push(b'\\');
+    let mut out = makefile_header(dialect, dialect.is_nmake().then_some(cmake))?;
+    if dialect.is_nmake() {
+        out.push_str(b"!IFNDEF CTEST_COMMAND\nCTEST_COMMAND = ctest\n!ENDIF\n\n");
+    } else {
+        // Separate entry points can build the same target. Submakes still run in parallel.
+        out.push_str(b".NOTPARALLEL:\nCMAKE_COMMAND ?= ");
+        let mut cmake_value = Vec::new();
+        make_recipe_text(&mut cmake_value, &quote_always(cmake))?;
+        for byte in cmake_value {
+            if byte == b'#' {
+                out.push(b'\\');
+            }
+            out.push(byte);
         }
-        out.push(byte);
+        out.push_str(b"\nCTEST_COMMAND ?= ctest\n\n");
+        if report_progress {
+            out.push_str(b"export CMAKE_COMMAND\n");
+        }
     }
-    out.push_str(b"\nCTEST_COMMAND ?= ctest\n\n");
-    if report_progress {
-        out.push_str(b"export CMAKE_COMMAND\n");
-    }
-    phony(&mut out, b"all", [b"cmake_check_build_system".as_slice()]);
+    phony_for(
+        dialect,
+        &mut out,
+        b"all",
+        [b"cmake_check_build_system".as_slice()],
+    );
     let all = graph
         .targets
         .iter()
         .enumerate()
         .filter_map(|(index, target)| target.in_all.then_some(index));
     progress::build(
+        dialect,
         &mut out,
         b"all",
         report_progress.then(|| progress::count(targets, all)),
     );
-    phony(&mut out, b"clean", []);
-    recursive_make(&mut out, MAKEFILE2, b"clean");
-    phony(&mut out, b"preinstall", [b"all".as_slice()]);
-    recursive_make(&mut out, MAKEFILE2, b"preinstall");
-    phony(&mut out, b"install", [b"preinstall".as_slice()]);
+    phony_for(dialect, &mut out, b"clean", []);
+    recursive_make_for(dialect, &mut out, MAKEFILE2, b"clean");
+    phony_for(dialect, &mut out, b"preinstall", [b"all".as_slice()]);
+    recursive_make_for(dialect, &mut out, MAKEFILE2, b"preinstall");
+    phony_for(dialect, &mut out, b"install", [b"preinstall".as_slice()]);
     out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -P cmake_install.cmake\n");
     let test_depends_all = model
         .and_then(|model| model.definition(DirId::ROOT, b"CMAKE_SKIP_TEST_ALL_DEPENDENCY"))
         .is_some_and(|value| rcmake_base::truth::is_off(value));
-    phony(
+    phony_for(
+        dialect,
         &mut out,
         b"test",
         test_depends_all.then_some(b"all".as_slice()),
@@ -541,11 +636,11 @@ fn top_level(
     out.push_str(b"\t$(SILENT)$(CTEST_COMMAND) --force-new-ctest-process");
     for argument in &result.metadata.ctest_arguments {
         out.push(b' ');
-        make_recipe_text(&mut out, &quote_always(argument))?;
+        make_recipe_text_for(dialect, &mut out, &quote_arg(dialect, argument))?;
     }
     out.push(b'\n');
 
-    phony(&mut out, b"edit_cache", []);
+    phony_for(dialect, &mut out, b"edit_cache", []);
     out.push_str(b"\t$(SILENT)");
     if let Some(model) = model
         && let Some(editor) = model
@@ -553,13 +648,13 @@ fn top_level(
             .filter(|editor| !editor.is_empty())
     {
         let root = model.dir(DirId::ROOT);
-        make_recipe_text(&mut out, &quote_always(editor))?;
+        make_recipe_text_for(dialect, &mut out, &quote_arg(dialect, editor))?;
         for (option, dir) in [
             (b" -S".as_slice(), &root.source_dir),
             (b" -B", &root.binary_dir),
         ] {
             out.push_str(option);
-            make_recipe_text(&mut out, &quote_always(dir))?;
+            make_recipe_text_for(dialect, &mut out, &quote_arg(dialect, dir))?;
         }
         out.push(b'\n');
     } else {
@@ -571,73 +666,111 @@ fn top_level(
     if let Some(source_dir) = listfiles.iter().find_map(|file| {
         let file = path::to_native(file);
         (file.file_name()? == "CMakeLists.txt")
-            .then(|| path::from_native(file.parent().unwrap_or(Path::new("."))))
+            .then(|| path::from_native_cmake(file.parent().unwrap_or(Path::new("."))))
     }) {
         configure.push_str(b" -S ");
-        make_recipe_text(&mut configure, &quote_always(&source_dir))?;
+        make_recipe_text_for(dialect, &mut configure, &quote_arg(dialect, &source_dir))?;
     }
-    phony(&mut out, b"rebuild_cache", []);
+    phony_for(dialect, &mut out, b"rebuild_cache", []);
     out.push_str(b"\t$(SILENT)");
     out.push_str(&configure);
     out.push(b'\n');
 
     if listfiles.is_empty() {
-        phony(&mut out, b"cmake_check_build_system", []);
+        phony_for(dialect, &mut out, b"cmake_check_build_system", []);
     } else {
         for file in listfiles {
-            check_make_path(file)?;
+            check_make_path_for(dialect, file)?;
         }
-        phony(&mut out, b"cmake_check_build_system", [REGEN_STAMP]);
+        phony_for(
+            dialect,
+            &mut out,
+            b"cmake_check_build_system",
+            [REGEN_STAMP],
+        );
         if verify_globs {
             let script = rcmake_gen_common::glob::SCRIPT.as_bytes();
             let marker = b"CMakeFiles/rcmake-glob-mismatch";
-            out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -E rm -f ");
-            out.push_str(marker);
-            out.push_str(b" && $(CMAKE_COMMAND) -D_RCMAKE_GLOB_MISMATCH_MARKER=");
-            out.push_str(marker);
-            out.push_str(b" -P ");
-            out.push_str(script);
-            out.push_str(b" && if test -f ");
-            out.push_str(marker);
-            out.push_str(b"; then ");
-            out.push_str(&configure);
-            out.push_str(b" --regenerate-during-build; fi\n");
+            if dialect.is_nmake() {
+                out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -E rm -f ");
+                out.push_str(marker);
+                out.push_str(b"\n\t$(SILENT)$(CMAKE_COMMAND) -D_RCMAKE_GLOB_MISMATCH_MARKER=");
+                out.push_str(marker);
+                out.push_str(b" -P ");
+                out.push_str(script);
+                out.push_str(b"\n\t$(SILENT)if exist \"");
+                out.push_str(marker);
+                out.push_str(b"\" ");
+                out.push_str(&configure);
+                out.push_str(b" --regenerate-during-build\n");
+            } else {
+                out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -E rm -f ");
+                out.push_str(marker);
+                out.push_str(b" && $(CMAKE_COMMAND) -D_RCMAKE_GLOB_MISMATCH_MARKER=");
+                out.push_str(marker);
+                out.push_str(b" -P ");
+                out.push_str(script);
+                out.push_str(b" && if test -f ");
+                out.push_str(marker);
+                out.push_str(b"; then ");
+                out.push_str(&configure);
+                out.push_str(b" --regenerate-during-build; fi\n");
+            }
         }
-        rule(
+        rule_for(
+            dialect,
             &mut out,
             REGEN_STAMP,
             listfiles.iter().map(|value| value.as_slice()),
         );
-        out.push_str(b"\t$(SILENT)");
-        out.push_str(&configure);
-        out.push_str(b" --regenerate-during-build && touch ");
-        out.push_str(REGEN_STAMP);
-        out.push(b'\n');
+        if dialect.is_nmake() {
+            out.push_str(b"\t$(SILENT)");
+            out.push_str(&configure);
+            out.push_str(b" --regenerate-during-build\n\t$(SILENT)$(CMAKE_COMMAND) -E touch ");
+            out.push_str(REGEN_STAMP);
+            out.push(b'\n');
+        } else {
+            out.push_str(b"\t$(SILENT)");
+            out.push_str(&configure);
+            out.push_str(b" --regenerate-during-build && touch ");
+            out.push_str(REGEN_STAMP);
+            out.push(b'\n');
+        }
         for input in listfiles {
             // A removed include must trigger configure again.
-            rule(&mut out, input, []);
+            rule_for(dialect, &mut out, input, []);
         }
     }
 
-    phony(&mut out, b"help", []);
+    phony_for(dialect, &mut out, b"help", []);
     for name in GLOBAL_TARGETS
         .iter()
         .copied()
         .chain(targets.iter().map(|target| target.name))
         .chain(prep.keys().map(|name| name.as_slice()))
     {
-        out.push_str(b"\t@printf '%s\\n' ");
-        make_recipe_text(&mut out, &quote_always(&[b"... ", name].concat()))?;
+        if dialect.is_nmake() {
+            out.push_str(b"\t@$(CMAKE_COMMAND) -E echo ");
+        } else {
+            out.push_str(b"\t@printf '%s\\n' ");
+        }
+        make_recipe_text_for(
+            dialect,
+            &mut out,
+            &quote_arg(dialect, &[b"... ", name].concat()),
+        )?;
         out.push(b'\n');
     }
     let progress_counts = report_progress.then(|| progress::counts_all(targets));
     for (index, target) in targets.iter().enumerate() {
-        phony(
+        phony_for(
+            dialect,
             &mut out,
             target.name,
             [b"cmake_check_build_system".as_slice()],
         );
         progress::build(
+            dialect,
             &mut out,
             &target.goal,
             progress_counts
@@ -646,8 +779,13 @@ fn top_level(
         );
     }
     for name in prep.keys() {
-        phony(&mut out, name, [b"cmake_check_build_system".as_slice()]);
-        recursive_make(&mut out, MAKEFILE2, name);
+        phony_for(
+            dialect,
+            &mut out,
+            name,
+            [b"cmake_check_build_system".as_slice()],
+        );
+        recursive_make_for(dialect, &mut out, MAKEFILE2, name);
     }
     Ok(out)
 }
@@ -658,9 +796,12 @@ fn dispatch(
     prep: &prep::Targets,
     report_progress: bool,
     clean_paths: &[BString],
+    cmake: &[u8],
+    dialect: MakeDialect,
 ) -> Result<Vec<u8>, GenError> {
-    let mut out = makefile();
-    phony(
+    let mut out = makefile_header(dialect, dialect.is_nmake().then_some(cmake))?;
+    phony_for(
+        dialect,
         &mut out,
         b"all",
         graph
@@ -670,19 +811,25 @@ fn dispatch(
             .filter(|(model, _)| model.in_all)
             .map(|(_, target)| target.goal.as_slice()),
     );
-    phony(
+    phony_for(
+        dialect,
         &mut out,
         b"clean",
         targets.iter().map(|target| target.clean_goal.as_slice()),
     );
     for path in clean_paths {
-        out.push_str(b"	$(SILENT)rm -rf -- ");
-        make_recipe_text(&mut out, &quote_always(path))?;
+        if dialect.is_nmake() {
+            out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -E rm -rf ");
+        } else {
+            out.push_str(b"\t$(SILENT)rm -rf -- ");
+        }
+        make_recipe_text_for(dialect, &mut out, &quote_arg(dialect, path))?;
         out.push(b'\n');
     }
-    phony(&mut out, b"preinstall", []);
+    phony_for(dialect, &mut out, b"preinstall", []);
     for target in targets {
-        phony(
+        phony_for(
+            dialect,
             &mut out,
             &target.goal,
             target
@@ -692,17 +839,18 @@ fn dispatch(
                 .map(|target| target.goal.as_slice()),
         );
         if let Some(fortran) = &target.fortran {
-            recursive_make(&mut out, &target.file, &fortran.scan_goal);
+            recursive_make_for(dialect, &mut out, &target.file, &fortran.scan_goal);
         }
-        recursive_make(&mut out, &target.file, &target.goal);
+        recursive_make_for(dialect, &mut out, &target.file, &target.goal);
         if report_progress {
-            progress::complete(&mut out, target)?;
+            progress::complete(dialect, &mut out, target)?;
         }
-        phony(&mut out, &target.clean_goal, []);
-        recursive_make(&mut out, &target.file, &target.clean_goal);
+        phony_for(dialect, &mut out, &target.clean_goal, []);
+        recursive_make_for(dialect, &mut out, &target.file, &target.clean_goal);
     }
     for (name, dependencies) in prep {
-        phony(
+        phony_for(
+            dialect,
             &mut out,
             name,
             dependencies.iter().map(|goal| goal.as_slice()),
@@ -717,29 +865,38 @@ fn build_file(
     build_dir: &Path,
     cmake: &[u8],
     host: &dyn Host,
+    dialect: MakeDialect,
 ) -> Result<Vec<u8>, GenError> {
-    let mut out = makefile();
-    out.push_str(b".DELETE_ON_ERROR:\n");
-    phony(
+    let mut out = makefile_header(dialect, dialect.is_nmake().then_some(cmake))?;
+    if !dialect.is_nmake() {
+        out.push_str(b".DELETE_ON_ERROR:\n");
+    }
+    phony_for(
+        dialect,
         &mut out,
         &target.goal,
         target.rules.iter().map(|step| step.goal.as_slice()),
     );
-    phony(&mut out, &target.clean_goal, []);
+    phony_for(dialect, &mut out, &target.clean_goal, []);
     if let Some(fortran) = &target.fortran {
-        fortran.emit_clean(&mut out, cmake)?;
+        fortran.emit_clean(dialect, &mut out, cmake)?;
     }
     for product in target.products.iter().collect::<BTreeSet<_>>() {
-        out.push_str(b"\t$(SILENT)rm -f -- ");
-        make_recipe_text(&mut out, &quote_always(product))?;
+        if dialect.is_nmake() {
+            out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -E rm -f ");
+        } else {
+            out.push_str(b"\t$(SILENT)rm -f -- ");
+        }
+        make_recipe_text_for(dialect, &mut out, &quote_arg(dialect, product))?;
         out.push(b'\n');
     }
-    phony(&mut out, FORCE, []);
+    phony_for(dialect, &mut out, FORCE, []);
     if let Some(fortran) = &target.fortran {
-        fortran.emit(&mut out, target, cmake, build_dir)?;
+        fortran.emit(dialect, &mut out, target, cmake, build_dir)?;
     }
     for step in &target.rules {
         if cuda::emit(
+            dialect,
             &mut out,
             build_dir,
             step.action,
@@ -750,27 +907,64 @@ fn build_file(
         )? {
             continue;
         }
-        cuda::emit_link_depends(&mut out, build_dir, step.action)?;
-        write_step(&mut out, step, &target.file, languages)?;
+        cuda::emit_link_depends(dialect, &mut out, build_dir, step.action)?;
+        write_step(dialect, &mut out, step, &target.file, languages)?;
     }
     Ok(out)
 }
 
-fn check_make_path(value: &[u8]) -> Result<(), GenError> {
-    if value.is_empty()
-        || value.iter().any(|byte| {
+fn check_make_path_for(dialect: MakeDialect, value: &[u8]) -> Result<(), GenError> {
+    let invalid = if dialect.is_nmake() {
+        value
+            .iter()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | b'\0' | b'|' | b'"'))
+    } else {
+        value.iter().any(|byte| {
             matches!(
                 byte,
                 b'\n' | b'\r' | b'\0' | b';' | b'=' | b'|' | b'\\' | b'(' | b')'
             )
         })
-    {
+    };
+    if value.is_empty() || invalid {
         return Err(invalid_graph(format!(
             "unsupported make path: {}",
             BString::from(value)
         )));
     }
     Ok(())
+}
+
+/// Double-quote one argument for Windows `cmd.exe` / NMake recipes.
+fn quote_cmd(value: &[u8]) -> BString {
+    let mut out = Vec::with_capacity(value.len() + 2);
+    out.push(b'"');
+    let mut backslashes = 0_usize;
+    for &byte in value {
+        match byte {
+            b'\\' => backslashes += 1,
+            b'"' => {
+                out.resize(out.len() + backslashes * 2 + 1, b'\\');
+                out.push(b'"');
+                backslashes = 0;
+            }
+            _ => {
+                out.resize(out.len() + backslashes, b'\\');
+                backslashes = 0;
+                out.push(byte);
+            }
+        }
+    }
+    out.resize(out.len() + backslashes * 2, b'\\');
+    out.push(b'"');
+    out.into()
+}
+
+fn quote_arg(dialect: MakeDialect, value: &[u8]) -> BString {
+    match dialect {
+        MakeDialect::Unix => quote_always(value),
+        MakeDialect::NMake => quote_cmd(value),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -780,7 +974,29 @@ enum Word {
     Wildcard,
 }
 
-fn make_word(out: &mut Vec<u8>, value: &[u8], word: Word) {
+fn make_word_for(dialect: MakeDialect, out: &mut Vec<u8>, value: &[u8], word: Word) {
+    if dialect.is_nmake() {
+        let needs_quotes = value.iter().any(|byte| {
+            matches!(
+                byte,
+                b' ' | b'\t' | b':' | b'#' | b'(' | b')' | b';' | b'=' | b'&' | b'%' | b'^'
+            )
+        });
+        if needs_quotes {
+            out.push(b'"');
+        }
+        for &byte in value {
+            if byte == b'$' {
+                out.push_str(b"$$");
+            } else {
+                out.push(byte);
+            }
+        }
+        if needs_quotes {
+            out.push(b'"');
+        }
+        return;
+    }
     for &byte in value {
         match byte {
             b'$' => out.push_str(b"$$"),
@@ -792,34 +1008,54 @@ fn make_word(out: &mut Vec<u8>, value: &[u8], word: Word) {
     }
 }
 
-fn rule<'a>(out: &mut Vec<u8>, goal: &[u8], inputs: impl IntoIterator<Item = &'a [u8]>) {
-    make_word(out, goal, Word::Target);
+fn rule_for<'a>(
+    dialect: MakeDialect,
+    out: &mut Vec<u8>,
+    goal: &[u8],
+    inputs: impl IntoIterator<Item = &'a [u8]>,
+) {
+    make_word_for(dialect, out, goal, Word::Target);
+    if dialect.is_nmake() && goal.len() == 1 && goal.first().is_some_and(u8::is_ascii_alphabetic) {
+        out.push(b' ');
+    }
     out.push(b':');
     for input in inputs {
         out.push(b' ');
-        make_word(out, input, Word::Input);
+        make_word_for(dialect, out, input, Word::Input);
     }
     out.push(b'\n');
 }
 
-fn phony<'a>(out: &mut Vec<u8>, goal: &[u8], inputs: impl IntoIterator<Item = &'a [u8]>) {
-    rule(out, b".PHONY", [goal]);
-    rule(out, goal, inputs);
+fn phony_for<'a>(
+    dialect: MakeDialect,
+    out: &mut Vec<u8>,
+    goal: &[u8],
+    inputs: impl IntoIterator<Item = &'a [u8]>,
+) {
+    if !dialect.is_nmake() {
+        rule_for(dialect, out, b".PHONY", [goal]);
+    }
+    rule_for(dialect, out, goal, inputs);
 }
 
-fn recursive_make(out: &mut Vec<u8>, file: &[u8], goal: &[u8]) {
+fn recursive_make_for(dialect: MakeDialect, out: &mut Vec<u8>, file: &[u8], goal: &[u8]) {
     out.push_str(b"\t$(SILENT)$(MAKE) $(MAKE_SILENT) -f ");
-    for (index, part) in [file, goal].into_iter().enumerate() {
-        if index != 0 {
-            out.push(b' ');
-        }
-        for &byte in quote_always(part).iter() {
-            if byte == b'$' {
-                out.push(b'$');
+    let push_escaped = |out: &mut Vec<u8>, value: &[u8]| {
+        for &byte in quote_arg(dialect, value).iter() {
+            match byte {
+                b'$' => out.push_str(b"$$"),
+                b'%' if dialect.is_nmake() => out.push_str(b"%%"),
+                _ => out.push(byte),
             }
-            out.push(byte);
         }
+    };
+    push_escaped(out, file);
+    if dialect.is_nmake() {
+        out.push_str(b" -$(MAKEFLAGS) VERBOSE=$(VERBOSE) ");
+    } else {
+        out.push(b' ');
     }
+    push_escaped(out, goal);
     out.push(b'\n');
 }
 

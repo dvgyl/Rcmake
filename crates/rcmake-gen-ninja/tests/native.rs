@@ -70,6 +70,7 @@ impl Project {
                     stderr: Output::Capture,
                     timeout: Some(Duration::from_secs(45)),
                     tee: false,
+                    default_error_mode: false,
                 },
                 &mut |_, _| {},
             )

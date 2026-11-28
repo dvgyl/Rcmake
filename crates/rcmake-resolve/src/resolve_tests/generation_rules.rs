@@ -344,6 +344,10 @@ fn normalizes_evaluated_windows_usage_paths() -> TestResult {
         .global
         .props
         .set("CMAKE_SYSTEM_NAME".into(), "Windows".into());
+    model
+        .global
+        .props
+        .set("CMAKE_HOST_SYSTEM_NAME".into(), "Windows".into());
     let mut iface = target("iface", TargetKind::InterfaceLibrary, &[]);
     iface.usage.push(
         UsageField::InterfaceIncludeDirectories,

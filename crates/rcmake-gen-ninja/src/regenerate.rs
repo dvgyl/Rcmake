@@ -13,20 +13,36 @@ use crate::{
     syntax::{Edge, Ninja},
 };
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Regeneration edge emission reads host state, manifest outputs, and command lines."
+)]
 pub(super) fn emit_regeneration(
     ninja: &mut Ninja,
     graph: &Graph<'_>,
+    host: &dyn Host,
     outputs: &[BString],
     result: &GenerationResult,
     regenerate: &[u8],
     verify: Option<&[u8]>,
     has_cache: bool,
 ) {
+    let listfile_exists = |file: &BString| {
+        let native = path::to_native(file);
+        let full = if native.is_absolute() {
+            native
+        } else {
+            graph.build_dir.join(native)
+        };
+        host.metadata(&full, rcmake_host::Follow::Yes).is_ok()
+    };
+    let prune_missing = result.metadata.listfiles.iter().any(listfile_exists);
     let mut seen = HashSet::new();
     let mut listfiles: Vec<_> = result
         .metadata
         .listfiles
         .iter()
+        .filter(|file| !prune_missing || listfile_exists(file))
         .map(|file| graph.node(file))
         .filter(|file| !outputs.contains(file) && seen.insert(file.clone()))
         .collect();
@@ -66,6 +82,7 @@ pub(super) fn emit_regeneration(
         }
     }
 
+    let regenerate = with_cached_warning_flags(host, graph.build_dir, regenerate);
     ninja.edge(
         b"RERUN_CMAKE",
         Edge {
@@ -75,7 +92,7 @@ pub(super) fn emit_regeneration(
             ..Edge::default()
         },
     );
-    ninja.binding(b"COMMAND", regenerate);
+    ninja.binding(b"COMMAND", &regenerate);
     ninja.binding(b"pool", b"console");
 
     // Missing listfiles must trigger regeneration so CMake can check them.
@@ -127,6 +144,12 @@ pub(super) fn configure_command(
     let mut command = cmake.to_vec();
     if rerun {
         command.extend_from_slice(b" --regenerate-during-build");
+        if result.metadata.ignore_compile_warning_as_error {
+            command.extend_from_slice(b" --compile-no-warning-as-error");
+        }
+        if result.metadata.ignore_link_warning_as_error {
+            command.extend_from_slice(b" --link-no-warning-as-error");
+        }
     }
     let option = |prefix: &[u8], directory: &Path, command: &mut Vec<u8>| {
         command.push(b' ');
@@ -141,6 +164,49 @@ pub(super) fn configure_command(
     option(b"-S", &source_dir, &mut command);
     option(b"-B", build_dir, &mut command);
     command
+}
+
+fn with_cached_warning_flags<'a>(
+    host: &dyn Host,
+    build_dir: &Path,
+    regenerate: &'a [u8],
+) -> std::borrow::Cow<'a, [u8]> {
+    const MARKER: &[u8] = b" --regenerate-during-build";
+    let Some(pos) = regenerate
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    else {
+        return std::borrow::Cow::Borrowed(regenerate);
+    };
+    let mut extra = Vec::new();
+    for (cache_key, flag) in [
+        (
+            b"_RCMAKE_NO_WARNING_AS_ERROR".as_slice(),
+            b" --compile-no-warning-as-error".as_slice(),
+        ),
+        (
+            b"_RCMAKE_IGNORE_LINK_WARNING_AS_ERROR",
+            b" --link-no-warning-as-error",
+        ),
+    ] {
+        if !regenerate.windows(flag.len()).any(|window| window == flag)
+            && configuration_setting(host, build_dir, cache_key)
+                .is_some_and(|value| rcmake_base::truth::is_on(&value))
+        {
+            extra.extend_from_slice(flag);
+        }
+    }
+    if extra.is_empty() {
+        return std::borrow::Cow::Borrowed(regenerate);
+    }
+    let Some((head, tail)) = regenerate.split_at_checked(pos + MARKER.len()) else {
+        return std::borrow::Cow::Borrowed(regenerate);
+    };
+    let mut out = Vec::with_capacity(regenerate.len() + extra.len());
+    out.extend_from_slice(head);
+    out.extend_from_slice(&extra);
+    out.extend_from_slice(tail);
+    std::borrow::Cow::Owned(out)
 }
 
 pub(super) fn configuration_setting(

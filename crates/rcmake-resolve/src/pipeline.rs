@@ -13,7 +13,7 @@ use rcmake_model::{CustomCommandKind, DirId, GeneratorKind, ProjectModel, Target
 use crate::{
     BuildGraph, BuildStep, GenerationResult, InstallActionKind, ResolveError, ResolveOptions,
     ResolvedTarget,
-    cxx_modules::{generation_location, module_error, stdlib},
+    cxx_modules::{generation_location, module_error, stdlib, synthetic},
     exports::resolve_exports,
     ide, lower,
     resolve_link::{ResolvedLink, attach_links, resolve_link},
@@ -115,22 +115,28 @@ fn resolve_project(
     workers_override: Option<usize>,
 ) -> Result<GenerationResult, ResolveError> {
     // Direct callers can supply a model before finalization.
-    let mut entries = crate::usage::includes::pending_current_dir_interfaces(model).peekable();
-    let includes = if entries.peek().is_some() {
-        let mut finalized = model.clone();
-        crate::usage::includes::append_current_dir_interfaces(&mut finalized, entries);
-        Some(finalized)
-    } else {
-        None
-    };
-    let model = includes.as_ref().unwrap_or(model);
-    let output_sets = rule_output_sets::prepare(model)?;
-    let model = output_sets.as_ref().unwrap_or(model);
-    let rules = crate::target::instantiate_rules(model, host)?;
-    let model = rules.as_ref().unwrap_or(model);
-    crate::exports::source_sets::validate(model)?;
-    let strategies = intdir::prepare(model, host)?;
-    let model = strategies.as_ref().unwrap_or(model);
+    let mut owned_model: Option<ProjectModel> = None;
+    {
+        let mut entries = crate::usage::includes::pending_current_dir_interfaces(model).peekable();
+        if entries.peek().is_some() {
+            let mut finalized = model.clone();
+            crate::usage::includes::append_current_dir_interfaces(&mut finalized, entries);
+            owned_model = Some(finalized);
+        }
+    }
+    if let Some(updated) = rule_output_sets::prepare(owned_model.as_ref().unwrap_or(model))? {
+        owned_model = Some(updated);
+    }
+    if let Some(updated) =
+        crate::target::instantiate_rules(owned_model.as_ref().unwrap_or(model), host)?
+    {
+        owned_model = Some(updated);
+    }
+    crate::exports::source_sets::validate(owned_model.as_ref().unwrap_or(model))?;
+    if let Some(updated) = intdir::prepare(owned_model.as_ref().unwrap_or(model), host)? {
+        owned_model = Some(updated);
+    }
+    let model = owned_model.as_ref().unwrap_or(model);
     intdir::warn_collisions(model, host);
     link_tags::validate(model, host)?;
     lower::custom::warn_depfile_policy(model, host);
@@ -164,8 +170,12 @@ fn resolve_project(
     }
     paths.index_source_records(model);
     let autogen = autogen::prepare(model, &mut paths, &configs)?;
-    let model = autogen.as_ref().map_or(model, |plan| &plan.model);
-    paths.index_source_records(model);
+    let model = if let Some(plan) = &autogen {
+        paths.index_source_records(&plan.model);
+        &plan.model
+    } else {
+        model
+    };
     let unity = unity::prepare(model, host, &mut paths, &configs)?;
     paths.set_unity(Some(unity));
     check_notfound_target_properties(model, &paths)?;
@@ -237,6 +247,7 @@ fn resolve_project(
     let mut provenance = Provenance::default();
     let mut targets = Vec::new();
     let mut runtime_languages = IndexMap::new();
+    let mut object_dependencies = IndexMap::new();
     let mut graphs = Vec::with_capacity(configs.len());
     let mut cross_graphs = IndexMap::new();
     let mut compile_inputs = BTreeMap::new();
@@ -267,6 +278,12 @@ fn resolve_project(
                 .runtime_languages
                 .into_iter()
                 .map(|(id, languages)| ((id, config.clone()), languages)),
+        );
+        object_dependencies.extend(
+            output
+                .object_dependencies
+                .into_iter()
+                .map(|(id, deps)| ((id, config.clone()), deps)),
         );
         targets.extend(output.targets);
         cross_graphs.extend(output.cross_graphs);
@@ -307,6 +324,7 @@ fn resolve_project(
             .with_ide(options.ide)
             .with_memos(&shared_memos),
         &targets,
+        &object_dependencies,
         &install,
         &configs,
     )?;
@@ -321,12 +339,11 @@ fn resolve_project(
             action.kind = InstallActionKind::Code("file(INSTALL DESTINATION \"\")".into());
         }
     }
-    let mut metadata = lower::collect_metadata(model);
+    let mut metadata = lower::artifacts::collect_metadata_with_host(model, host);
     if let Some(autogen) = &autogen {
         metadata
             .listfiles
             .extend(autogen.reconfigure_inputs.iter().cloned());
-        metadata.generated_files.clone_from(&autogen.info_outputs);
         metadata.clean_files.clone_from(&autogen.clean_paths);
     }
     if model.generator == Some(GeneratorKind::UnixMakefiles)
@@ -383,20 +400,53 @@ fn resolve_project(
             .with_memos(&shared_memos),
     )?;
     for target in &mut targets {
-        target.dependencies = target_depends
+        if target_depends.target_index(target.id).is_none() {
+            continue;
+        }
+        let mut merged: IndexSet<TargetId> = target_depends
             .direct_depends(target.id)
             .iter()
             .map(|depend| depend.target)
             .collect();
+        for &dep_id in &target.dependencies {
+            if dep_id != target.id && target_depends.target_index(dep_id).is_none() {
+                merged.insert(dep_id);
+            }
+        }
+        target.dependencies = merged.into_iter().collect();
+    }
+    // Prune stale transitive non-direct target dependencies from per-config graphs
+    // while preserving per-config synthetic/module provider targets (e.g. `import std`)
+    // and leaving `cross_graphs` provenance untouched.
+    for graph in &mut graphs {
+        for (index, &id) in graph.target_ids.iter().enumerate() {
+            if target_depends.target_index(id).is_none() {
+                continue;
+            }
+            let Some(graph_target) = graph.targets.get_mut(index) else {
+                continue;
+            };
+            let direct_set: IndexSet<TargetId> = target_depends
+                .direct_depends(id)
+                .iter()
+                .map(|depend| depend.target)
+                .collect();
+            graph_target.depends.retain(|&dep_index| {
+                if dep_index == index {
+                    return false;
+                }
+                let Some(&dep_id) = graph.target_ids.get(dep_index) else {
+                    return true;
+                };
+                target_depends.target_index(dep_id).is_none() || direct_set.contains(&dep_id)
+            });
+        }
     }
     crate::file_sets::clean_lint_fixes(model, host, &graphs);
     let resolved_model = prepared
         .map(|prepared| Box::new(prepared.model))
         .or_else(|| autogen.map(|autogen| Box::new(autogen.model)))
-        .or_else(|| strategies.map(Box::new))
-        .or_else(|| rules.map(Box::new))
-        .or_else(|| output_sets.map(Box::new))
-        .or_else(|| includes.map(Box::new));
+        .or_else(|| owned_model.map(Box::new));
     Ok(GenerationResult {
         configs,
         targets,
@@ -420,6 +470,7 @@ struct ConfigOutput {
     provenance: Option<Provenance>,
     targets: Vec<ResolvedTarget>,
     runtime_languages: IndexMap<TargetId, IndexSet<BString>>,
+    object_dependencies: IndexMap<TargetId, Vec<TargetId>>,
     graph: Result<BuildGraph, ResolveError>,
     cross_graphs: IndexMap<(ConfigId, ConfigId), BuildGraph>,
     memos: Option<MemoSnapshot>,
@@ -631,6 +682,147 @@ struct TargetResolveWork {
     outcome: TargetResolveOutcome,
 }
 
+/// Return `true` when a single `COMPILE_FEATURES` / `INTERFACE_COMPILE_FEATURES`
+/// raw entry can evaluate to `cxx_std_20`, `cxx_std_23`, or `cxx_std_26`.
+///
+/// Structural/conditional wrappers (`$<cond:val>`, `$<IF:...>`, `$<BUILD_INTERFACE:...>`,
+/// boolean predicates, etc.) have their value branches inspected recursively;
+/// dynamic string-transforming expressions (such as `$<LOWER_CASE:...>`,
+/// `$<TARGET_PROPERTY:...>`, `$<JOIN:...>`, or spliced text + expression tokens)
+/// conservatively return `true` so parallel resolution never misses a C++20 dyndep probe.
+fn genex_entry_may_produce_cxx20(raw: &[u8]) -> bool {
+    fn text_has_cxx20(bytes: &[u8]) -> bool {
+        bytes
+            .windows(10)
+            .any(|part| matches!(part, b"cxx_std_20" | b"cxx_std_23" | b"cxx_std_26"))
+    }
+
+    fn nodes_may_produce_cxx20(nodes: &[rcmake_genex::GenexNode], depth: usize) -> bool {
+        if depth > rcmake_genex::MAX_NESTING {
+            return true;
+        }
+        // Check for non-separator text spliced directly with an expression
+        // (e.g. `cxx_std_$<IF:...,20,17>`), which can synthesize a feature name.
+        let mut saw_expr = false;
+        let mut saw_non_sep_text = false;
+        for node in nodes {
+            match node {
+                rcmake_genex::GenexNode::Text(text) => {
+                    if text_has_cxx20(text) {
+                        return true;
+                    }
+                    if text.iter().any(|&byte| byte != b';') {
+                        saw_non_sep_text = true;
+                    }
+                }
+                rcmake_genex::GenexNode::Expr(expr) => {
+                    saw_expr = true;
+                    if expr_may_produce_cxx20(expr, depth + 1) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Only reject splicing when a non-empty, non-`;` text token sits adjacent
+        // to an expression without a `;` boundary between them.
+        if saw_expr && saw_non_sep_text {
+            for pair in nodes.windows(2) {
+                let spliced = match pair {
+                    [
+                        rcmake_genex::GenexNode::Text(text),
+                        rcmake_genex::GenexNode::Expr(_),
+                    ] => !text.is_empty() && !text.ends_with(b";"),
+                    [
+                        rcmake_genex::GenexNode::Expr(_),
+                        rcmake_genex::GenexNode::Text(text),
+                    ] => !text.is_empty() && !text.starts_with(b";"),
+                    _ => false,
+                };
+                if spliced {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn expr_may_produce_cxx20(expr: &rcmake_genex::GenexExpr, depth: usize) -> bool {
+        if depth > rcmake_genex::MAX_NESTING {
+            return true;
+        }
+        match expr.identifier.as_slice() {
+            // Conditional guard `$<cond:value>` where `cond` is a nested expression:
+            // output comes exclusively from `params` (or empty).
+            [rcmake_genex::GenexNode::Expr(_)] => expr
+                .params
+                .as_ref()
+                .is_some_and(|params| params.iter().any(|p| nodes_may_produce_cxx20(p, depth + 1))),
+            [rcmake_genex::GenexNode::Text(ident)] => match ident.as_slice() {
+                b"0"
+                | b"BOOL"
+                | b"NOT"
+                | b"AND"
+                | b"OR"
+                | b"STREQUAL"
+                | b"EQUAL"
+                | b"IN_LIST"
+                | b"VERSION_LESS"
+                | b"VERSION_GREATER"
+                | b"VERSION_EQUAL"
+                | b"VERSION_LESS_EQUAL"
+                | b"VERSION_GREATER_EQUAL"
+                | b"CONFIG"
+                | b"COMPILE_LANGUAGE"
+                | b"COMPILE_LANG_AND_ID"
+                | b"LINK_LANGUAGE"
+                | b"LINK_LANG_AND_ID"
+                | b"C_COMPILER_ID"
+                | b"CXX_COMPILER_ID"
+                | b"CUDA_COMPILER_ID"
+                | b"OBJC_COMPILER_ID"
+                | b"OBJCXX_COMPILER_ID"
+                | b"Fortran_COMPILER_ID"
+                | b"HIP_COMPILER_ID"
+                | b"ISPC_COMPILER_ID"
+                | b"Swift_COMPILER_ID"
+                | b"C_COMPILER_VERSION"
+                | b"CXX_COMPILER_VERSION"
+                | b"PLATFORM_ID"
+                | b"TARGET_EXISTS"
+                | b"TARGET_POLICY" => false,
+                b"1"
+                | b"BUILD_INTERFACE"
+                | b"INSTALL_INTERFACE"
+                | b"BUILD_LOCAL_INTERFACE"
+                | b"COMPILE_ONLY"
+                | b"LINK_ONLY" => expr.params.as_ref().is_some_and(|params| {
+                    params.iter().any(|p| nodes_may_produce_cxx20(p, depth + 1))
+                }),
+                b"IF" => expr.params.as_ref().is_some_and(|params| {
+                    params.get(1..).is_some_and(|branches| {
+                        branches
+                            .iter()
+                            .any(|branch| nodes_may_produce_cxx20(branch, depth + 1))
+                    })
+                }),
+                // Dynamic / string-producing expressions (e.g. LOWER_CASE, UPPER_CASE,
+                // JOIN, STRING, TARGET_PROPERTY, GENEX_EVAL, TARGET_GENEX_EVAL,
+                // MAKE_C_IDENTIFIER) could synthesize `cxx_std_20+`.
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+
+    if !raw.windows(2).any(|part| part == b"$<") {
+        return text_has_cxx20(raw);
+    }
+    match rcmake_genex::parse(raw) {
+        Ok(ast) => nodes_may_produce_cxx20(&ast.nodes, 0),
+        Err(_) => true,
+    }
+}
+
 /// Return `true` when target resolution may invoke the Ninja C++20 dyndep
 /// capability query or a caller-supplied [`GeneratorFacts`](crate::GeneratorFacts)
 /// callback. Running serially in those cases preserves exact capability-query
@@ -643,18 +835,11 @@ fn may_probe_ninja_cxx_dyndep(model: &ProjectModel, paths: &SourcePaths<'_>) -> 
     {
         return false;
     }
-    if paths.generator_facts.is_some() {
-        return true;
-    }
     let supports_modules = |value: &[u8]| matches!(value, b"20" | b"23" | b"26");
     let has_cxx20_feature = |entries: &[rcmake_model::BT<BString>]| {
-        entries.iter().any(|entry| {
-            entry
-                .value
-                .windows(10)
-                .any(|part| matches!(part, b"cxx_std_20" | b"cxx_std_23" | b"cxx_std_26"))
-                || entry.value.windows(2).any(|part| part == b"$<")
-        })
+        entries
+            .iter()
+            .any(|entry| genex_entry_may_produce_cxx20(&entry.value))
     };
     let mut has_cxx20 = false;
     let mut has_scan_trigger = false;
@@ -683,18 +868,32 @@ fn may_probe_ninja_cxx_dyndep(model: &ProjectModel, paths: &SourcePaths<'_>) -> 
             .get(b"CXX_STANDARD")
             .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_STANDARD"))
             .is_some_and(|value| supports_modules(value));
-        has_scan_trigger |= lower::definition(model, target.dir, b"CMAKE_CXX_SCANDEP_SOURCE")
-            .is_some()
-            || target
-                .props
-                .get(b"CXX_SCAN_FOR_MODULES")
-                .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_SCAN_FOR_MODULES"))
-                .is_some_and(|value| truth::is_on(value))
-            || model.dir(target.dir).source_props.values().any(|props| {
+        let target_scan_setting = target
+            .props
+            .get(b"CXX_SCAN_FOR_MODULES")
+            .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_SCAN_FOR_MODULES"));
+        let source_or_set_scan_on =
+            target.file_sets.iter().any(|&id| {
+                model.file_set(id).is_some_and(|set| {
+                    set.props
+                        .get(b"CXX_SCAN_FOR_MODULES")
+                        .is_some_and(|value| truth::is_on(value))
+                })
+            }) || model.dir(target.dir).source_props.values().any(|props| {
                 props
                     .get(b"CXX_SCAN_FOR_MODULES")
                     .is_some_and(|value| truth::is_on(value))
             });
+        let target_can_scan = source_or_set_scan_on
+            || match target_scan_setting {
+                Some(value) => truth::is_on(value),
+                None => {
+                    target.policies.policies.get(PolicyId::new(155)) == PolicyStatus::New
+                        && lower::definition(model, target.dir, b"CMAKE_CXX_SCANDEP_SOURCE")
+                            .is_some()
+                }
+            };
+        has_scan_trigger |= target_can_scan;
     }
     has_cxx20 && has_scan_trigger
 }
@@ -1491,16 +1690,25 @@ fn resolve_config(
     };
     let std_model = stdlib::providers(model, paths.host, &resolved, config)?;
     let model = std_model.as_ref().map_or(model, |(model, _)| model);
+    let synth_model = synthetic::providers(model, &resolved, config)?;
+    let model = synth_model.as_ref().map_or(model, |(model, _)| model);
+    let has_overlay = std_model.is_some() || synth_model.is_some();
     let mut usage = UsageResolver::with_source_paths(model, paths);
-    if std_model.is_none() {
+    if !has_overlay {
         usage = usage.with_memos(&memos);
     }
     usage.provenance = provenance;
     usage.seed_target_languages(config, &resolved);
     let providers = std_model.as_ref().map(|(_, bindings)| bindings);
+    let synthetic_bindings = synth_model.as_ref().map(|(_, bindings)| bindings);
     let provider_ids = providers
         .into_iter()
         .flat_map(|bindings| bindings.values().copied())
+        .chain(
+            synthetic_bindings
+                .into_iter()
+                .flat_map(|bindings| bindings.values().flatten().map(|&(_, synth)| synth)),
+        )
         .collect::<IndexSet<_>>();
     for id in provider_ids {
         if let Some(target) = model.target(id) {
@@ -1541,6 +1749,7 @@ fn resolve_config(
                 provenance: usage.provenance,
                 targets: resolved.into_values().collect(),
                 runtime_languages: IndexMap::new(),
+                object_dependencies: IndexMap::new(),
                 graph: Err(error),
                 cross_graphs: IndexMap::new(),
                 memos: None,
@@ -1548,7 +1757,18 @@ fn resolve_config(
         }
         result => result?,
     };
-    attach_links(&mut resolved, &mut inputs, links, providers);
+    let object_dependencies: IndexMap<TargetId, Vec<TargetId>> = resolved
+        .iter()
+        .filter(|(_, facts)| !facts.dependencies.is_empty())
+        .map(|(&id, facts)| (id, facts.dependencies.clone()))
+        .collect();
+    attach_links(
+        &mut resolved,
+        &mut inputs,
+        links,
+        providers,
+        synthetic_bindings,
+    );
     if let Some(verification) = plan.verification {
         verification.add_header_inputs(config, &mut resolved, &mut inputs);
     }
@@ -1613,7 +1833,7 @@ fn resolve_config(
             }
         }
     }
-    let output_memos = std_model.is_none().then(|| usage.memo_snapshot());
+    let output_memos = (!has_overlay).then(|| usage.memo_snapshot());
     Ok(ConfigOutput {
         provenance: usage.provenance,
         targets: resolved,
@@ -1621,8 +1841,76 @@ fn resolve_config(
             .into_iter()
             .map(|(id, input)| (id, input.link_languages))
             .collect(),
+        object_dependencies,
         graph: Ok(graph),
         cross_graphs,
         memos: output_memos,
     })
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use rcmake_diag::{Backtrace, PolicyId, PolicyMap, PolicyStatus};
+    use rcmake_host::PureHost;
+    use rcmake_model::{
+        BT, DirId, GeneratorKind, ProjectModel, Target, TargetKind, TargetOrigin, UsageField,
+    };
+
+    use super::may_probe_ninja_cxx_dyndep;
+    use crate::sources::SourcePaths;
+
+    #[test]
+    fn ninja_cxx_dyndep_guard_allows_parallel_when_no_target_uses_cxx20()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = PureHost::default();
+        let mut model = ProjectModel::default();
+        model.generator = Some(GeneratorKind::Ninja);
+        model.set_root_dirs("/src".into(), "/build".into());
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert("CMAKE_CXX_SCANDEP_SOURCE".into(), "clang-scan-deps".into());
+        let mut policies = PolicyMap::default();
+        policies.set(PolicyId::new(155), PolicyStatus::New)?;
+        let mut app = Target::new(
+            "app".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            policies,
+        );
+        app.usage.push(
+            UsageField::CompileFeatures,
+            BT::new(
+                "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:cxx_std_17>".into(),
+                Backtrace::default(),
+            ),
+        );
+        let app_id = model.add_target(app)?;
+
+        let paths = SourcePaths::new(&host);
+        assert!(
+            !may_probe_ninja_cxx_dyndep(&model, &paths),
+            "C++17 genex compile feature must not serialize parallel target resolution"
+        );
+
+        // Dynamic string-producing genex that could synthesize `cxx_std_20` must serialize.
+        model.target_mut(app_id).ok_or("missing app")?.usage.push(
+            UsageField::CompileFeatures,
+            BT::new("$<LOWER_CASE:CXX_STD_20>".into(), Backtrace::default()),
+        );
+        assert!(
+            may_probe_ninja_cxx_dyndep(&model, &paths),
+            "$<LOWER_CASE:CXX_STD_20> must conservatively serialize"
+        );
+
+        // Explicit CMAKE_CXX_SCAN_FOR_MODULES=OFF disables scanning and allows parallel resolution.
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert("CMAKE_CXX_SCAN_FOR_MODULES".into(), "OFF".into());
+        assert!(!may_probe_ninja_cxx_dyndep(&model, &paths));
+        Ok(())
+    }
 }

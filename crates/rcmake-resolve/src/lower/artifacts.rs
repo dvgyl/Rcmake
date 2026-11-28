@@ -20,6 +20,29 @@ pub(crate) fn is_dll_platform(model: &ProjectModel, dir: DirId) -> bool {
     )
 }
 
+/// Return the DLL soversion suffix to append before `.dll` when a shared
+/// library on a DLL platform enables `DLL_NAME_WITH_SOVERSION` (or leaves it
+/// unset while `CMAKE_SHARED_LIBRARY_NAME_WITH_VERSION` is ON).
+pub(crate) fn dll_soversion<'a>(model: &ProjectModel, target: &'a Target) -> Option<&'a [u8]> {
+    if target.kind != TargetKind::SharedLibrary {
+        return None;
+    }
+    let soversion = target
+        .props
+        .get(b"SOVERSION")
+        .filter(|value| !value.is_empty())?;
+    let enabled = match target
+        .props
+        .get(b"DLL_NAME_WITH_SOVERSION")
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => truth::is_on(value),
+        None => definition(model, target.dir, b"CMAKE_SHARED_LIBRARY_NAME_WITH_VERSION")
+            .is_some_and(|value| truth::is_on(value)),
+    };
+    enabled.then_some(soversion.as_slice())
+}
+
 fn imported_linker_file(
     model: &ProjectModel,
     target: &Target,
@@ -299,7 +322,14 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
     match target.kind {
         TargetKind::SharedLibrary => {
             artifacts.linker_file = Some(plain.clone());
-            if !no_soname {
+            if is_dll_platform(model, target.dir) {
+                if let Some(soversion) = dll_soversion(model, target) {
+                    artifacts.file = Some(join(
+                        &dir,
+                        &[stem.as_slice(), b"-", soversion, suffix].concat(),
+                    ));
+                }
+            } else if !no_soname {
                 let versioned = |version: Option<&BString>| {
                     let Some(version) = version else {
                         return plain.clone();
@@ -368,21 +398,46 @@ pub(crate) fn object_dir(model: &ProjectModel, target: &Target, config: &ConfigI
     }
 }
 
-pub(crate) fn short_support_dir(model: &ProjectModel, target: &Target) -> BString {
+pub(crate) fn cmf_support_dir(model: &ProjectModel, target: &Target) -> BString {
     let relative = build_relative(model, &model.dir(target.dir).binary_dir);
+    if matches!(model.generator, Some(GeneratorKind::VisualStudio(_))) {
+        let leaf = if short_object_paths(model) {
+            short_target_hash(target, &relative)
+        } else {
+            [target.name.as_slice(), b".dir"].concat()
+        };
+        return join(&relative, &[b"CMakeFiles/", leaf.as_slice()].concat());
+    }
+    if short_object_paths(model) {
+        short_support_dir(model, target)
+    } else {
+        join(
+            &relative,
+            &[b"CMakeFiles/", target.name.as_slice(), b".dir"].concat(),
+        )
+    }
+}
+
+fn short_target_hash(target: &Target, relative: &[u8]) -> Vec<u8> {
     let directory = if relative.is_empty() {
         b".".as_slice()
     } else {
-        &relative
+        relative
     };
     let name_hash = sha3_prefix(&target.name, 4);
     let directory_hash = sha3_prefix(directory, 4);
-    let short = format!(".o/{name_hash}{directory_hash}");
+    format!("{name_hash}{directory_hash}").into_bytes()
+}
+
+pub(crate) fn short_support_dir(model: &ProjectModel, target: &Target) -> BString {
+    let relative = build_relative(model, &model.dir(target.dir).binary_dir);
+    let hash = short_target_hash(target, &relative);
+    let short = [b".o/".as_slice(), &hash].concat();
     if matches!(
         model.generator,
         Some(GeneratorKind::UnixMakefiles | GeneratorKind::VisualStudio(_))
     ) {
-        join(&relative, short.as_bytes())
+        join(&relative, &short)
     } else {
         short.into()
     }
@@ -499,8 +554,71 @@ pub fn object_path(
     config: &ConfigId,
     source: &[u8],
 ) -> BString {
-    let name = object_name(model, target, source, short_object_paths(model), None);
-    join(&object_dir(model, target, config), &name)
+    let dir = object_dir(model, target, config);
+    let short = short_object_paths(model);
+    let (name, suffix) = object_name_with_suffix(model, target, source, short, None);
+    let name = if short {
+        name
+    } else {
+        shorten_object_name(model, target, &dir, name, suffix)
+    };
+    join(&dir, &name)
+}
+
+fn object_path_max(model: &ProjectModel, target: &Target) -> Option<usize> {
+    if let Some(value) = definition(model, target.dir, b"CMAKE_OBJECT_PATH_MAX")
+        .or_else(|| definition(model, DirId::ROOT, b"CMAKE_OBJECT_PATH_MAX"))
+        .filter(|value| !value.is_empty())
+    {
+        let parsed = std::str::from_utf8(value).ok()?.parse::<usize>().ok()?;
+        return (parsed >= 128).then_some(parsed);
+    }
+    (is_dll_platform(model, target.dir) || super::shell::windows_host(model, target.dir))
+        .then_some(250)
+}
+
+fn shorten_object_name(
+    model: &ProjectModel,
+    target: &Target,
+    obj_dir: &[u8],
+    name: BString,
+    suffix: &[u8],
+) -> BString {
+    let Some(limit) = object_path_max(model, target) else {
+        return name;
+    };
+    let root_len = model.dir(DirId::ROOT).binary_dir.len();
+    let full_len = |candidate: &[u8]| {
+        let rel_len = if obj_dir.is_empty() {
+            candidate.len()
+        } else {
+            obj_dir.len() + 1 + candidate.len()
+        };
+        if root_len == 0 {
+            rel_len
+        } else {
+            root_len + 1 + rel_len
+        }
+    };
+    if full_len(&name) <= limit {
+        return name;
+    }
+    if let Some(slash) = name.iter().rposition(|&byte| byte == b'/') {
+        let (dir_part, rest) = name.split_at(slash);
+        let file_part = rest.get(1..).unwrap_or_default();
+        if dir_part.len() > 32 {
+            let hash = HashAlgo::Md5.hex_digest(dir_part);
+            let shortened: BString = [hash.as_bytes(), b"/", file_part].concat().into();
+            if full_len(&shortened) <= limit {
+                return shortened;
+            }
+        }
+    }
+    if name.len() > 32 + suffix.len() {
+        let hash = HashAlgo::Md5.hex_digest(&name);
+        return [hash.as_bytes(), suffix].concat().into();
+    }
+    name
 }
 
 /// Return the object file path that the File API codemodel reports for an
@@ -539,6 +657,16 @@ fn object_name(
     short: bool,
     custom_install_name: Option<&[u8]>,
 ) -> BString {
+    object_name_with_suffix(model, target, source, short, custom_install_name).0
+}
+
+fn object_name_with_suffix<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    source: &[u8],
+    short: bool,
+    custom_install_name: Option<&[u8]>,
+) -> (BString, &'a [u8]) {
     let dir = model.dir(target.dir);
     let root = model.dir(DirId::ROOT);
     let absolute = model_path(&join(&dir.source_dir, source)).normalize();
@@ -587,10 +715,10 @@ fn object_name(
     if short {
         let hash_input = relative.unwrap_or_else(|| absolute.normalize());
         let hash = sha3_prefix(&hash_input, 8);
-        return [hash.as_bytes(), suffix].concat().into();
+        return ([hash.as_bytes(), suffix].concat().into(), suffix);
     }
     if let Some(name) = custom_install_name.filter(|name| !name.is_empty()) {
-        return [name, suffix].concat().into();
+        return ([name, suffix].concat().into(), suffix);
     }
 
     if matches!(
@@ -599,7 +727,7 @@ fn object_name(
     ) && let Ok(name) = crate::sources::custom_object_name(model, target.dir, source)
         && !name.is_empty()
     {
-        return [name.as_slice(), suffix].concat().into();
+        return ([name.as_slice(), suffix].concat().into(), suffix);
     }
 
     let name = relative.unwrap_or_else(|| absolute.normalize());
@@ -610,7 +738,7 @@ fn object_name(
         }
     }
     safe.extend_from_slice(suffix);
-    safe.into()
+    (safe.into(), suffix)
 }
 
 pub(super) fn object_install_directory(
@@ -703,6 +831,24 @@ pub fn linker_language<'a>(
 /// from directory variable snapshots and the cache.
 #[must_use]
 pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
+    collect_metadata_inner(model, None)
+}
+
+/// Collect listfiles and compiler data from the model, pruning configure-input
+/// listfiles that no longer exist on `host` at generation time (matching CMake's
+/// pruning of deleted temporary probe / `configure_file` inputs).
+#[must_use]
+pub(crate) fn collect_metadata_with_host(
+    model: &ProjectModel,
+    host: &dyn rcmake_host::Host,
+) -> ConfigureMetadata {
+    collect_metadata_inner(model, Some(host))
+}
+
+fn collect_metadata_inner(
+    model: &ProjectModel,
+    host: Option<&dyn rcmake_host::Host>,
+) -> ConfigureMetadata {
     let mut listfiles = IndexSet::new();
     let mut languages = IndexMap::new();
     for (dir, directory) in model.dirs() {
@@ -711,6 +857,20 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
             if let Some(language) = compiler_language(key) {
                 languages.entry(language).or_insert(dir);
             }
+        }
+    }
+    if let Some(host) = host {
+        let root_src = &model.dir(DirId::ROOT).source_dir;
+        let exists = |path: &BString| {
+            let native = if rcmake_host::path::to_native(path).is_absolute() {
+                rcmake_host::path::to_native(path)
+            } else {
+                rcmake_host::path::to_native(&join(root_src, path))
+            };
+            host.metadata(&native, rcmake_host::Follow::Yes).is_ok()
+        };
+        if listfiles.iter().any(exists) {
+            listfiles.retain(exists);
         }
     }
     for key in model
@@ -783,6 +943,18 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
             .enumerate()
             .filter_map(|(step, command)| command.job_server_aware.then_some(step))
             .collect(),
+        ignore_compile_warning_as_error: definition(
+            model,
+            DirId::ROOT,
+            b"_RCMAKE_NO_WARNING_AS_ERROR",
+        )
+        .is_some_and(|value| truth::is_on(value)),
+        ignore_link_warning_as_error: definition(
+            model,
+            DirId::ROOT,
+            b"_RCMAKE_IGNORE_LINK_WARNING_AS_ERROR",
+        )
+        .is_some_and(|value| truth::is_on(value)),
         ..ConfigureMetadata::default()
     }
 }

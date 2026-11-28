@@ -599,9 +599,17 @@ impl FileApi<'_, '_> {
                 step.insert("language".into(), Value::string(link.language.clone()));
             }
             let mut fragments = Vec::new();
+            let mut post_flags = Vec::new();
             if let Some(raw) = raw {
-                let (flags, ipo) = codemodel_link_flags(self.model, raw, &target.config, link)
-                    .map_err(|error| GenError::Invalid(error.to_string().into()))?;
+                let (flags, extra_post_flags, ipo) = codemodel_link_flags(
+                    self.model,
+                    target.id,
+                    raw,
+                    &target.config,
+                    link,
+                    Some(usage),
+                )
+                .map_err(|error| GenError::Invalid(error.to_string().into()))?;
                 if ipo {
                     step.insert("lto".into(), Bool(true));
                 }
@@ -611,6 +619,7 @@ impl FileApi<'_, '_> {
                         ("fragment", Value::string(flags)),
                     ])
                 }));
+                post_flags = extra_post_flags;
             }
             let framework_flags: Vec<_> = link
                 .fragments
@@ -644,6 +653,12 @@ impl FileApi<'_, '_> {
                         Object(item)
                     }),
             );
+            fragments.extend(post_flags.into_iter().map(|flags| {
+                object([
+                    ("role", Value::string("flags")),
+                    ("fragment", Value::string(flags)),
+                ])
+            }));
             if !static_archive {
                 let mut runtime_paths_frags = Vec::new();
                 let mut runtime_libs_frags = Vec::new();

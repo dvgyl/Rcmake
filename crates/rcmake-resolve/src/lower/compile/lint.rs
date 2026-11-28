@@ -14,6 +14,16 @@ use crate::{
     usage::{UsageResolver, handle},
 };
 
+fn quote_for_host(arg: &[u8], windows: bool) -> BString {
+    if windows {
+        let mut out = Vec::new();
+        rcmake_base::shell::windows_argument(arg, &mut out, false);
+        out.into()
+    } else {
+        quote(arg)
+    }
+}
+
 pub(super) fn launch(
     model: &ProjectModel,
     target: &Target,
@@ -22,6 +32,7 @@ pub(super) fn launch(
     skip_file_set_linting: Option<bool>,
     usage: &mut UsageResolver<'_>,
 ) -> Result<(Invocation, Option<BString>), ResolveError> {
+    let windows = super::super::shell::windows_host(model, target.dir);
     let launchers = compile.tool_prefix(model, target, b"_COMPILER_LAUNCHER", usage)?;
     let args = if let Some(source) = compile.source
         && matches!(
@@ -40,7 +51,7 @@ pub(super) fn launch(
     };
     let co_compile = !args.is_empty();
     let launcher_shell = (!co_compile && !launchers.is_empty())
-        .then(|| join_words(launchers.iter().map(|arg| quote(arg))));
+        .then(|| join_words(launchers.iter().map(|arg| quote_for_host(arg, windows))));
     let mut prefix = Vec::new();
     if !co_compile {
         prefix.extend(launchers);
@@ -63,7 +74,7 @@ pub(super) fn launch(
     }
     let has_simple_argv =
         simple_args(&invocation.shell).is_some_and(|args| args == invocation.argv);
-    let prefix_shell = has_simple_argv.then(|| {
+    let prefix_shell = (!windows && has_simple_argv).then(|| {
         join_words(prefix.iter().enumerate().map(|(index, arg)| {
             if co_compile
                 && index >= 3
@@ -77,7 +88,9 @@ pub(super) fn launch(
     });
     prefix.extend(invocation.argv);
     let mut command = direct(prefix, invocation.working_dir);
-    if let Some(prefix_shell) = prefix_shell {
+    if windows {
+        command.shell = join_words(command.argv.iter().map(|arg| quote_for_host(arg, true)));
+    } else if let Some(prefix_shell) = prefix_shell {
         command.shell = join_words([prefix_shell, invocation.shell]);
     }
     Ok((command, launcher_shell))

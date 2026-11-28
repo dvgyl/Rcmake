@@ -333,3 +333,199 @@ fn link_event_byproducts_are_cleaned_without_forcing_relink_outputs()
     );
     Ok(())
 }
+
+#[test]
+fn nmake_dialect_emits_windows_nmake_and_cmd_syntax() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new("/build");
+    let host = PureHost::new(root.into(), "/tools/cmake.exe".into());
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("D:/src (x86)".into(), "/build".into());
+    let sub = model.add_directory(
+        DirId::ROOT,
+        "D:/src (x86)/sub".into(),
+        "/build/sub".into(),
+        Default::default(),
+    )?;
+    let target = rcmake_model::Target::new(
+        "app".into(),
+        rcmake_model::TargetKind::Executable,
+        rcmake_model::TargetOrigin::Normal,
+        sub,
+        Default::default(),
+        Default::default(),
+    );
+    model.add_target(target)?;
+
+    let mut result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: vec![
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["generated/first.h".into(), "generated/second.h".into()],
+                    depends: vec!["D:/src (x86)/input.txt".into()],
+                    comment: Some("Generate headers".into()),
+                    invocations: vec![Invocation {
+                        argv: vec![
+                            "cmake".into(),
+                            "-E".into(),
+                            "echo".into(),
+                            "hello world".into(),
+                        ],
+                        working_dir: Some("sub dir".into()),
+                        ..Invocation::default()
+                    }],
+                    depfile: Some("generated/custom.d".into()),
+                    ..CustomStep::default()
+                }),
+                BuildStep::Compile {
+                    byproducts: Vec::new(),
+                    compile_input: None,
+                    object: "CMakeFiles/app.dir/main.c.obj".into(),
+                    source: "D:/src (x86)/main.c".into(),
+                    invocation: invocation("cl /nologo /c \"D:/src (x86)/main.c\""),
+                    depfile: Some("CMakeFiles/app.dir/main.c.d".into()),
+                    modmap: None,
+                    dyndep: None,
+                },
+            ],
+            targets: vec![graph_target("app", vec![0, 1], Vec::new(), true)],
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    result.metadata.cmake_command = Some("D:/Program Files/CMake/bin/cmake.exe".into());
+    result.metadata.listfiles = vec!["D:/src (x86)/CMakeLists.txt".into()];
+
+    generate_nmake_with_model(&result, &host, root, &model)?;
+
+    let top = read(&host, &root.join("Makefile"));
+    assert!(top.contains("SHELL = cmd.exe\n"), "{top}");
+    assert!(top.contains("!IF \"$(VERBOSE)\" == \"\"\n"), "{top}");
+    assert!(top.contains("MAKE_SILENT = /nologo\n"), "{top}");
+    assert!(top.contains("!IFNDEF CMAKE_COMMAND\n"), "{top}");
+    assert!(
+        top.contains("\"D:/Program Files/CMake/bin/cmake.exe\""),
+        "{top}"
+    );
+    assert!(
+        top.contains("$(CMAKE_COMMAND) -E touch CMakeFiles/rcmake-regenerate.stamp"),
+        "{top}"
+    );
+    assert!(
+        top.contains("@$(CMAKE_COMMAND) -E echo \"... app\""),
+        "{top}"
+    );
+    for forbidden in [
+        ".PHONY:",
+        ".NOTPARALLEL:",
+        "SHELL = /bin/sh",
+        "export ",
+        "?=",
+        "printf ",
+    ] {
+        assert!(
+            !top.contains(forbidden),
+            "unexpected GNU Make syntax {forbidden} in Makefile:\n{top}"
+        );
+    }
+
+    let dispatch = read(&host, &root.join("CMakeFiles/Makefile2"));
+    assert!(dispatch.contains("!IFNDEF CMAKE_COMMAND\n"), "{dispatch}");
+    assert!(
+        dispatch.contains(
+            "$(MAKE) $(MAKE_SILENT) -f \"CMakeFiles/app.dir/build.make\" -$(MAKEFLAGS) VERBOSE=$(VERBOSE) \"CMakeFiles/app.dir/all\""
+        ),
+        "{dispatch}"
+    );
+    assert!(dispatch.contains("\"Built target app\""), "{dispatch}");
+    assert!(!dispatch.contains(".PHONY:"), "{dispatch}");
+
+    let build = read(&host, &root.join("CMakeFiles/app.dir/build.make"));
+    assert!(build.contains("\"D:/src (x86)/main.c\""), "{build}");
+    assert!(
+        build.contains("$(CMAKE_COMMAND) -E make_directory \"generated\""),
+        "{build}"
+    );
+    assert!(
+        build.contains("$(CMAKE_COMMAND) -E rm -f \"generated/first.h\""),
+        "{build}"
+    );
+    assert!(
+        build.contains("cd /d \"sub dir\" && \"cmake\" \"-E\" \"echo\" \"hello world\""),
+        "{build}"
+    );
+    assert!(
+        build.contains("!IF !EXIST(\"generated/second.h\")\n"),
+        "{build}"
+    );
+    assert!(
+        build.contains("if not exist \"generated/second.h\" exit /b 1\n"),
+        "{build}"
+    );
+    assert!(
+        build.contains(
+            "!IF EXIST(\"generated/custom.d\")\n!INCLUDE \"generated/custom.d\"\n!ENDIF\n"
+        ),
+        "{build}"
+    );
+    for forbidden in [
+        ".PHONY:",
+        ".DELETE_ON_ERROR:",
+        "mkdir -p",
+        "rm -f --",
+        "ifeq (",
+        "-include ",
+        "test -e",
+        "CDPATH=",
+    ] {
+        assert!(
+            !build.contains(forbidden),
+            "unexpected Unix syntax {forbidden} in build.make:\n{build}"
+        );
+    }
+
+    let sub_makefile = read(&host, &root.join("sub/Makefile"));
+    assert!(
+        sub_makefile.contains(
+            "cd /d \"/build\" && $(MAKE) $(MAKE_SILENT) -f \"Makefile\" -$(MAKEFLAGS) VERBOSE=$(VERBOSE) \"sub/all\""
+        ),
+        "{sub_makefile}"
+    );
+    assert!(!sub_makefile.contains("$(MAKE) -C"), "{sub_makefile}");
+
+    let dir_info = read(
+        &host,
+        &root.join("CMakeFiles/CMakeDirectoryInformation.cmake"),
+    );
+    assert!(dir_info.contains("\"NMake Makefiles\""), "{dir_info}");
+    assert!(!dir_info.contains("CMAKE_FORCE_UNIX_PATHS"), "{dir_info}");
+    Ok(())
+}
+
+#[test]
+fn nmake_adds_space_before_colon_for_single_letter_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new("/build");
+    let host = PureHost::new(root.into(), "/tools/cmake.exe".into());
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            targets: vec![graph_target("x", Vec::new(), Vec::new(), true)],
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+
+    generate_nmake_makefiles(&result, &host, root)?;
+    let nmake_top = read(&host, &root.join("Makefile"));
+    assert!(
+        nmake_top.contains("\nx : cmake_check_build_system\n"),
+        "{nmake_top}"
+    );
+
+    generate_unix_makefiles(&result, &host, root)?;
+    let unix_top = read(&host, &root.join("Makefile"));
+    assert!(
+        unix_top.contains("\nx: cmake_check_build_system\n"),
+        "{unix_top}"
+    );
+    Ok(())
+}

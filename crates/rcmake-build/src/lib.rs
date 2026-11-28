@@ -627,6 +627,7 @@ fn run_with_env(
             stderr: Output::SharedWithStdout,
             timeout: Some(Duration::from_secs(120)),
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     );

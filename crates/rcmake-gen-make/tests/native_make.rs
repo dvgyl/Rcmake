@@ -74,6 +74,7 @@ fn run(host: &NativeHost, cwd: &Path, program: &str, args: &[&str]) -> String {
                 stderr: Output::Capture,
                 timeout: Some(Duration::from_secs(30)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

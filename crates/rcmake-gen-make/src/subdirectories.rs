@@ -7,19 +7,36 @@ use rcmake_model::{DirId, ProjectModel, TargetId};
 use rcmake_resolve::{GenerationResult, usage::UsageResolver};
 
 use super::{
-    BString, GenError, Host, MAKEFILE2, Path, Target, check_make_path, make_recipe_text, makefile,
-    path, phony, quote_always, recursive_make, write_makefile,
+    BString, GenError, Host, MAKEFILE2, MakeDialect, Path, Target, check_make_path_for,
+    make_recipe_text_for, makefile_header, path, phony_for, quote_arg, recursive_make_for,
+    write_makefile,
 };
 
+pub(super) struct Context<'a, 't> {
+    pub(super) host: &'a dyn Host,
+    pub(super) build: &'a Path,
+    pub(super) model: &'a ProjectModel,
+    pub(super) result: &'a GenerationResult,
+    pub(super) targets: &'a [Target<'t>],
+    pub(super) cmake: &'a [u8],
+    pub(super) dialect: MakeDialect,
+}
+
 pub(super) fn write(
-    host: &dyn Host,
-    build: &Path,
-    model: &ProjectModel,
-    result: &GenerationResult,
-    targets: &[Target<'_>],
-    (top, dispatch): (&mut Vec<u8>, &mut Vec<u8>),
+    ctx: Context<'_, '_>,
+    top: &mut Vec<u8>,
+    dispatch: &mut Vec<u8>,
 ) -> Result<(), GenError> {
-    let root = path::from_native(build);
+    let Context {
+        host,
+        build,
+        model,
+        result,
+        targets,
+        cmake,
+        dialect,
+    } = ctx;
+    let root = path::from_native_cmake(build);
     let mut directories = BTreeMap::new();
     let mut children_by_dir: HashMap<DirId, Vec<DirId>> = HashMap::new();
     for (id, dir) in model.dirs().skip(1) {
@@ -66,7 +83,7 @@ pub(super) fn write(
         .map(|graph| graph.config.clone())
         .unwrap_or_default();
     for (&id, relative) in &directories {
-        let mut wrapper = makefile();
+        let mut wrapper = makefile_header(dialect, Some(cmake))?;
         let mut goals = Vec::new();
         let dir_children = children_by_dir
             .get(&id)
@@ -78,16 +95,21 @@ pub(super) fn write(
             .unwrap_or_default();
         for name in [b"all".as_slice(), b"clean", b"preinstall"] {
             let goal = Lexical::new(relative).append(name);
-            check_make_path(&goal)?;
+            check_make_path_for(dialect, &goal)?;
             let prereq = match name {
                 b"all" => Some(BString::from("cmake_check_build_system")),
                 b"preinstall" => Some(Lexical::new(relative).append(b"all")),
                 _ => None,
             };
-            phony(top, &goal, prereq.as_ref().map(|value| value.as_slice()));
-            recursive_make(top, MAKEFILE2, &goal);
-            phony(&mut wrapper, name, []);
-            from_root(&mut wrapper, &root, b"Makefile", &goal)?;
+            phony_for(
+                dialect,
+                top,
+                &goal,
+                prereq.as_ref().map(|value| value.as_slice()),
+            );
+            recursive_make_for(dialect, top, MAKEFILE2, &goal);
+            phony_for(dialect, &mut wrapper, name, []);
+            from_root(dialect, &mut wrapper, &root, b"Makefile", &goal)?;
 
             let mut needs = Vec::new();
             if name != b"preinstall" {
@@ -138,23 +160,33 @@ pub(super) fn write(
                     }
                 }
             }
-            phony(dispatch, &goal, needs.iter().map(|value| value.as_slice()));
+            phony_for(
+                dialect,
+                dispatch,
+                &goal,
+                needs.iter().map(|value| value.as_slice()),
+            );
             goals.push(BString::from(name));
         }
         for &(_, _, target) in dir_targets {
-            phony(&mut wrapper, target.name, []);
-            from_root(&mut wrapper, &root, b"Makefile", target.name)?;
+            phony_for(dialect, &mut wrapper, target.name, []);
+            from_root(dialect, &mut wrapper, &root, b"Makefile", target.name)?;
             let fast = [target.name, b"/fast"].concat();
-            phony(&mut wrapper, &fast, []);
-            from_root(&mut wrapper, &root, &target.file, &target.goal)?;
+            phony_for(dialect, &mut wrapper, &fast, []);
+            from_root(dialect, &mut wrapper, &root, &target.file, &target.goal)?;
             goals.push(target.name.into());
         }
-        phony(&mut wrapper, b"help", []);
+        phony_for(dialect, &mut wrapper, b"help", []);
         for goal in goals {
-            wrapper.extend_from_slice(b"\t@printf '%s\\n' ");
-            make_recipe_text(
+            if dialect.is_nmake() {
+                wrapper.extend_from_slice(b"\t@$(CMAKE_COMMAND) -E echo ");
+            } else {
+                wrapper.extend_from_slice(b"\t@printf '%s\\n' ");
+            }
+            make_recipe_text_for(
+                dialect,
                 &mut wrapper,
-                &quote_always(&[b"... ", goal.as_slice()].concat()),
+                &quote_arg(dialect, &[b"... ", goal.as_slice()].concat()),
             )?;
             wrapper.push(b'\n');
         }
@@ -168,13 +200,27 @@ pub(super) fn write(
     Ok(())
 }
 
-fn from_root(out: &mut Vec<u8>, root: &[u8], file: &[u8], goal: &[u8]) -> Result<(), GenError> {
-    out.extend_from_slice(b"\t$(SILENT)$(MAKE) -C ");
-    make_recipe_text(out, &quote_always(root))?;
-    out.extend_from_slice(b" -f ");
-    make_recipe_text(out, &quote_always(file))?;
-    out.push(b' ');
-    make_recipe_text(out, &quote_always(goal))?;
+fn from_root(
+    dialect: MakeDialect,
+    out: &mut Vec<u8>,
+    root: &[u8],
+    file: &[u8],
+    goal: &[u8],
+) -> Result<(), GenError> {
+    if dialect.is_nmake() {
+        out.extend_from_slice(b"\t$(SILENT)cd /d ");
+        make_recipe_text_for(dialect, out, &quote_arg(dialect, root))?;
+        out.extend_from_slice(b" && $(MAKE) $(MAKE_SILENT) -f ");
+        make_recipe_text_for(dialect, out, &quote_arg(dialect, file))?;
+        out.extend_from_slice(b" -$(MAKEFLAGS) VERBOSE=$(VERBOSE) ");
+    } else {
+        out.extend_from_slice(b"\t$(SILENT)$(MAKE) -C ");
+        make_recipe_text_for(dialect, out, &quote_arg(dialect, root))?;
+        out.extend_from_slice(b" -f ");
+        make_recipe_text_for(dialect, out, &quote_arg(dialect, file))?;
+        out.push(b' ');
+    }
+    make_recipe_text_for(dialect, out, &quote_arg(dialect, goal))?;
     out.push(b'\n');
     Ok(())
 }

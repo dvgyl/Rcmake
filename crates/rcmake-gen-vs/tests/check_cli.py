@@ -126,7 +126,7 @@ def check_projects(tree, version):
     for element, text in [
         ("PreprocessorDefinitions", "SOURCE_DEBUG=1"),
         ("AdditionalIncludeDirectories", "$(VCInstallDir)include"),
-        ("AdditionalOptions", "/FI$(ProjectDir)pch.h"),
+        ("ForcedIncludeFiles", "$(ProjectDir)pch.h"),
     ]:
         values = main.findall(f"./m:{element}", NS)
         assert len(values) == 1 and text in values[0].text, element

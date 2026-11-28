@@ -159,11 +159,14 @@ pub(crate) fn providers(
             current: Some(handle(id)),
             ..EvalContext::default()
         };
-        let options = usage
-            .collect_for_result(id, UsageField::CompileOptions, &context)?
-            .entries;
         let features = usage
             .collect_for_result(id, UsageField::CompileFeatures, &context)?
+            .entries;
+        if !super::target_needs_cxx_dyndep(model, target, &features) {
+            continue;
+        }
+        let options = usage
+            .collect_for_result(id, UsageField::CompileOptions, &context)?
             .entries;
         let (standard, extensions, required) = lower::cxx_standard_mode(model, target, &features);
         let get = |name: &[u8]| lower::definition(model, target.dir, name);
@@ -244,6 +247,9 @@ pub(crate) fn providers(
         };
         bindings.insert(id, provider);
     }
+    if bindings.is_empty() {
+        return Ok(None);
+    }
     Ok(Some((overlay, bindings)))
 }
 
@@ -262,7 +268,10 @@ fn on_off(value: bool) -> BString {
     if value { "ON" } else { "OFF" }.into()
 }
 
-fn compatibility_options(options: &[BT<BString>], frontend: Option<&BString>) -> Vec<BString> {
+pub(super) fn compatibility_options(
+    options: &[BT<BString>],
+    frontend: Option<&BString>,
+) -> Vec<BString> {
     let mut flags = options.iter().map(|option| &option.value);
     let mut compatible = Vec::new();
     while let Some(flag) = flags.next() {

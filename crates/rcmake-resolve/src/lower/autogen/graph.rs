@@ -433,13 +433,14 @@ fn add_autogen(
             }
         }
     }
-    let mut tool_targets = IndexSet::new();
     for tool in [&plan.moc, &plan.uic] {
         order_tool(model, tool, &mut ordering);
-        order_tool(model, tool, &mut tool_targets);
-        tool_files.extend(tool_dependencies(tool, plan.cross && plan.better));
+        tool_files.extend(tool_file_dependencies(
+            model,
+            tool,
+            plan.cross && plan.better,
+        ));
     }
-    tool_files.extend(tool_targets);
     if plan.moc.enabled {
         let file = plan.compilation_file(configured);
         add_source(
@@ -562,9 +563,12 @@ fn add_autogen(
 
     if plan.use_stamp {
         let order_name = concatenate(&[&origin.name, b"_autogen_timestamp_deps"]);
-        let mut order = command(model, origin, CustomCommandKind::Output);
-        order.depends = backtrace(origin, order_files);
-        let order_id = add_utility(model, origin.dir, origin, &order_name, folder, order)?;
+        let order = (!order_files.is_empty()).then(|| {
+            let mut order = command(model, origin, CustomCommandKind::Output);
+            order.depends = backtrace(origin, order_files);
+            order
+        });
+        let order_id = add_utility_optional(model, origin.dir, origin, &order_name, folder, order)?;
         for dep in ordering {
             add_utility_dep(model, order_id, origin, dep)?;
         }
@@ -657,12 +661,10 @@ fn add_rcc(
                 .iter()
                 .flat_map(|(config, paths)| paths.iter().map(|path| in_config(config, path))),
         );
-        driver.depends.extend(backtrace(
-            origin,
-            files
-                .chain(ordering)
-                .chain(tool_dependencies(&plan.rcc, plan.cross && plan.better)),
-        ));
+        let rcc_deps = tool_file_dependencies(model, &plan.rcc, plan.cross && plan.better);
+        driver
+            .depends
+            .extend(backtrace(origin, files.chain(rcc_deps)));
         driver.outputs = backtrace(origin, [job.output.clone()]);
         model.add_command(driver).map_err(model_error)?;
         Ok(None)
@@ -681,23 +683,58 @@ fn order_tool(model: &ProjectModel, tool: &ToolPlan, ordering: &mut IndexSet<BSt
     }
 }
 
-fn tool_dependencies(tool: &ToolPlan, command_config: bool) -> impl Iterator<Item = BString> + '_ {
-    std::iter::once(tool.executable.default.clone())
-        .chain(
-            tool.executable
-                .per_config
+/// Emit one file/target dependency representation per configuration for an
+/// enabled AUTOGEN tool, avoiding duplicate `(target, artifact)` entries in the
+/// same configuration while preserving per-configuration overrides (e.g. a
+/// target in Debug and an external executable path in Release).
+fn tool_file_dependencies(
+    model: &ProjectModel,
+    tool: &ToolPlan,
+    command_config: bool,
+) -> Vec<BString> {
+    if !tool.enabled {
+        return Vec::new();
+    }
+    let mut deps = Vec::new();
+    let wrap_config = |config: &ConfigId, value: &BString| {
+        let path = in_config(config, value);
+        if command_config {
+            concatenate(&[b"$<COMMAND_CONFIG:", &path, b">"])
+        } else {
+            path
+        }
+    };
+    if tool.executable.per_config.is_empty() {
+        if !tool.executable.default.is_empty() {
+            deps.push(tool.executable.default.clone());
+        } else {
+            let mut names = IndexSet::new();
+            order_tool(model, tool, &mut names);
+            deps.extend(names);
+        }
+        return deps;
+    }
+    for (config, file) in &tool.executable.per_config {
+        if !file.is_empty() {
+            deps.push(wrap_config(config, file));
+            continue;
+        }
+        let mut names = IndexSet::new();
+        for id in tool.dependency.into_iter().chain(
+            tool.artifact_deps
                 .iter()
-                .filter(|(_, file)| !file.is_empty())
-                .map(move |(config, file)| {
-                    let path = in_config(config, file);
-                    if command_config {
-                        concatenate(&[b"$<COMMAND_CONFIG:", &path, b">"])
-                    } else {
-                        path
-                    }
-                }),
-        )
-        .filter(|file| !file.is_empty())
+                .filter(|(_, dep_cfg)| dep_cfg == config)
+                .map(|(id, _)| *id),
+        ) {
+            if let Some(tool_target) = model.target(id) {
+                names.insert(tool_target.name.clone());
+            }
+        }
+        for name in names {
+            deps.push(wrap_config(config, &name));
+        }
+    }
+    deps
 }
 
 fn command(model: &ProjectModel, origin: &Target, kind: CustomCommandKind) -> CustomCommand {
@@ -720,7 +757,18 @@ fn add_utility(
     origin: &Target,
     name: &BString,
     folder: &BString,
-    mut command: CustomCommand,
+    command: CustomCommand,
+) -> Result<TargetId, ResolveError> {
+    add_utility_optional(model, dir, origin, name, folder, Some(command))
+}
+
+fn add_utility_optional(
+    model: &mut ProjectModel,
+    dir: DirId,
+    origin: &Target,
+    name: &BString,
+    folder: &BString,
+    command: Option<CustomCommand>,
 ) -> Result<TargetId, ResolveError> {
     let mut target = Target::new(
         name.clone(),
@@ -741,9 +789,11 @@ fn add_utility(
     let id = model.add_target(target).map_err(|error| {
         ResolveError::Message(format!("Cannot add AUTOGEN target {name}. {error}").into())
     })?;
-    command.kind = CustomCommandKind::Utility(id);
-    command.dir = dir;
-    model.add_command(command).map_err(model_error)?;
+    if let Some(mut command) = command {
+        command.kind = CustomCommandKind::Utility(id);
+        command.dir = dir;
+        model.add_command(command).map_err(model_error)?;
+    }
     Ok(id)
 }
 

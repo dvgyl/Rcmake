@@ -126,6 +126,20 @@ endif()
             out.extend_from_slice(b")\nendif()\n\n");
         }
     }
+    if definitions(b"CMAKE_GENERATOR").is_some_and(|generator| generator == b"Xcode")
+        && let Some(platform) = xcode_embedded_platform(&definitions)
+    {
+        let top_binary_dir = definitions(b"CMAKE_BINARY_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map_or(binary_dir, |dir| dir.as_slice());
+        out.extend_from_slice(b"set(CMAKE_BINARY_DIR ");
+        quote(&mut out, top_binary_dir);
+        out.extend_from_slice(b")\n\nif(NOT PLATFORM_NAME)\n  if(NOT \"$ENV{PLATFORM_NAME}\" STREQUAL \"\")\n    set(PLATFORM_NAME \"$ENV{PLATFORM_NAME}\")\n  endif()\n  if(NOT PLATFORM_NAME)\n    set(PLATFORM_NAME ");
+        out.extend_from_slice(platform);
+        out.extend_from_slice(b")\n  endif()\nendif()\n\nif(NOT EFFECTIVE_PLATFORM_NAME)\n  if(NOT \"$ENV{EFFECTIVE_PLATFORM_NAME}\" STREQUAL \"\")\n    set(EFFECTIVE_PLATFORM_NAME \"$ENV{EFFECTIVE_PLATFORM_NAME}\")\n  endif()\n  if(NOT EFFECTIVE_PLATFORM_NAME)\n    set(EFFECTIVE_PLATFORM_NAME -");
+        out.extend_from_slice(platform);
+        out.extend_from_slice(b")\n  endif()\nendif()\n\n");
+    }
     for action in &manifest.actions {
         render_action(&mut out, action, options)?;
     }
@@ -133,6 +147,39 @@ endif()
         render_manifest(&mut out, binary_dir);
     }
     Ok(out)
+}
+
+/// Return the default Xcode embedded Apple platform name (such as `iphoneos`)
+/// when generating install scripts for embedded Apple targets under Xcode.
+fn xcode_embedded_platform<'a>(
+    definitions: &impl Fn(&[u8]) -> Option<&'a BString>,
+) -> Option<&'static [u8]> {
+    if let Some(sdk) = definitions(b"CMAKE_OSX_SYSROOT").filter(|value| !value.is_empty()) {
+        let name = rcmake_base::path_lex::Lexical::new(sdk)
+            .filename()
+            .to_ascii_lowercase();
+        for (prefix, platform) in [
+            (b"iphoneos".as_slice(), b"iphoneos".as_slice()),
+            (b"iphonesimulator", b"iphonesimulator"),
+            (b"appletvos", b"appletvos"),
+            (b"appletvsimulator", b"appletvsimulator"),
+            (b"watchos", b"watchos"),
+            (b"watchsimulator", b"watchsimulator"),
+            (b"xros", b"xros"),
+            (b"xrsimulator", b"xrsimulator"),
+        ] {
+            if name.starts_with(prefix) {
+                return Some(platform);
+            }
+        }
+    }
+    match definitions(b"CMAKE_SYSTEM_NAME").map(|value| value.as_slice()) {
+        Some(b"iOS") => Some(b"iphoneos"),
+        Some(b"tvOS") => Some(b"appletvos"),
+        Some(b"watchOS") => Some(b"watchos"),
+        Some(b"visionOS") => Some(b"xros"),
+        _ => None,
+    }
 }
 
 /// Return a serial include for a child install script.

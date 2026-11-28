@@ -1,7 +1,8 @@
 //! Path syntax and checks for evaluated usage properties.
 
 use rcmake_base::BString;
-use rcmake_model::{DirId, GeneratorKind, ProjectModel};
+use rcmake_host::Host;
+use rcmake_model::{DirId, ProjectModel};
 
 use super::{SourcePaths, UsageResolver};
 
@@ -24,23 +25,41 @@ impl UsageResolver<'_> {
     }
 }
 
-pub(super) fn windows_path_rules(
+fn windows_host_path_rules(model: &ProjectModel, dir: DirId, host: Option<&dyn Host>) -> bool {
+    if let Some(host_system) = crate::lower::definition(model, dir, b"CMAKE_HOST_SYSTEM_NAME") {
+        if host_system == b"CYGWIN" {
+            return false;
+        }
+        if !host_system.is_empty() {
+            return host_system.starts_with(b"Windows");
+        }
+    }
+    if let Some(host) = host {
+        return host.system().sysname.starts_with(b"Windows")
+            || model.dir(DirId::ROOT).source_dir.get(1) == Some(&b':');
+    }
+    cfg!(windows) || model.dir(DirId::ROOT).source_dir.get(1) == Some(&b':')
+}
+
+pub(crate) fn windows_path_rules(
     model: &ProjectModel,
     dir: DirId,
     paths: Option<&SourcePaths<'_>>,
 ) -> bool {
-    if crate::lower::definition(model, dir, b"CMAKE_SYSTEM_NAME")
-        .is_some_and(|name| name == b"CYGWIN")
-    {
-        return false;
-    }
-    paths.map_or(cfg!(windows), |paths| {
-        paths.host.system().sysname == b"Windows"
-    }) || crate::lower::definition(model, dir, b"CMAKE_HOST_SYSTEM_NAME")
-        .is_some_and(|name| name == b"Windows")
-        || model.dir(DirId::ROOT).source_dir.get(1) == Some(&b':')
-        || crate::lower::artifacts::is_dll_platform(model, dir)
-        || matches!(model.generator, Some(GeneratorKind::VisualStudio(_)))
+    windows_host_path_rules(model, dir, paths.map(|paths| paths.host))
+}
+
+pub(crate) fn full_path_for_model(model: &ProjectModel, dir: DirId, path: &[u8]) -> bool {
+    full_path(path, windows_host_path_rules(model, dir, None))
+}
+
+pub(crate) fn full_path_for_host(
+    model: &ProjectModel,
+    dir: DirId,
+    host: &dyn Host,
+    path: &[u8],
+) -> bool {
+    full_path(path, windows_host_path_rules(model, dir, Some(host)))
 }
 
 pub(crate) fn usage_path_is_full(
@@ -90,7 +109,7 @@ pub(super) fn interface_path_problem<'a>(
 }
 fn full_path(path: &[u8], windows: bool) -> bool {
     if windows {
-        path.get(1) == Some(&b':') || path.starts_with(b"/")
+        path.get(1) == Some(&b':') || matches!(path.first(), Some(b'/' | b'\\'))
     } else {
         matches!(path.first(), Some(b'/' | b'~'))
     }

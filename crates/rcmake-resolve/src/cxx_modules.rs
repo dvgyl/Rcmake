@@ -16,6 +16,9 @@ use crate::{
 };
 
 pub(crate) mod stdlib;
+pub(crate) mod synthetic;
+
+pub(crate) use synthetic::is_synthetic_provider;
 
 pub(crate) const STD_MODULE_TARGET: &[u8] = b"@cmake_cxx_std";
 
@@ -57,6 +60,7 @@ fn ninja_cxx_dyndep(model: &ProjectModel, paths: &SourcePaths<'_>) -> Option<boo
         stderr: Output::Capture,
         timeout: Some(std::time::Duration::from_secs(5)),
         tee: false,
+        default_error_mode: false,
     };
     match paths.generator_facts {
         Some(facts) => facts.ninja_cxx_dyndep(paths.host, &request),
@@ -232,6 +236,36 @@ fn allows_module_scanning(model: &ProjectModel, target: &Target, inputs: &Target
             .is_some_and(|value| supports_modules(value))
 }
 
+pub(crate) fn target_needs_cxx_dyndep(
+    model: &ProjectModel,
+    target: &Target,
+    features: &[rcmake_model::BT<BString>],
+) -> bool {
+    let supports_modules = |standard: &[u8]| matches!(standard, b"20" | b"23" | b"26");
+    let has_cxx20 = cxx_standard(model, target).is_some_and(|value| supports_modules(value))
+        || lower::required_standard(b"CXX", features).is_some_and(supports_modules);
+    if !has_cxx20 {
+        return false;
+    }
+    if let Some(setting) = target
+        .props
+        .get(b"CXX_SCAN_FOR_MODULES")
+        .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_SCAN_FOR_MODULES"))
+    {
+        return truth::is_on(setting);
+    }
+    target.policies.policies.get(PolicyId::new(155)) == PolicyStatus::New
+        && scan_rule(model, target).is_some_and(|rule| !rule.is_empty())
+        && matches!(
+            model.generator,
+            None | Some(
+                GeneratorKind::Ninja
+                    | GeneratorKind::NinjaMultiConfig
+                    | GeneratorKind::VisualStudio(_)
+            )
+        )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Module resolution uses source and target facts."
@@ -270,7 +304,7 @@ pub(crate) fn resolve_module_info(
                 UsageScope::Public => ModuleVisibility::Public,
                 UsageScope::Interface => ModuleVisibility::Interface,
             };
-            let bmi_only = is_std_provider(target)
+            let bmi_only = (is_std_provider(target) || is_synthetic_provider(target))
                 && lower::definition(model, target.dir, b"CMAKE_CXX_COMPILER_ID")
                     .is_none_or(|id| id != b"MSVC".as_slice());
             units.push(ModuleUnit {

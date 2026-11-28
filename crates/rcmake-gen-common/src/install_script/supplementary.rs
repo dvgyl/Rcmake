@@ -414,6 +414,7 @@ impl Outputs {
                         options
                             .destination
                             .as_deref()
+                            .filter(|destination| !destination.is_empty())
                             .map_or(default, Vec::as_slice),
                         None,
                     )?;

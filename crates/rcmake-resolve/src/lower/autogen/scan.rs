@@ -424,6 +424,7 @@ fn run_tool(
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(15)),
             tee: false,
+            default_error_mode: false,
         },
         RESOURCE_LIMIT,
     )

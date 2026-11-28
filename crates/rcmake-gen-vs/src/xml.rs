@@ -6,6 +6,7 @@ use std::fmt::Write;
 pub struct Writer {
     output: String,
     elements: Vec<String>,
+    empty_end: &'static str,
 }
 
 impl Writer {
@@ -21,6 +22,30 @@ impl Writer {
         Self {
             output,
             elements: Vec::new(),
+            empty_end: " />",
+        }
+    }
+
+    /// Close empty elements with `/>` and no space before it, as CMake
+    /// writes `.slnx` solutions.
+    #[must_use]
+    pub fn compact(mut self) -> Self {
+        self.empty_end = "/>";
+        self
+    }
+
+    /// Start a document without an XML declaration, as a .NET SDK-style
+    /// project file starts, with an optional byte order mark.
+    #[must_use]
+    pub fn without_declaration(bom: bool) -> Self {
+        Self {
+            output: if bom {
+                "\u{feff}".into()
+            } else {
+                String::new()
+            },
+            elements: Vec::new(),
+            empty_end: " />",
         }
     }
 
@@ -58,7 +83,8 @@ impl Writer {
     /// Write an empty element.
     pub fn empty(&mut self, name: &str, attrs: &[(&str, &str)]) {
         self.tag(name, attrs);
-        self.output.push_str(" />\r\n");
+        self.output.push_str(self.empty_end);
+        self.output.push_str("\r\n");
     }
 
     /// Write an element with text content.
@@ -106,6 +132,19 @@ pub(crate) fn escape(output: &mut String, value: &str, attribute: bool) {
     if start < value.len() {
         output.push_str(value.get(start..).unwrap_or_default());
     }
+}
+
+/// Return `true` when `value` can be an element name.
+///
+/// The rule is the ASCII part of the XML `NCName` rule: a letter or `_`
+/// first, then letters, digits, `_`, `.`, or `-`. A user value that fails,
+/// such as `My Tool` or `a:b`, must not become an element name.
+pub(crate) fn is_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
 }
 
 pub(crate) fn unescape_attribute(mut value: &str) -> String {

@@ -57,9 +57,10 @@ fn uuid_matches_cmake_namespace_and_reuses_cache() {
             props: Default::default(),
         },
     );
+    // CMake uses the cached value without a change of case.
     assert_eq!(
         guid::for_name(&model, "/out", "app"),
-        "{DEADBEEF-0000-4000-8000-000000000000}"
+        "{deadbeef-0000-4000-8000-000000000000}"
     );
 }
 
@@ -472,6 +473,8 @@ fn fixture(
         .insert("CMAKE_CONFIGURATION_TYPES".into(), "Debug;Release".into());
     root.props.set("CMAKE_TESTING_ENABLED".into(), "ON".into());
     root.props.set("VS_STARTUP_PROJECT".into(), "app".into());
+    // Policy CMP0143 is not set here, so the property turns folders on.
+    model.global.props.set("USE_FOLDERS".into(), "ON".into());
     model.add_install(InstallRule {
         dir: DirId::ROOT,
         backtrace: Default::default(),
@@ -801,10 +804,18 @@ fn check_fixture(version: VsVersion, platform: &str, host: &dyn Host, bin: &Path
     assert!(fallback.contains(">Level3</WarningLevel>"));
     assert!(fallback.contains(">MultiThreadedDebugDLL</RuntimeLibrary>"));
     assert!(!fallback.contains("/Fo"));
+    // As in CMake, `ZERO_CHECK` checks the stamps of all directories through
+    // a `.rule` file, and it has each directory stamp as an output.
     let zero = contents(host, bin, "ZERO_CHECK.vcxproj");
-    assert!(zero.contains("--regenerate-during-build"));
-    assert!(zero.contains("CMakeLists.txt"));
-    assert!(zero.contains("generate.stamp"));
+    for expected in [
+        "--check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file ",
+        r#"\generate.stamp.rule">"#,
+        r"CMakeFiles\generate.stamp</Outputs>",
+        ">Checking Build System</Message>",
+    ] {
+        assert!(zero.contains(expected), "{expected}\n{zero}");
+    }
+    assert!(!zero.contains("--regenerate-during-build"), "{zero}");
     let filters = contents(host, bin, "app.vcxproj.filters");
     for group in [
         "Code",
@@ -886,10 +897,8 @@ fn clcompile_emits_defaults_and_source_overrides_with_msbuild_properties() {
             "AdditionalIncludeDirectories",
             r"$(VCInstallDir)\include%3Bextra;%(AdditionalIncludeDirectories)",
         ),
-        (
-            "AdditionalOptions",
-            r#"%(AdditionalOptions) "/FI$(ProjectDir)pch.h""#,
-        ),
+        // As in the CMake flag table, `/FI` is the `ForcedIncludeFiles` list.
+        ("ForcedIncludeFiles", r"$(ProjectDir)pch.h"),
     ] {
         let expected = format!(
             "<{element} Condition=\"'$(Configuration)|$(Platform)'=='Debug|x64'\">{value}</{element}>"
@@ -977,7 +986,8 @@ fn nested_solutions_build_only_local_targets_and_their_dependencies() {
     )
     .expect("generate solutions");
     let solution = contents(&host, bin, "sub/Child.slnx");
-    assert!(solution.contains("Path=\"..\\dependency.vcxproj\""));
+    // CMake keeps `/` in the project paths of this format.
+    assert!(solution.contains("Path=\"../dependency.vcxproj\""));
     assert!(solution.contains("Path=\"child.vcxproj\""));
     assert!(solution.contains("Path=\"ALL_BUILD.vcxproj\""));
     assert!(!solution.contains("unrelated"));
@@ -1152,3 +1162,5 @@ fn make_dir_preserves_configuration_order() {
 }
 
 mod link;
+mod managed;
+mod runcmake;

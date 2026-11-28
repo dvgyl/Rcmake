@@ -5,7 +5,7 @@ pub(crate) mod msvc;
 
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
-use rcmake_genex::{ConfigId, EvalContext, evaluate};
+use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target};
 
 use super::artifacts::{compile_pdb, is_darwin};
@@ -113,14 +113,14 @@ fn compile_flag_parts(
     };
     leading.extend(policy.ipo_compile(ipo));
     let architectures = super::apple::arch::flags(model, target, config, language, architecture)?;
+    let mut usage = usage;
     let mut flags = Vec::new();
     flags.extend(policy.compile(position_independent));
     flags.extend(
-        msvc::debug_options(model, target, config, language)?
+        msvc::debug_options(model, target, config, language, usage.as_deref_mut())?
             .iter()
             .map(|option| quote(option)),
     );
-    let mut usage = usage;
     let quote_gpu = |flag: &BString| {
         if for_codemodel {
             codemodel_flag_quote(model, target, flag)
@@ -150,48 +150,16 @@ fn compile_flag_parts(
         )?);
     }
 
-    if let Some(default) = definition(model, target.dir, b"CMAKE_MSVC_RUNTIME_LIBRARY_DEFAULT")
-        .filter(|value| !value.is_empty())
-    {
-        let raw = target.props.get(b"MSVC_RUNTIME_LIBRARY").unwrap_or(default);
-        let target_id = model
-            .find_target(target.dir, &target.name)
-            .map(crate::usage::handle);
-        let context = EvalContext {
-            config: config.clone(),
-            head: target_id,
-            current: target_id,
-            language: Some(group.language.clone()),
-            ..EvalContext::default()
-        };
-        let evaluate_runtime = |usage: &mut UsageResolver<'_>| {
-            let ast = usage.parse_genex(raw)?;
-            evaluate(&ast, &context, &mut usage.host(target.dir))
-        };
-        let (runtime, _) = match &mut usage {
-            Some(usage) => evaluate_runtime(usage)?,
-            None => evaluate_runtime(&mut UsageResolver::new(model))?,
-        };
-        if !runtime.is_empty()
-            && let Some(options) = definition(
-                model,
-                target.dir,
-                &[
-                    b"CMAKE_",
-                    language,
-                    b"_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_",
-                    &runtime,
-                ]
-                .concat(),
-            )
-        {
-            flags.extend(
-                list::split(options, list::Empty::Drop)
-                    .iter()
-                    .map(|option| quote(option)),
-            );
-        }
-    }
+    flags.extend(
+        msvc::runtime_library(model, target, config, language, usage.as_deref_mut())?
+            .iter()
+            .map(|option| quote(option)),
+    );
+    flags.extend(
+        msvc::runtime_checks(model, target, config, language, usage.as_deref_mut())?
+            .iter()
+            .map(|option| quote(option)),
+    );
 
     // The target creation copied `CMAKE_<LANG>_VISIBILITY_PRESET`, so a later
     // directory value does not apply (`cmLocalGenerator::AddVisibilityPresetFlags`).
@@ -325,6 +293,31 @@ pub(crate) fn include_identity(path: &[u8]) -> BString {
 fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BString {
     let darwin = is_darwin(model, target.dir);
     let implicit = implicit_include_dirs(model, target, &group.language);
+    let configured_include = definition(
+        model,
+        target.dir,
+        &[b"CMAKE_INCLUDE_FLAG_", group.language.as_slice()].concat(),
+    );
+    let include_flag = configured_include
+        .filter(|value| !value.is_empty())
+        .map_or(b"-I".as_slice(), |value| value.as_slice());
+    let system_flag = match definition(
+        model,
+        target.dir,
+        &[b"CMAKE_INCLUDE_SYSTEM_FLAG_", group.language.as_slice()].concat(),
+    ) {
+        Some(value) if !value.is_empty() => value.as_slice(),
+        Some(_) => include_flag,
+        None => {
+            if super::artifacts::is_msvc(model, target.dir, &group.language)
+                || configured_include.is_some()
+            {
+                include_flag
+            } else {
+                b"-isystem "
+            }
+        }
+    };
     let mut paths = IndexSet::new();
     let mut frameworks = implicit_frameworks();
     join_words(group.includes.iter().filter_map(|include| {
@@ -338,14 +331,12 @@ fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BStr
                 framework_flag(model, target, &group.language, directory, include.system)
             });
         }
-        Some(if include.system {
-            join_words([
-                "-isystem".into(),
-                compile_argument(model, target, b"", &path),
-            ])
+        let flag = if include.system {
+            system_flag
         } else {
-            compile_argument(model, target, b"-I", &path)
-        })
+            include_flag
+        };
+        Some(compile_argument(model, target, flag, &path))
     }))
 }
 
@@ -1016,9 +1007,24 @@ fn finalize_compile_invocations_inner(
     let mut rule_launcher_prefix = None;
     if let Some(prefix) = lint::rule_launcher(model, target, launch, usage)? {
         let prefix = expand_rule(&prefix, lookup_paths);
+        let windows = super::shell::windows_host(model, target.dir);
         for invocation in &mut invocations {
             let working_dir = invocation.working_dir.take();
-            let shell = join_words([prefix.clone(), std::mem::take(&mut invocation.shell)]);
+            let body = if windows
+                && !invocation.argv.is_empty()
+                && !matches!(
+                    invocation.argv.as_slice(),
+                    [prog, flag, ..] if prog == b"sh" && flag == b"-c"
+                ) {
+                join_words(invocation.argv.iter().map(|arg| {
+                    let mut out = Vec::new();
+                    rcmake_base::shell::windows_argument(arg, &mut out, false);
+                    BString::from(out)
+                }))
+            } else {
+                std::mem::take(&mut invocation.shell)
+            };
+            let shell = join_words([prefix.clone(), body]);
             *invocation = command(shell);
             invocation.working_dir = working_dir;
         }

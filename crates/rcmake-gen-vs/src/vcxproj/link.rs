@@ -24,11 +24,18 @@ impl Context<'_> {
         ) {
             return;
         }
+        self.link_defaults(config);
+        // As in CMake, a target has no import library when the platform does
+        // not use them (`CMAKE_IMPORT_LIBRARY_SUFFIX` is empty) or when it has
+        // managed code only.
+        let import = fact
+            .and_then(|fact| fact.artifacts.import_file.as_ref())
+            .filter(|_| self.has_import_library());
+        if !self.has_import_library() {
+            config.link.take("ImportLibrary");
+        }
         for (property, file) in [
-            (
-                "ImportLibrary",
-                fact.and_then(|fact| fact.artifacts.import_file.as_ref()),
-            ),
+            ("ImportLibrary", import),
             (
                 "ProgramDatabaseFile",
                 fact.and_then(|fact| fact.artifacts.pdb_file.as_ref()),
@@ -93,6 +100,64 @@ impl Context<'_> {
         }
     }
 
+    /// Add the link settings that CMake writes for every linked target.
+    ///
+    /// The flags of the project come first, so a setting is added only when
+    /// the flags do not set it. Empty values stop MSBuild from using its own
+    /// defaults.
+    fn link_defaults(&self, config: &mut Config) {
+        let link = &mut config.link;
+        if !link.has("SubSystem") {
+            link.set("SubSystem", if config.gui { "Windows" } else { "Console" });
+        }
+        if !link.has("GenerateDebugInformation") {
+            link.set("GenerateDebugInformation", "false");
+        }
+        if !link.has("Version")
+            && let Some(version) = self
+                .project
+                .target
+                .and_then(|id| self.model.target(id))
+                .and_then(|target| target.props.get(b"VERSION"))
+                .and_then(|value| image_version(&string(value)))
+        {
+            link.set("Version", version);
+        }
+        link.inherit("IgnoreSpecificDefaultLibraries");
+        for key in [
+            "DataExecutionPrevention",
+            "ImageHasSafeExceptionHandlers",
+            "LinkErrorReporting",
+            "RandomizedBaseAddress",
+        ] {
+            if !link.has(key) {
+                link.set(key, "");
+            }
+        }
+    }
+
+    /// Tell if the target has an import library, as CMake decides.
+    fn has_import_library(&self) -> bool {
+        let Some(target) = self.project.target.and_then(|id| self.model.target(id)) else {
+            return false;
+        };
+        // CMake uses import libraries only when the platform sets a suffix
+        // for them. Windows always sets `.lib`, so only an empty value turns
+        // them off.
+        let dll_platform = self
+            .model
+            .definition(target.dir, b"CMAKE_IMPORT_LIBRARY_SUFFIX")
+            .is_none_or(|suffix| !suffix.is_empty());
+        let managed = matches!(
+            target.kind,
+            TargetKind::Executable | TargetKind::SharedLibrary
+        ) && target
+            .props
+            .get(b"COMMON_LANGUAGE_RUNTIME")
+            .is_some_and(|value| !matches!(value.as_slice(), b"" | b"netcore"));
+        dll_platform && !managed
+    }
+
     fn definition_command(&self, fact: &ResolvedTarget) -> Option<&rcmake_resolve::Invocation> {
         let cfg = fact.config.0.as_slice();
         let graph = self.indices.graph_by_config.get(cfg).copied()?;
@@ -121,11 +186,12 @@ impl Context<'_> {
 
     pub(super) fn ide_link(&self, ide: &IdeFacts, config: &str) -> flags_table::Settings {
         let archive = self.project.kind == TargetKind::StaticLibrary;
-        let mut flags: Vec<_> = ide
-            .link_options
-            .iter()
-            .flat_map(|flag| ide_flags(&string(&flag.value)))
-            .collect();
+        let mut flags = self.linker_variable_flags(config);
+        flags.extend(
+            ide.link_options
+                .iter()
+                .flat_map(|flag| ide_flags(&string(&flag.value))),
+        );
         let mut libraries = Vec::new();
         for item in &ide.link_items {
             match item {
@@ -135,6 +201,7 @@ impl Context<'_> {
                     }
                     libraries.extend(self.target_objects(*id, config));
                 }
+                IdeLinkItem::File(file) if is_targets_file(&string(file)) => {}
                 IdeLinkItem::File(file)
                     if !archive || source_kind(&string(file), Kind::Other) == Kind::Object =>
                 {
@@ -181,6 +248,39 @@ impl Context<'_> {
             );
         }
         out
+    }
+
+    /// The linker flags that CMake reads from variables and the older target
+    /// properties, before `LINK_OPTIONS`.
+    ///
+    /// A linked target uses `CMAKE_<TYPE>_LINKER_FLAGS[_<CONFIG>]` and
+    /// `LINK_FLAGS[_<CONFIG>]`. A static library uses
+    /// `CMAKE_STATIC_LINKER_FLAGS[_<CONFIG>]` and
+    /// `STATIC_LIBRARY_FLAGS[_<CONFIG>]`.
+    fn linker_variable_flags(&self, config: &str) -> Vec<String> {
+        let Some(target) = self.project.target.and_then(|id| self.model.target(id)) else {
+            return Vec::new();
+        };
+        let (variable, property) = match target.kind {
+            TargetKind::Executable => ("CMAKE_EXE_LINKER_FLAGS", "LINK_FLAGS"),
+            TargetKind::SharedLibrary => ("CMAKE_SHARED_LINKER_FLAGS", "LINK_FLAGS"),
+            TargetKind::ModuleLibrary => ("CMAKE_MODULE_LINKER_FLAGS", "LINK_FLAGS"),
+            TargetKind::StaticLibrary => ("CMAKE_STATIC_LINKER_FLAGS", "STATIC_LIBRARY_FLAGS"),
+            _ => return Vec::new(),
+        };
+        let upper = config.to_ascii_uppercase();
+        let variables = [variable.to_owned(), format!("{variable}_{upper}")];
+        let properties = [property.to_owned(), format!("{property}_{upper}")];
+        variables
+            .iter()
+            .filter_map(|key| self.model.definition(target.dir, key.as_bytes()))
+            .chain(
+                properties
+                    .iter()
+                    .filter_map(|key| target.props.get(key.as_bytes())),
+            )
+            .flat_map(|value| flags_table::split(&string(value)))
+            .collect()
     }
 
     pub(super) fn target_library(&self, id: TargetId, config: &str) -> Option<String> {
@@ -358,5 +458,58 @@ pub(super) fn library(value: &str) -> String {
         windows(value)
     } else {
         format!("{value}.lib")
+    }
+}
+
+/// The image version `<major>.<minor>` of a `VERSION` property, as CMake
+/// reads it. Missing or invalid parts are zero. A version `0.0` gives `None`.
+fn image_version(value: &str) -> Option<String> {
+    let mut parts = value.split('.');
+    let mut number = || {
+        parts
+            .next()
+            .map(|part| {
+                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<u32>().unwrap_or(0)
+            })
+            .unwrap_or(0)
+    };
+    let (major, minor) = (number(), number());
+    (major != 0 || minor != 0).then(|| format!("{major}.{minor}"))
+}
+
+/// Tell if a linked file is an MSBuild `.targets` file, which the project
+/// imports instead of linking.
+fn is_targets_file(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("targets"))
+}
+
+/// The `.targets` files in the link items, with `\` separators.
+pub(super) fn targets_files(ide: &IdeFacts) -> Vec<String> {
+    ide.link_items
+        .iter()
+        .filter_map(|item| match item {
+            IdeLinkItem::File(file) => Some(string(file)),
+            _ => None,
+        })
+        .filter(|file| is_targets_file(file))
+        .map(|file| windows(&file))
+        .collect()
+}
+
+#[cfg(test)]
+mod image_version_tests {
+    use super::image_version;
+
+    #[test]
+    fn version_keeps_major_and_minor_only() {
+        assert_eq!(image_version("0.1").as_deref(), Some("0.1"));
+        assert_eq!(image_version("1.0").as_deref(), Some("1.0"));
+        assert_eq!(image_version("65535.65535").as_deref(), Some("65535.65535"));
+        assert_eq!(image_version("1.2.3").as_deref(), Some("1.2"));
+        assert_eq!(image_version("2").as_deref(), Some("2.0"));
+        assert_eq!(image_version(""), None);
+        assert_eq!(image_version("0.0"), None);
     }
 }

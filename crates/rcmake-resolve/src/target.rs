@@ -10,7 +10,8 @@ use rcmake_model::{
 use crate::{
     ArtifactSet, CompileGroup, CompileUnit, ResolveError, ResolvedTarget, TargetMetadata,
     cxx_modules::{
-        is_std_provider, resolve_module_info, validate_module_scanning, validate_module_source,
+        is_std_provider, is_synthetic_provider, resolve_module_info, validate_module_scanning,
+        validate_module_source,
     },
     ide::{self, IdeCompile},
     lower,
@@ -44,6 +45,7 @@ pub(crate) fn resolve_target<'a>(
         exclude_from_all: excluded_from_all(model, usage, id, target, ctx)?,
         generator_provided: target.kind == TargetKind::GlobalTarget
             || is_std_provider(target)
+            || is_synthetic_provider(target)
             || target.props.get(GENERATOR_PROVIDED).is_some(),
     };
     if let Some(strategy) = lower::install_object_name_strategy(model, target)
@@ -195,7 +197,7 @@ pub(crate) fn resolve_target<'a>(
             continue;
         }
         let member = members.get(&source.value);
-        let source_props = sources::properties(dir, &source.value);
+        let source_props = paths.properties(dir, &source.value);
         if source_props.get(b"MACOSX_PACKAGE_LOCATION").is_some()
             && lower::is_darwin(model, target.dir)
             && ide::bundle_kind(target) != ide::BundleKind::None
@@ -325,6 +327,18 @@ pub(crate) fn resolve_target<'a>(
                         {
                             defines.insert(0, BT::new(symbol.clone(), Backtrace::default()));
                         }
+                        if target
+                            .policies
+                            .policies
+                            .get(rcmake_diag::PolicyId::new(204))
+                            == rcmake_diag::PolicyStatus::New
+                            && lower::compile::msvc::targets_msvc_abi(model, target.dir, &language)
+                            && !defines
+                                .iter()
+                                .any(|define| is_msvc_charset_define(&define.value))
+                        {
+                            defines.push(BT::new("_MBCS".into(), Backtrace::default()));
+                        }
                         let mut includes = usage.collect_includes_for_result(id, &compile_ctx)?;
                         if flavor.is_none() {
                             // `cmLocalGenerator::GetIncludeDirectories` drops the implicit directories.
@@ -434,6 +448,17 @@ pub(crate) fn resolve_target<'a>(
     resolved.compile_groups = groups.into_values().collect();
     if let Some(ide) = ide_compile {
         ide.finish(&mut resolved, model, target, paths, &inputs, &members)?;
+    }
+    if let (Some(facts), Some(unity)) = (&mut resolved.ide, unity) {
+        facts.unity_files = unity
+            .files
+            .iter()
+            .map(|(path, file)| ide::IdeUnityFile {
+                path: path.clone(),
+                language: file.language.clone(),
+                member_sources: file.member_sources(&ctx.config),
+            })
+            .collect();
     }
     resolve_module_info(
         model,
@@ -639,6 +664,13 @@ fn resolved_file_set_member(
 /// Remove a leading `-D` from each definition, as CMake does when it adds definitions
 /// to a compile line. A generator expression can produce such a value after the
 /// `target_compile_definitions()` command has removed the literal ones.
+fn is_msvc_charset_define(define: &[u8]) -> bool {
+    matches!(define, b"_UNICODE" | b"_MBCS" | b"_SBCS")
+        || define.starts_with(b"_UNICODE=")
+        || define.starts_with(b"_MBCS=")
+        || define.starts_with(b"_SBCS=")
+}
+
 fn strip_define_flags(defines: Vec<BT<BString>>) -> Vec<BT<BString>> {
     let mut seen = IndexMap::new();
     for mut define in defines {

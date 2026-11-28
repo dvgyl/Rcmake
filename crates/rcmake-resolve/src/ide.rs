@@ -73,6 +73,20 @@ pub struct IdeFacts {
     pub xcode_config_sensitive_embed: Option<BString>,
     /// Precompiled headers, one entry per language.
     pub pch: Vec<IdePch>,
+    /// Generated unity batch files and their original member sources for this configuration.
+    pub unity_files: Vec<IdeUnityFile>,
+}
+
+/// One generated unity source batch and the original target sources it includes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdeUnityFile {
+    /// Absolute path of the generated unity source file.
+    pub path: BString,
+    /// Compile language of the unity batch (for example `C` or `CXX`).
+    pub language: BString,
+    /// Absolute paths of the original member sources included in this unity batch
+    /// for the active configuration, in inclusion order.
+    pub member_sources: Vec<BString>,
 }
 
 /// Output directory and file name parts of a target.
@@ -614,9 +628,26 @@ impl IdeCompile {
                 }
                 if self.flavor == IdeFlavor::VisualStudio {
                     flags.extend(
-                        lower::msvc_debug_options(model, target, &resolved.config, &base.language)?
-                            .into_iter()
-                            .map(|option| BT::new(option, Backtrace::default())),
+                        lower::msvc_debug_options(
+                            model,
+                            target,
+                            &resolved.config,
+                            &base.language,
+                            None,
+                        )?
+                        .into_iter()
+                        .map(|option| BT::new(option, Backtrace::default())),
+                    );
+                    flags.extend(
+                        lower::compile::msvc::runtime_checks(
+                            model,
+                            target,
+                            &resolved.config,
+                            &base.language,
+                            None,
+                        )?
+                        .into_iter()
+                        .map(|option| BT::new(option, Backtrace::default())),
                     );
                 }
                 flags.append(&mut base.flags);

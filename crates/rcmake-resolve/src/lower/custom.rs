@@ -33,6 +33,7 @@ pub(super) struct Commands<'a> {
     cross: Option<CrossConfiguration<'a>>,
     outputs: IndexMap<BString, usize>,
     file_outputs: IndexMap<BString, usize>,
+    dir_outputs: IndexMap<DirId, IndexSet<BString>>,
     pub(super) byproduct_owners: IndexMap<BString, TargetId>,
     attachments: attachments::Attachments,
     command_dirs: Vec<DirId>,
@@ -74,6 +75,7 @@ pub(crate) fn validate_custom_commands(
         cross: None,
         outputs: IndexMap::new(),
         file_outputs: IndexMap::new(),
+        dir_outputs: IndexMap::new(),
         byproduct_owners: IndexMap::new(),
         attachments: attachments::Attachments::default(),
         command_dirs: Vec::new(),
@@ -132,6 +134,7 @@ impl<'a> Commands<'a> {
             cross,
             outputs: IndexMap::new(),
             file_outputs: IndexMap::new(),
+            dir_outputs: IndexMap::new(),
             byproduct_owners: attachments::byproduct_owners(model, config, usage)?,
             attachments: attachments::Attachments::default(),
             command_dirs: Vec::new(),
@@ -193,8 +196,10 @@ impl<'a> Commands<'a> {
             if command.codegen {
                 commands.codegen.insert(index);
             }
+            let dir_entry = commands.dir_outputs.entry(command.dir).or_default();
             for path in step.outputs.iter().chain(&step.byproducts) {
                 commands.outputs.entry(path.clone()).or_insert(index);
+                dir_entry.insert(absolute_path(&model.dir(DirId::ROOT).binary_dir, path));
             }
             let file_outputs = step.outputs.iter().chain(
                 step.byproducts
@@ -299,14 +304,17 @@ impl<'a> Commands<'a> {
         eval.host.artifact_dependencies = Some(&artifact_dependencies);
         eval.host.warning_site = Some(command.backtrace.clone());
 
+        let cmp0212 = command.policies.get(PolicyId::new(212));
         let mut target_dependencies = IndexSet::new();
         for dep in command.depends.iter().map(|entry| &entry.value) {
             for dep in list::split(&eval.value(dep)?, list::Empty::Drop) {
                 depends.push(self.dependency_path(
                     command.dir,
                     &dep,
+                    cmp0212,
                     paths,
                     command_config,
+                    &outputs,
                     &mut target_dependencies,
                 ));
             }
@@ -317,7 +325,7 @@ impl<'a> Commands<'a> {
             .chain(command.implicit_depends.iter().map(|(_, file)| file))
         {
             for dep in list::split(&eval.value(dep)?, list::Empty::Drop) {
-                let path = self.file_dependency(command.dir, &dep, paths);
+                let path = self.file_dependency(command.dir, &dep, paths, &outputs);
                 if !depends.contains(&path) {
                     depends.push(path);
                 }
@@ -442,13 +450,6 @@ impl<'a> Commands<'a> {
                 continue;
             }
             target_dependencies.insert((id, config.clone()));
-            // File inputs also order custom commands whose target has no compile steps.
-            if let Some(file) = self.artifact(id, target, &config) {
-                let path = build_relative(self.model, &file);
-                if !depends.contains(&path) {
-                    depends.push(path);
-                }
-            }
         }
         dependencies.extend(
             target_dependencies
@@ -465,7 +466,12 @@ impl<'a> Commands<'a> {
                 .collect()
         };
         let symbolic = |output: &BString| {
-            sources::properties(self.model.dir(command.dir), output)
+            let dir = self.model.dir(command.dir);
+            paths
+                .map_or_else(
+                    || sources::properties(dir, output),
+                    |paths| paths.properties(dir, output),
+                )
                 .get(b"SYMBOLIC")
                 .is_some_and(|value| truth::is_on(value))
         };
@@ -513,41 +519,104 @@ impl<'a> Commands<'a> {
         Ok((step, dependencies))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Custom dependency resolution carries directory, policy, config, and output context."
+    )]
     fn dependency_path(
         &self,
         dir: DirId,
         dep: &BString,
+        cmp0212: PolicyStatus,
         paths: Option<&SourcePaths<'_>>,
         command_config: &ConfigId,
+        own_outputs: &[BString],
         dependencies: &mut IndexSet<(TargetId, ConfigId)>,
     ) -> BString {
-        if let Some(id) = self.model.find_target(dir, dep)
-            && let Some(target) = self.model.target(id)
-        {
-            dependencies.insert((id, command_config.clone()));
-            return self.artifact(id, target, command_config).map_or_else(
-                || {
-                    if command_config == self.config {
-                        dep.clone()
+        let name = Lexical::new(dep).filename();
+        if !name.is_empty() {
+            let mut found = self.model.find_target(dir, name);
+            if found.is_none()
+                && cmp0212 != PolicyStatus::New
+                && let Some(stripped) = name.strip_suffix(b".exe")
+            {
+                found = self.model.find_target(dir, stripped);
+            }
+            if let Some(id) = found
+                && let Some(target) = self.model.target(id)
+            {
+                let full_path_mismatch = if paths.map_or_else(
+                    || crate::usage::paths::full_path_for_model(self.model, dir, dep),
+                    |paths| {
+                        crate::usage::paths::full_path_for_host(self.model, dir, paths.host, dep)
+                    },
+                ) {
+                    let target_dir = if matches!(
+                        target.kind,
+                        TargetKind::Executable
+                            | TargetKind::StaticLibrary
+                            | TargetKind::SharedLibrary
+                            | TargetKind::ModuleLibrary
+                            | TargetKind::UnknownLibrary
+                    ) {
+                        self.artifact(id, target, command_config)
+                            .map(|path| super::collapse(b"", Lexical::new(&path).parent()))
+                            .unwrap_or_default()
                     } else {
-                        [dep.as_slice(), b":", &command_config.0].concat().into()
-                    }
-                },
-                |path| build_relative(self.model, &path),
-            );
+                        BString::default()
+                    };
+                    let dep_dir = super::collapse(b"", Lexical::new(dep).parent());
+                    dep_dir != target_dir
+                } else {
+                    false
+                };
+                if !full_path_mismatch {
+                    dependencies.insert((id, command_config.clone()));
+                    return self.artifact(id, target, command_config).map_or_else(
+                        || {
+                            if command_config == self.config {
+                                target.name.clone()
+                            } else {
+                                [target.name.as_slice(), b":", &command_config.0]
+                                    .concat()
+                                    .into()
+                            }
+                        },
+                        |path| build_relative(self.model, &path),
+                    );
+                }
+            }
         }
-        self.file_dependency(dir, dep, paths)
+        self.file_dependency(dir, dep, paths, own_outputs)
     }
 
     fn file_dependency(
         &self,
-        dir: DirId,
+        dir_id: DirId,
         dep: &BString,
         paths: Option<&SourcePaths<'_>>,
+        own_outputs: &[BString],
     ) -> BString {
-        let dir = self.model.dir(dir);
+        let dir = self.model.dir(dir_id);
         let source = absolute_path(&dir.source_dir, dep);
         let binary = absolute_path(&dir.binary_dir, dep);
+        let source_rel = build_relative(self.model, &source);
+        let has_earlier_source_record = self.source_attachment(dir_id, &source_rel).is_some()
+            || dir.source_props.get(&source).is_some_and(|props| {
+                props.get(b"\0rcmake-source-absolute").is_some()
+                    && props.get(b"\0rcmake-source-binary-alternative").is_none()
+            });
+        if !Lexical::new(dep).absolute()
+            && !has_earlier_source_record
+            && !own_outputs.iter().any(|output| output == &binary)
+            && (paths.is_some_and(|paths| paths.is_custom_output_in_dir(dir_id, &binary))
+                || self
+                    .dir_outputs
+                    .get(&dir_id)
+                    .is_some_and(|outputs| outputs.contains(&binary)))
+        {
+            return build_relative(self.model, &binary);
+        }
         let in_source = paths.map_or_else(
             || dir.source_props.contains_key(&source),
             |paths| {
@@ -618,10 +687,9 @@ impl<'a> Commands<'a> {
                 let producers: Vec<_> = step
                     .depends
                     .iter()
-                    .flat_map(|path| {
+                    .filter_map(|path| {
                         self.producer(path)
-                            .into_iter()
-                            .chain(self.source_attachment(command.dir, path))
+                            .or_else(|| self.source_attachment(command.dir, path))
                     })
                     .collect();
                 if event.is_some() {
@@ -704,17 +772,15 @@ impl<'a> Commands<'a> {
     }
 
     fn input_producers(&self, step: usize) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        let dir = self.command_dirs.get(step).copied();
         self.inputs
             .get(step)
             .into_iter()
             .flatten()
-            .flat_map(move |path| {
-                self.producer(path).into_iter().chain(
-                    self.command_dirs
-                        .get(step)
-                        .and_then(|dir| self.source_attachment(*dir, path))
-                        .filter(|attached| *attached != step),
-                )
+            .filter_map(move |path| {
+                self.producer(path)
+                    .or_else(|| dir.and_then(|dir| self.source_attachment(dir, path)))
+                    .filter(|&producer| producer != step)
             })
     }
 
@@ -1120,5 +1186,137 @@ mod tests {
             "-DINTDIR=Release/x"
         );
         assert_eq!(expand_cfg_intdir(b"plain", &config), "plain");
+    }
+
+    #[test]
+    fn command_tool_orders_without_file_input_and_relative_output_wins_over_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::path::Path;
+
+        use rcmake_diag::{Backtrace, PolicyMap};
+        use rcmake_host::PureHost;
+        use rcmake_model::{
+            BT, CustomCommand, CustomCommandKind, DirId, GeneratorKind, ProjectModel, Target,
+            TargetKind, TargetOrigin,
+        };
+
+        let host = PureHost::default();
+        host.seed_file(Path::new("/src/tool.c"), b"int main(void) { return 0; }\n")?;
+        host.seed_file(Path::new("/src/gen.hpp"), b"// source tree copy\n")?;
+        host.seed_file(Path::new("/src/in.txt"), b"input\n")?;
+
+        let mut model = ProjectModel::default();
+        model.generator = Some(GeneratorKind::Ninja);
+        model.set_root_dirs("/src".into(), "/build".into());
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert("CMAKE_C_COMPILER".into(), "/usr/bin/cc".into());
+
+        let mut tool = Target::new(
+            "tool".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        tool.sources
+            .push(BT::new("tool.c".into(), Backtrace::default()));
+        model.add_target(tool)?;
+
+        // Producer writes binary-dir `gen.hpp` while depending on its own relative `gen.hpp`
+        // (which exists in `/src/gen.hpp`).
+        let mut prod = CustomCommand::new(
+            DirId::ROOT,
+            CustomCommandKind::Output,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        prod.outputs
+            .push(BT::new("gen.hpp".into(), Backtrace::default()));
+        prod.depends
+            .push(BT::new("gen.hpp".into(), Backtrace::default()));
+        prod.command_lines
+            .push(vec!["tool".into(), "in.txt".into()]);
+        model.add_command(prod)?;
+
+        // Consumer uses relative `DEPENDS gen.hpp` and `COMMAND tool`.
+        let mut cons = CustomCommand::new(
+            DirId::ROOT,
+            CustomCommandKind::Output,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        cons.outputs
+            .push(BT::new("out.txt".into(), Backtrace::default()));
+        cons.depends
+            .push(BT::new("gen.hpp".into(), Backtrace::default()));
+        cons.command_lines.push(vec!["tool".into()]);
+        model.add_command(cons)?;
+
+        // Explicit `DEPENDS tool` establishes a file-level dependency on `tool`.
+        let mut explicit = CustomCommand::new(
+            DirId::ROOT,
+            CustomCommandKind::Output,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        explicit
+            .outputs
+            .push(BT::new("explicit.txt".into(), Backtrace::default()));
+        explicit
+            .depends
+            .push(BT::new("tool".into(), Backtrace::default()));
+        explicit.command_lines.push(vec!["tool".into()]);
+        model.add_command(explicit)?;
+
+        let result = crate::resolve(&model, &host, &[ConfigId::default()])?;
+        let graph = result.graphs.first().ok_or("missing build graph")?;
+        let step_for = |output: &[u8]| {
+            graph.steps.iter().find_map(|step| match step {
+                crate::BuildStep::Custom(custom)
+                    if custom.outputs.iter().any(|out| out.as_slice() == output) =>
+                {
+                    Some(custom)
+                }
+                _ => None,
+            })
+        };
+        let prod_step = step_for(b"gen.hpp").ok_or("missing prod step")?;
+        assert!(
+            prod_step.depends.iter().any(|dep| dep == "/src/gen.hpp"),
+            "producer must keep source-tree input: {:?}",
+            prod_step.depends
+        );
+        assert!(
+            !prod_step.depends.iter().any(|dep| dep == "tool"),
+            "COMMAND tool must not add tool artifact to file depends: {:?}",
+            prod_step.depends
+        );
+        assert!(
+            !prod_step.target_dependencies.is_empty(),
+            "COMMAND tool must still record target ordering"
+        );
+
+        let cons_step = step_for(b"out.txt").ok_or("missing cons step")?;
+        assert!(
+            cons_step.depends.iter().any(|dep| dep == "gen.hpp"),
+            "relative DEPENDS must prefer declaring dir custom-command output over source tree: {:?}",
+            cons_step.depends
+        );
+        assert!(
+            !cons_step.depends.iter().any(|dep| dep == "tool"),
+            "COMMAND tool must not insert tool file input: {:?}",
+            cons_step.depends
+        );
+
+        let explicit_step = step_for(b"explicit.txt").ok_or("missing explicit step")?;
+        assert!(
+            explicit_step.depends.iter().any(|dep| dep == "tool"),
+            "explicit DEPENDS tool must record file input: {:?}",
+            explicit_step.depends
+        );
+        Ok(())
     }
 }

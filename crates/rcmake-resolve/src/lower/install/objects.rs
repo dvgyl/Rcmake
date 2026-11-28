@@ -8,6 +8,7 @@ use super::{file_action, join};
 
 pub(super) struct ObjectPaths {
     built: BString,
+    installer_from: BString,
     installed: BString,
 }
 
@@ -25,8 +26,24 @@ impl ObjectPaths {
             &unit.source.value,
             custom_name,
         );
+        let built = join(&model.dir(DirId::ROOT).binary_dir, &unit.object);
+        let installer_from = if model.generator == Some(rcmake_model::GeneratorKind::Ninja) {
+            let dir = super::super::object_dir(model, target, &ConfigId::default());
+            if let Some(rest) = unit
+                .object
+                .strip_prefix(dir.as_slice())
+                .and_then(|rest| rest.strip_prefix(b"/"))
+            {
+                [dir.as_slice(), b"/.//", rest].concat().into()
+            } else {
+                built.clone()
+            }
+        } else {
+            built.clone()
+        };
         Self {
-            built: join(&model.dir(DirId::ROOT).binary_dir, &unit.object),
+            built,
+            installer_from,
             installed: join(destination, &name),
         }
     }
@@ -40,7 +57,7 @@ impl ObjectPaths {
                 .relative(Lexical::new(base))
                 .unwrap_or_else(|| self.installed.clone())
         };
-        (self.built.clone(), relative)
+        (self.installer_from.clone(), relative)
     }
 
     pub(super) fn action(

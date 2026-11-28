@@ -65,6 +65,106 @@ rule CXX_COMPILE_SCANNED_DEPFILE
   deps = gcc
 ";
 
+pub(crate) fn synthetic_compile_rule_name(
+    target_name: &[u8],
+    config: Option<&[u8]>,
+) -> Option<BString> {
+    if !target_name
+        .windows(b"@synth_".len())
+        .any(|window| window == b"@synth_")
+    {
+        return None;
+    }
+    let mut name = Vec::with_capacity(b"CXX_COMPILER__".len() + target_name.len() + 16);
+    name.extend_from_slice(b"CXX_COMPILER__");
+    for &byte in target_name {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            name.push(byte);
+        } else {
+            let encoded = format!(".{byte:02x}");
+            name.extend_from_slice(encoded.as_bytes());
+        }
+    }
+    name.extend_from_slice(b"_scanned_");
+    if let Some(config) = config.filter(|config| !config.is_empty()) {
+        for &byte in config {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+                name.push(byte);
+            } else {
+                let encoded = format!(".{byte:02x}");
+                name.extend_from_slice(encoded.as_bytes());
+            }
+        }
+    }
+    Some(name.into())
+}
+
+pub(crate) fn emit_synthetic_rules(
+    ninja: &mut crate::syntax::Ninja,
+    result: &GenerationResult,
+    model: Option<&ProjectModel>,
+    multi_config: bool,
+    windows: bool,
+) {
+    let mut emitted = HashSet::new();
+    let msvc_format = model.is_some_and(|model| {
+        model
+            .definition(DirId::ROOT, b"CMAKE_CXX_DEPFILE_FORMAT")
+            .is_some_and(|value| value == b"msvc")
+    });
+    for graph in &result.graphs {
+        let config = multi_config.then_some(graph.config.0.as_slice());
+        for target in &graph.targets {
+            let Some(rule) = synthetic_compile_rule_name(&target.name, config) else {
+                continue;
+            };
+            if !emitted.insert(rule.clone()) {
+                continue;
+            }
+            let mut has_depfile = false;
+            let mut has_msvc = msvc_format;
+            for &step_index in &target.steps {
+                if let Some(BuildStep::Compile {
+                    depfile,
+                    invocation,
+                    ..
+                }) = graph.steps.get(step_index)
+                {
+                    if depfile.is_some() {
+                        has_depfile = true;
+                    }
+                    if windows
+                        && (invocation.argv.iter().any(|arg| {
+                            arg.eq_ignore_ascii_case(b"/showIncludes")
+                                || arg.eq_ignore_ascii_case(b"-showIncludes")
+                        }) || invocation
+                            .shell
+                            .split(|&byte| byte.is_ascii_whitespace())
+                            .any(|arg| {
+                                arg.eq_ignore_ascii_case(b"/showIncludes")
+                                    || arg.eq_ignore_ascii_case(b"-showIncludes")
+                            }))
+                    {
+                        has_msvc = true;
+                    }
+                }
+            }
+            ninja.0.extend_from_slice(b"\nrule ");
+            ninja.0.extend_from_slice(&rule);
+            ninja
+                .0
+                .extend_from_slice(b"\n  command = $COMMAND\n  description = $DESC\n");
+            if has_msvc {
+                ninja.0.extend_from_slice(b"  deps = msvc\n");
+            } else if has_depfile {
+                ninja
+                    .0
+                    .extend_from_slice(b"  depfile = $DEP_FILE\n  deps = gcc\n");
+            }
+        }
+    }
+}
+
 pub(crate) fn uses_modules(graph: &BuildGraph) -> bool {
     graph.steps.iter().any(|step| {
         matches!(
@@ -200,11 +300,24 @@ pub(crate) fn write_metadata(
                 dir_top_src: top_src.clone(),
                 dir_top_bld: top_bld.clone(),
                 module_dir: absolute(&top_bld, parent(dd)),
-                linked_target_dirs: implicit_inputs
-                    .iter()
-                    .filter(|input| Lexical::new(input).filename() == b"CXXModules.json")
-                    .map(|input| absolute(&top_bld, parent(input)))
-                    .collect(),
+                linked_target_dirs: match resolved {
+                    Some(target) => target
+                        .cxx_modules
+                        .as_ref()
+                        .map(|modules| {
+                            modules
+                                .linked_target_dirs
+                                .iter()
+                                .map(|dir| absolute(&top_bld, dir))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    None => implicit_inputs
+                        .iter()
+                        .filter(|input| Lexical::new(input).filename() == b"CXXModules.json")
+                        .map(|input| absolute(&top_bld, parent(input)))
+                        .collect(),
+                },
                 ..TargetDependInfo::default()
             };
             if let Some(model) = model {

@@ -26,7 +26,7 @@ mod syntax;
 pub use build::build_commands;
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
 use rcmake_gen_common::compile_commands_native::MultiConfigCompileDatabase;
@@ -228,14 +228,19 @@ fn generate_single(
     graph.emit_entry_aliases(&mut ninja);
     graph.emit_assumed_sources(&mut ninja, model);
     prep.emit(&mut ninja, &graph);
+    let regen_pos = ninja.0.len();
     emit_regeneration(
         &mut ninja,
         &graph,
+        host,
         &manifests,
         result,
         &regenerate,
         verify_globs.then_some(programs.cmake.as_slice()),
         has_cache,
+    );
+    emit_start_instrument_edges(
+        &mut ninja, &graph, regen_pos, result, model, host, build_dir,
     );
     emit_utilities(
         &mut ninja,
@@ -257,6 +262,7 @@ fn generate_single(
         host,
         build_dir,
         uses_modules,
+        false,
         model,
         &commands,
         &programs.cmake,
@@ -425,6 +431,7 @@ fn write_rules(
     host: &dyn Host,
     build_dir: &Path,
     uses_modules: bool,
+    multi_config: bool,
     model: Option<&ProjectModel>,
     commands: &Commands,
     cmake_cmd: &[u8],
@@ -495,9 +502,11 @@ fn write_rules(
         ninja.0.extend_from_slice(cuda::RULES.as_bytes());
     }
     response::emit_rules(&mut ninja);
-    if !commands.windows() {
-        instrumented::emit_rules(&mut ninja, result, build_dir, !prefix.is_empty(), commands);
+    instrumented::emit_rules(&mut ninja, result, build_dir, !prefix.is_empty(), commands);
+    if has_instrumentation(result, model, host, build_dir) {
+        emit_start_instrument_rule(&mut ninja, result, host, build_dir, commands, cmake_cmd);
     }
+    modules::emit_synthetic_rules(&mut ninja, result, model, multi_config, commands.windows());
     if let Some(prefix) = model
         .and_then(|model| model.definition(DirId::ROOT, b"CMAKE_CL_SHOWINCLUDES_PREFIX"))
         .cloned()
@@ -756,6 +765,191 @@ fn generation_error(path: &Path, message: impl Into<BString>) -> GenError {
         path: path::from_native(path),
         message: message.into(),
     }
+}
+
+fn is_instrumented_invocation(invocation: &rcmake_resolve::Invocation) -> bool {
+    invocation
+        .argv
+        .get(1)
+        .is_some_and(|arg| arg == b"--instrument")
+        || (invocation.argv.get(1).is_some_and(|arg| arg == b"-E")
+            && invocation
+                .argv
+                .get(2)
+                .is_some_and(|arg| arg == b"__instrument"))
+}
+
+fn has_json_query_files(host: &dyn Host, dir: &Path) -> bool {
+    let Ok(entries) = host.read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().any(|entry| {
+        matches!(entry.kind, FileKind::File | FileKind::Symlink)
+            && !entry.name.starts_with(b".")
+            && entry.name.ends_with(b".json")
+    })
+}
+
+fn user_instrumentation_query_dir(host: &dyn Host) -> Option<PathBuf> {
+    let env = |name: &[u8]| {
+        host.env_get(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| path::to_native(&value))
+    };
+    let config = env(b"CMAKE_CONFIG_DIR").or_else(|| match host.system().sysname.as_slice() {
+        b"Windows" | b"Windows_NT" => env(b"LOCALAPPDATA").map(|dir| dir.join("CMake")),
+        b"Darwin" | b"macOS" => env(b"XDG_CONFIG_HOME")
+            .or_else(|| env(b"HOME").map(|dir| dir.join("Library/Application Support")))
+            .map(|dir| dir.join("CMake")),
+        _ => env(b"XDG_CONFIG_HOME")
+            .or_else(|| env(b"HOME").map(|dir| dir.join(".config")))
+            .map(|dir| dir.join("cmake")),
+    })?;
+    let abs = if config.is_absolute() {
+        config
+    } else {
+        host.initial_cwd().join(config)
+    };
+    Some(abs.join("instrumentation/v1/query"))
+}
+
+fn has_instrumentation(
+    result: &GenerationResult,
+    model: Option<&ProjectModel>,
+    host: &dyn Host,
+    build_dir: &Path,
+) -> bool {
+    if model.is_some_and(|model| {
+        !model.global.instrumentation.is_empty()
+            || model
+                .global
+                .props
+                .get(b"_RCMAKE_INSTRUMENTATION_QUERIES")
+                .is_some()
+    }) {
+        return true;
+    }
+    let query_dir = build_dir.join(".cmake/instrumentation/v1/query");
+    if has_json_query_files(host, &query_dir)
+        || has_json_query_files(host, &query_dir.join("generated"))
+        || user_instrumentation_query_dir(host).is_some_and(|dir| has_json_query_files(host, &dir))
+    {
+        return true;
+    }
+    result
+        .graphs
+        .iter()
+        .flat_map(|graph| &graph.steps)
+        .any(|step| match step {
+            BuildStep::Compile { invocation, .. } => is_instrumented_invocation(invocation),
+            BuildStep::Link { invocations, .. } => {
+                invocations.iter().any(is_instrumented_invocation)
+            }
+            BuildStep::Custom(custom) => custom.invocations.iter().any(is_instrumented_invocation),
+            _ => false,
+        })
+}
+
+pub(crate) fn emit_start_instrument_edges(
+    ninja: &mut Ninja,
+    graph: &Graph<'_>,
+    regen_pos: usize,
+    result: &GenerationResult,
+    model: Option<&ProjectModel>,
+    host: &dyn Host,
+    build_dir: &Path,
+) {
+    if !has_instrumentation(result, model, host, build_dir) {
+        return;
+    }
+    let phony_node = graph.node(b"CMakeFiles/instrument");
+    let start_node = graph.node(b"start_instrument");
+    insert_rerun_input(&mut ninja.0, regen_pos, &start_node);
+    ninja.phony(&phony_node, &[]);
+    ninja.edge(
+        b"START_INSTRUMENT",
+        Edge {
+            outputs: std::slice::from_ref(&start_node),
+            inputs: std::slice::from_ref(&phony_node),
+            ..Edge::default()
+        },
+    );
+}
+
+fn escape_ninja_command_arg(commands: &Commands, word: &[u8], out: &mut Vec<u8>) {
+    let mut quoted = Vec::new();
+    commands.word(word, &mut quoted);
+    for byte in quoted {
+        if byte == b'$' {
+            out.push(b'$');
+        }
+        out.push(byte);
+    }
+}
+
+fn emit_start_instrument_rule(
+    ninja: &mut Ninja,
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    commands: &Commands,
+    cmake_cmd: &[u8],
+) {
+    ninja
+        .0
+        .extend_from_slice(b"\nrule START_INSTRUMENT\n  command = ");
+    if !commands.windows() {
+        ninja.0.extend_from_slice(b"exec ");
+    }
+    let ctest = result.metadata.ctest_command.as_ref().filter(|ctest| {
+        host.metadata(&path::to_native(ctest), Follow::Yes)
+            .is_ok_and(|meta| meta.kind == FileKind::File)
+    });
+    if let Some(ctest) = ctest {
+        escape_ninja_command_arg(commands, ctest, &mut ninja.0);
+        ninja
+            .0
+            .extend_from_slice(b" --instrument --start-instrumentation ");
+    } else {
+        for &byte in cmake_cmd {
+            if byte == b'$' {
+                ninja.0.push(b'$');
+            }
+            ninja.0.push(byte);
+        }
+        ninja
+            .0
+            .extend_from_slice(b" -E __instrument --start-instrumentation ");
+    }
+    let build = path::from_native_cmake(build_dir);
+    escape_ninja_command_arg(commands, &build, &mut ninja.0);
+    ninja
+        .0
+        .extend_from_slice(b"\n  description = Collecting build metrics\n  restat = 1\n");
+}
+
+fn insert_rerun_input(buf: &mut Vec<u8>, start: usize, node: &BString) {
+    const MARKER: &[u8] = b": RERUN_CMAKE";
+    let Some(tail) = buf.get(start..) else {
+        return;
+    };
+    let Some(offset) = tail
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    else {
+        return;
+    };
+    let insert_at = start + offset + MARKER.len();
+    let mut encoded = Vec::with_capacity(node.len() + 1);
+    encoded.push(b' ');
+    for &byte in node.as_slice() {
+        match byte {
+            b'$' | b' ' | b':' | b'\n' => encoded.extend_from_slice(&[b'$', byte]),
+            b'|' => encoded.extend_from_slice(b"${ninja_pipe}"),
+            _ => encoded.push(byte),
+        }
+    }
+    buf.splice(insert_at..insert_at, encoded);
 }
 
 #[cfg(test)]

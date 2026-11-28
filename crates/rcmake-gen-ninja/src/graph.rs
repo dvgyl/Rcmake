@@ -555,34 +555,41 @@ impl<'a> Graph<'a> {
                         } else {
                             None
                         };
-                        if let Some(owner) = owned_utility
-                            && let Some(owner_target) = input.targets.get(owner)
-                            && let Some(owner_meta) = graph.target_meta.get(owner)
-                        {
-                            let owner_name = &owner_target.name;
-                            let dir_rel = &owner_meta.dir_rel;
-                            let mut synth = Vec::new();
-                            if !dir_rel.is_empty() {
-                                synth.extend_from_slice(dir_rel);
-                                synth.push(b'/');
+                        let empty_ordering_utility = owned_utility.is_some()
+                            && custom.outputs.is_empty()
+                            && custom.byproducts.is_empty()
+                            && custom.invocations.is_empty()
+                            && custom.depends.is_empty();
+                        if !empty_ordering_utility {
+                            if let Some(owner) = owned_utility
+                                && let Some(owner_target) = input.targets.get(owner)
+                                && let Some(owner_meta) = graph.target_meta.get(owner)
+                            {
+                                let owner_name = &owner_target.name;
+                                let dir_rel = &owner_meta.dir_rel;
+                                let mut synth = Vec::new();
+                                if !dir_rel.is_empty() {
+                                    synth.extend_from_slice(dir_rel);
+                                    synth.push(b'/');
+                                }
+                                synth.extend_from_slice(b"CMakeFiles/");
+                                synth.extend_from_slice(owner_name);
+                                let candidate = qualified(&graph.node(&synth), config);
+                                if used_synthetic.insert(candidate.clone()) {
+                                    nodes.outputs.push(candidate);
+                                }
                             }
-                            synth.extend_from_slice(b"CMakeFiles/");
-                            synth.extend_from_slice(owner_name);
-                            let candidate = qualified(&graph.node(&synth), config);
-                            if used_synthetic.insert(candidate.clone()) {
-                                nodes.outputs.push(candidate);
+                            for name in &custom.byproducts {
+                                let node = graph.node(name);
+                                if !nodes.outputs.contains(&node) {
+                                    nodes.outputs.push(node);
+                                }
                             }
-                        }
-                        for name in &custom.byproducts {
-                            let node = graph.node(name);
-                            if !nodes.outputs.contains(&node) {
-                                nodes.outputs.push(node);
+                            if nodes.outputs.is_empty() {
+                                let name =
+                                    BString::from(format!("CMakeFiles/rcmake-custom-{index}.util"));
+                                nodes.outputs.push(qualified(&graph.node(&name), config));
                             }
-                        }
-                        if nodes.outputs.is_empty() {
-                            let name =
-                                BString::from(format!("CMakeFiles/rcmake-custom-{index}.util"));
-                            nodes.outputs.push(qualified(&graph.node(&name), config));
                         }
                     }
                 }
@@ -992,29 +999,44 @@ impl<'a> Graph<'a> {
         model: Option<&ProjectModel>,
         result: &GenerationResult,
     ) {
-        let mut ambiguous = BTreeSet::new();
-        for (name, artifact) in artifacts {
-            let Some(file) = artifact.linker_file.as_ref().or(artifact.file.as_ref()) else {
-                continue;
-            };
-            let file = self.node(file);
-            let filename = self.node(Lexical::new(&file).filename());
-            if name == &filename.as_slice()
-                || self.names.contains_key(&filename)
-                || self.producers.contains_key(&filename)
-            {
-                continue;
-            }
-            if self
-                .extra_aliases
-                .insert(filename.clone(), vec![file])
-                .is_some()
-            {
-                ambiguous.insert(filename);
+        let mut seen_targets = BTreeSet::new();
+        let mut ordered = Vec::with_capacity(artifacts.len());
+        for target in &self.input.targets {
+            let name = target.name.as_slice();
+            if let Some(&artifact) = artifacts.get(name) {
+                seen_targets.insert(name);
+                ordered.push((name, artifact));
             }
         }
-        for name in ambiguous {
-            self.extra_aliases.remove(&name);
+        for (&name, &artifact) in artifacts {
+            if !seen_targets.contains(name) {
+                ordered.push((name, artifact));
+            }
+        }
+        for (name, artifact) in ordered {
+            let mut candidates = Vec::with_capacity(2);
+            if let Some(linker) = artifact.linker_file.as_ref() {
+                candidates.push(linker);
+                if artifact.import_file.as_ref() == Some(linker)
+                    && let Some(runtime) = artifact.file.as_ref()
+                    && runtime != linker
+                {
+                    candidates.push(runtime);
+                }
+            } else if let Some(runtime) = artifact.file.as_ref() {
+                candidates.push(runtime);
+            }
+            for file in candidates {
+                let file = self.node(file);
+                let filename = self.node(Lexical::new(&file).filename());
+                if name == filename.as_slice()
+                    || self.names.contains_key(&filename)
+                    || self.producers.contains_key(&filename)
+                {
+                    continue;
+                }
+                self.extra_aliases.entry(filename).or_insert(vec![file]);
+            }
         }
         let Some(model) = model else { return };
         for build_target in &self.input.targets {
@@ -1076,12 +1098,24 @@ impl<'a> Graph<'a> {
             .collect();
         let mut dir_all: BTreeMap<DirId, Vec<BString>> =
             model.dirs().map(|(id, _)| (id, Vec::new())).collect();
-        let excluded_targets: HashSet<_> = result
+        let resolved_exclude: HashMap<&[u8], bool> = result
             .targets
             .iter()
-            .filter(|target| target.config == self.input.config && target.metadata.exclude_from_all)
-            .map(|target| target.metadata.name.as_slice())
+            .filter(|target| target.config == self.input.config)
+            .map(|target| {
+                (
+                    target.metadata.name.as_slice(),
+                    target.metadata.exclude_from_all,
+                )
+            })
             .collect();
+        let mut excluded_any_config: HashMap<&[u8], bool> = HashMap::new();
+        for target in &result.targets {
+            let entry = excluded_any_config
+                .entry(target.metadata.name.as_slice())
+                .or_insert(false);
+            *entry |= target.metadata.exclude_from_all;
+        }
         for (index, build_target) in self.input.targets.iter().enumerate() {
             let Some(target) = self
                 .input
@@ -1103,27 +1137,39 @@ impl<'a> Graph<'a> {
                 continue;
             };
             let excluded_prop = target.props.get(b"EXCLUDE_FROM_ALL");
-            let in_dir_all = if model.dir_excluded_from_all(target.dir) {
-                !build_target.steps.is_empty()
+            let dir_excluded = model.dir_excluded_from_all(target.dir);
+            let excluded_this_config = resolved_exclude
+                .get(build_target.name.as_slice())
+                .copied()
+                .unwrap_or_else(|| excluded_prop.map_or(dir_excluded, |value| truth::is_on(value)));
+            let excluded_in_any_config = excluded_any_config
+                .get(build_target.name.as_slice())
+                .copied()
+                .unwrap_or(excluded_this_config);
+            let in_dir_all = if dir_excluded {
+                (!build_target.steps.is_empty() || target.kind == TargetKind::InterfaceLibrary)
                     && target.kind != TargetKind::Utility
-                    && !excluded_prop.is_some_and(|value| {
-                        excluded_targets.contains(build_target.name.as_slice())
-                            || truth::is_on(value)
-                    })
+                    && !(excluded_prop.is_some() && excluded_this_config)
             } else {
-                build_target.in_all
-                    && !excluded_prop.is_some_and(|value| {
-                        excluded_targets.contains(build_target.name.as_slice())
-                            || truth::is_on(value)
-                    })
+                build_target.in_all && !(excluded_prop.is_some() && excluded_this_config)
             };
             if !in_dir_all {
                 continue;
             }
-            if let Some(inputs) = dir_all.get_mut(&target.dir)
-                && let Some(meta) = self.target_meta.get(index)
-            {
-                inputs.extend(meta.artifact_outputs.iter().cloned());
+            if let Some(meta) = self.target_meta.get(index) {
+                if let Some(inputs) = dir_all.get_mut(&target.dir) {
+                    inputs.extend(meta.artifact_outputs.iter().cloned());
+                }
+                // Match CMake `cmGlobalCommonGenerator.cxx`: only promote a target
+                // inside an excluded directory to ancestor `/all` targets when
+                // `EXCLUDE_FROM_ALL` is false in EVERY configuration.
+                if dir_excluded && excluded_prop.is_some() && !excluded_in_any_config {
+                    for ancestor in model.ancestors(target.dir).skip(1) {
+                        if let Some(inputs) = dir_all.get_mut(&ancestor) {
+                            inputs.extend(meta.artifact_outputs.iter().cloned());
+                        }
+                    }
+                }
             }
         }
         for (id, dir) in model.dirs() {
@@ -1217,7 +1263,8 @@ impl<'a> Graph<'a> {
 
     pub(crate) fn set_compile_metadata(&mut self, result: &'a GenerationResult) {
         self.compile_languages = progress::compile_languages(result, self.input);
-        self.launcher_slots = crate::instrumented::collect_launchers(result).1;
+        self.launcher_slots =
+            crate::instrumented::collect_launchers(result, self.commands.windows()).1;
         self.command_settings.result = Some(result);
         self.fortran_info.extend(
             result
@@ -1638,6 +1685,9 @@ impl<'a> Graph<'a> {
         exports: &[ModuleExportJob],
         custom_inputs: Option<&Vec<BString>>,
     ) -> Result<(), GenError> {
+        if nodes.outputs.is_empty() {
+            return Ok(());
+        }
         let mut language_inputs = Vec::new();
         let mut plan = match step {
             BuildStep::DeviceLink { .. } => None,

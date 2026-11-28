@@ -301,9 +301,13 @@ impl FileApi<'_, '_> {
                         if directory {
                             if let Some(dir_prefix) = file.strip_suffix(b"/.") {
                                 let rel = relative(dir_prefix, self.source);
-                                let mut path = rel;
-                                path.extend_from_slice(b"/.");
-                                Value::string(path)
+                                if rel == b"." {
+                                    Value::string(rel)
+                                } else {
+                                    let mut path = rel;
+                                    path.extend_from_slice(b"/.");
+                                    Value::string(path)
+                                }
                             } else {
                                 let (from, to) = file.strip_suffix(b"/").map_or_else(
                                     || (file.as_slice(), Lexical::new(file).filename()),

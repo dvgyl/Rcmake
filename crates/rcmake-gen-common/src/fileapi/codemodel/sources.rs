@@ -61,13 +61,18 @@ impl FileApi<'_, '_> {
             kind: FrameKind::Command,
         });
         if let Some(pch) = pch {
-            sources.extend(pch.create.iter().map(|entry| Source {
-                path: entry.path.clone(),
-                trace: file_trace.clone(),
-                generated: false,
-                source_group: "Source Files".into(),
-                compile: Some((entry.group, entry.flags.clone())),
-            }));
+            sources.extend(
+                pch.create
+                    .iter()
+                    .filter(|entry| !entry.path.is_empty())
+                    .map(|entry| Source {
+                        path: entry.path.clone(),
+                        trace: file_trace.clone(),
+                        generated: false,
+                        source_group: "Source Files".into(),
+                        compile: Some((entry.group, entry.flags.clone())),
+                    }),
+            );
         }
 
         let source_dir = Lexical::new(&target.metadata.source_dir);
@@ -116,6 +121,7 @@ impl FileApi<'_, '_> {
                 }
             }
         }
+        let mut inherited_sources = Vec::new();
         if let Some(raw) = raw {
             let src_ctx = EvalContext {
                 config: target.config.clone(),
@@ -242,54 +248,15 @@ impl FileApi<'_, '_> {
                 )
                 && let Ok(collected) = usage.collect_property(target.id, b"SOURCES", &src_ctx)
             {
-                for item in collected.entries {
-                    push_evaluated_source(
-                        &item.value,
-                        &item.backtrace,
-                        &mut sources,
-                        &mut seen,
-                        &mut object_languages,
-                    );
-                }
+                inherited_sources = collected.entries;
             }
         }
-        for unit in &target.compile_units {
-            let path = Lexical::new(&source_dir.append(&unit.source.value)).normalize();
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            let flags = pch
-                .and_then(|pch| pch.use_flags.get(&unit.source.value))
-                .cloned()
-                .unwrap_or_default();
-            let compile = Some((unit.group, flags));
-            let trace = &unit.source.backtrace;
-            sources.push(match raw {
-                Some(raw) => self.source(target.id, raw, path, trace, compile),
-                None => Source {
-                    path,
-                    trace: trace.clone(),
-                    generated: false,
-                    source_group: "Source Files".into(),
-                    compile,
-                },
-            });
-        }
-
-        if let Some(raw) = raw {
-            for path in &file_sets.order {
-                if let Some(member) = file_sets.sources.get(path).filter(|member| member.in_build)
-                    && seen.insert(path.clone())
-                {
-                    let trace = member.traces.first().unwrap_or(&file_trace);
-                    sources.push(self.source(target.id, raw, path.clone(), trace, None));
-                }
-            }
-        }
+        // PCH header files appear after direct sources and before traced carriers
+        // on both the owner target and targets reusing its precompiled headers.
         for build_graph in &self.result.graphs {
             if let Some(pch) = build_graph.pch_details.get(&target.id) {
                 for entry in &pch.create {
-                    if seen.insert(entry.header.clone()) {
+                    if !entry.header.is_empty() && seen.insert(entry.header.clone()) {
                         sources.push(Source {
                             path: entry.header.clone(),
                             trace: file_trace.clone(),
@@ -298,31 +265,6 @@ impl FileApi<'_, '_> {
                             compile: None,
                         });
                     }
-                }
-            }
-        }
-        if raw.is_some() {
-            let context = EvalContext {
-                config: target.config.clone(),
-                traversal: rcmake_genex::UsageTraversal::Link,
-                link_language: target.link.as_ref().map(|link| link.language.clone()),
-                ..Default::default()
-            };
-            let links = usage
-                .direct_link_items(target.id, false, &context)
-                .map_err(|error| GenError::Invalid(error.to_string().into()))?;
-            for item in links.iter() {
-                if let rcmake_resolve::usage::ResolvedLinkKind::Objects(id) = item.kind
-                    && let Some(dependency) = targets.get(&id)
-                {
-                    append_objects(
-                        &mut sources,
-                        &mut seen,
-                        &mut object_languages,
-                        self.build,
-                        dependency.target,
-                        &item.text.backtrace,
-                    );
                 }
             }
         }
@@ -404,6 +346,143 @@ impl FileApi<'_, '_> {
                     );
                 }
             }
+        }
+
+        // Stage 2: inherited INTERFACE_SOURCES from linked targets.
+        if let Some(raw) = raw
+            && !inherited_sources.is_empty()
+        {
+            let objects: BTreeMap<BString, &BString> = targets
+                .values()
+                .filter(|dep| dep.target.metadata.kind == TargetKind::ObjectLibrary)
+                .flat_map(|dep| {
+                    dep.target.compile_units.iter().filter_map(|unit| {
+                        let group = dep.target.compile_groups.get(unit.group)?;
+                        Some((
+                            Lexical::new(self.build).append(&unit.object),
+                            &group.language,
+                        ))
+                    })
+                })
+                .collect();
+            for item in &inherited_sources {
+                let path = self
+                    .result
+                    .target_depends
+                    .resolved_source(target.id, &item.value)
+                    .cloned()
+                    .unwrap_or_else(|| Lexical::new(&source_dir.append(&item.value)).normalize());
+                if let Some(&language) = objects.get(&path) {
+                    if !object_languages.contains(language) {
+                        object_languages.insert(language.clone());
+                    }
+                    if seen.insert(path.clone()) {
+                        sources.push(Source {
+                            path,
+                            trace: item.backtrace.clone(),
+                            generated: true,
+                            source_group: "Object Libraries".into(),
+                            compile: None,
+                        });
+                    }
+                    continue;
+                }
+                if seen.insert(path.clone()) {
+                    let unit = units.get(&path).copied();
+                    sources.push(self.source(
+                        target.id,
+                        raw,
+                        path,
+                        &item.backtrace,
+                        unit.map(|unit| {
+                            (
+                                unit.group,
+                                pch.and_then(|pch| pch.use_flags.get(&unit.source.value))
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                        }),
+                    ));
+                }
+            }
+        }
+
+        // Stage 3: objects from direct object-library links.
+        if raw.is_some() {
+            let context = EvalContext {
+                config: target.config.clone(),
+                traversal: rcmake_genex::UsageTraversal::Link,
+                link_language: target.link.as_ref().map(|link| link.language.clone()),
+                ..Default::default()
+            };
+            let links = usage
+                .direct_link_items(target.id, false, &context)
+                .map_err(|error| GenError::Invalid(error.to_string().into()))?;
+            for item in links.iter() {
+                if let rcmake_resolve::usage::ResolvedLinkKind::Objects(id) = item.kind
+                    && let Some(dependency) = targets.get(&id)
+                {
+                    append_objects(
+                        &mut sources,
+                        &mut seen,
+                        &mut object_languages,
+                        self.build,
+                        dependency.target,
+                        &item.text.backtrace,
+                    );
+                }
+            }
+        }
+
+        // Stage 4: native build-side file sets in file-set name order.
+        if let Some(raw) = raw {
+            for path in &file_sets.named_order {
+                if let Some(member) = file_sets.sources.get(path).filter(|member| member.in_build)
+                    && seen.insert(path.clone())
+                {
+                    let trace = member.traces.first().unwrap_or(&file_trace);
+                    let unit = units.get(path).copied();
+                    sources.push(self.source(
+                        target.id,
+                        raw,
+                        path.clone(),
+                        trace,
+                        unit.map(|unit| {
+                            (
+                                unit.group,
+                                pch.and_then(|pch| pch.use_flags.get(&unit.source.value))
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                        }),
+                    ));
+                }
+            }
+        }
+
+        // Stage 5: remaining compile units (e.g. inherited source file sets or
+        // synthetic units not already emitted above).
+        for unit in &target.compile_units {
+            let path = Lexical::new(&source_dir.append(&unit.source.value)).normalize();
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let flags = pch
+                .and_then(|pch| pch.use_flags.get(&unit.source.value))
+                .cloned()
+                .unwrap_or_default();
+            let compile = Some((unit.group, flags));
+            let trace = &unit.source.backtrace;
+            sources.push(match raw {
+                Some(raw) => self.source(target.id, raw, path, trace, compile),
+                None => Source {
+                    path,
+                    trace: trace.clone(),
+                    generated: false,
+                    source_group: "Source Files".into(),
+                    compile,
+                },
+            });
         }
 
         let mut source_groups = IndexMap::<BString, (Vec<usize>, Vec<usize>)>::new();
@@ -914,14 +993,15 @@ fn trace_steps_for_graph(
     // target, and the steps that no earlier step reaches. Roots after the
     // first reached step (the producers of the utility command `DEPENDS`)
     // enter the queue when it has processed the first roots.
-    let source_roots: HashSet<usize> = initial
-        .iter()
-        .filter_map(|path| {
-            producers
-                .get(Lexical::new(path).normalize().as_slice())
-                .copied()
-        })
-        .collect();
+    let mut source_roots_order: Vec<usize> = Vec::new();
+    let mut source_roots = HashSet::new();
+    for path in initial {
+        if let Some(&position) = producers.get(Lexical::new(path).normalize().as_slice())
+            && source_roots.insert(position)
+        {
+            source_roots_order.push(position);
+        }
+    }
     let mut reached = HashSet::new();
     // The producers of the custom target `DEPENDS`, in sorted dependency order.
     let mut late: Vec<usize> = Vec::new();
@@ -935,12 +1015,18 @@ fn trace_steps_for_graph(
     let utility_roots: HashSet<usize> = late.iter().copied().collect();
     let mut after_reached = false;
     let mut early = Vec::new();
+    let mut inserted_source_roots = false;
     for position in 0..steps.len() {
         let source_root = source_roots.contains(&position);
-        if !source_root && utility_roots.contains(&position) {
+        if source_root {
+            if !inserted_source_roots {
+                early.extend(source_roots_order.iter().copied());
+                inserted_source_roots = true;
+            }
+        } else if utility_roots.contains(&position) {
             // Queued with the custom target command below.
-        } else if source_root || !reached.contains(&position) {
-            if source_root || !after_reached {
+        } else if !reached.contains(&position) {
+            if !after_reached {
                 early.push(position);
             } else {
                 late.push(position);
@@ -949,6 +1035,9 @@ fn trace_steps_for_graph(
             after_reached = true;
         }
         reached.extend(children(position));
+    }
+    if !inserted_source_roots {
+        early.extend(source_roots_order);
     }
     let first = early.len();
     let mut queue: indexmap::IndexSet<usize> = early.into_iter().collect();
