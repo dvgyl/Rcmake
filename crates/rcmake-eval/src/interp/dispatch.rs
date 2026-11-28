@@ -304,11 +304,25 @@ impl Interp {
         defer_id: Option<BString>,
         f: impl FnOnce(&mut Self) -> CmdResult,
     ) -> CmdResult {
+        self.with_frame_arc_inner(file, line, name, defer_id, true, f)
+    }
+
+    fn with_frame_arc_inner(
+        &mut self,
+        file: &Arc<[u8]>,
+        line: u32,
+        name: Arc<[u8]>,
+        defer_id: Option<BString>,
+        push_bt_frame: bool,
+        f: impl FnOnce(&mut Self) -> CmdResult,
+    ) -> CmdResult {
         if !self.take_step() {
             return Err(CmdError::Reported);
         }
-        let bt = self.command_backtrace_arc(file, line, Arc::clone(&name));
-        let saved_bt = core::mem::replace(&mut self.bt, bt);
+        let saved_bt = push_bt_frame.then(|| {
+            let bt = self.command_backtrace_arc(file, line, Arc::clone(&name));
+            core::mem::replace(&mut self.bt, bt)
+        });
         let saved_defer = core::mem::replace(&mut self.hooks.top_defer_id, defer_id);
         self.depth = self.depth.saturating_add(1);
         let saved_line = core::mem::replace(&mut self.cur_line, line);
@@ -384,7 +398,9 @@ impl Interp {
         self.cur_line = saved_line;
         self.depth = self.depth.saturating_sub(1);
         self.hooks.top_defer_id = saved_defer;
-        self.bt = saved_bt;
+        if let Some(saved_bt) = saved_bt {
+            self.bt = saved_bt;
+        }
         result
     }
 
@@ -762,19 +778,53 @@ impl Interp {
 
     /// `Cx::call_command`: run a command with pre-expanded arguments under a frame.
     pub(crate) fn call_command(&mut self, name: &[u8], args: Vec<ExpandedArg>) -> CmdResult {
+        self.call_command_with_frame(name, args, true)
+    }
+
+    /// `Cx::call_command_in_current_frame`: run a command with pre-expanded arguments
+    /// using the normal execution scope without pushing a synthetic backtrace frame.
+    pub(crate) fn call_command_in_current_frame(
+        &mut self,
+        name: &[u8],
+        args: Vec<ExpandedArg>,
+    ) -> CmdResult {
+        self.call_command_with_frame(name, args, false)
+    }
+
+    fn call_command_with_frame(
+        &mut self,
+        name: &[u8],
+        args: Vec<ExpandedArg>,
+        push_bt_frame: bool,
+    ) -> CmdResult {
         let lower = fold_command_name(name);
-        if crate::code::opener_end(&lower).is_some() || unexpected_text(&lower).is_some() {
-            return Err(CmdError::Status(cat(&[
-                b"invalid command specified: ",
-                name,
-            ])));
-        }
         let file = self
             .bt
             .top()
             .map_or_else(|| Arc::from(&b""[..]), |f| Arc::clone(&f.file));
         let line = self.cur_line;
+        if crate::code::opener_end(&lower).is_some() || unexpected_text(&lower).is_some() {
+            let err = CmdError::Status(cat(&[b"invalid command specified: ", name]));
+            return if push_bt_frame {
+                Err(err)
+            } else {
+                self.with_frame_arc_inner(&file, line, Arc::from(name), None, false, |_| Err(err))
+            };
+        }
         let Some(command) = self.lookup_command(&lower) else {
+            if !push_bt_frame {
+                return self.with_frame_arc_inner(
+                    &file,
+                    line,
+                    Arc::from(name),
+                    None,
+                    false,
+                    |this| {
+                        this.unknown_command(name);
+                        Err(CmdError::Reported)
+                    },
+                );
+            }
             let saved = core::mem::take(&mut self.bt);
             let result = self.with_command_frame(&file, line, name, |this| {
                 this.unknown_command(name);
@@ -810,9 +860,10 @@ impl Interp {
         }
         let args = if raw.is_some() { Vec::new() } else { args };
         let saved = core::mem::replace(&mut self.cur_cmd, raw);
-        let result = self.with_command_frame(&file, line, name, |this| {
-            this.invoke_observed(&lower, command, &args)
-        });
+        let result =
+            self.with_frame_arc_inner(&file, line, Arc::from(name), None, push_bt_frame, |this| {
+                this.invoke_observed(&lower, command, &args)
+            });
         self.cur_cmd = saved;
         result
     }

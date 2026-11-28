@@ -73,7 +73,7 @@ fn parse_command(
             None => {
                 return Err(error(
                     name.start,
-                    "Unexpected end of file.\n\nParse error.  Function missing opening \"(\".",
+                    "Unexpected end of file.\nParse error.  Function missing opening \"(\".",
                 ));
             }
         }
@@ -163,7 +163,7 @@ pub(super) fn check_separation(
         if preceding == Separation::Bracket || kind == ArgKind::Bracket {
             return Err(error(
                 position,
-                format!("Syntax Error in cmake code at column {column}\n\n{WHITESPACE_MESSAGE}"),
+                format!("Syntax Error in cmake code at column {column}\n{WHITESPACE_MESSAGE}"),
             ));
         }
         warnings.push(Diagnostic {
@@ -176,10 +176,8 @@ pub(super) fn check_separation(
                 file: Arc::from([]),
                 line: position.line,
             },
-            body: format!(
-                "Syntax Warning in cmake code at column {column}\n\n{WHITESPACE_MESSAGE}"
-            )
-            .into(),
+            body: format!("Syntax Warning in cmake code at column {column}\n{WHITESPACE_MESSAGE}")
+                .into(),
         });
     }
     Ok(if kind == ArgKind::Bracket {

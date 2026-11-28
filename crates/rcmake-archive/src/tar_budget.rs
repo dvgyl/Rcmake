@@ -3,11 +3,10 @@ use std::ops::Range;
 
 use tar::{Header, PaxExtensions};
 
-use crate::MAX_ENTRIES;
-
 const BLOCK_SIZE: usize = 512;
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
-const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_METADATA_RECORDS: usize = 500_000;
 
 // Check physical headers before tar can read extension data into memory.
 pub(super) struct Reader<R> {
@@ -34,7 +33,7 @@ impl<R: Read> Reader<R> {
             trailer: false,
             pax_size: None,
             pax: None,
-            records_left: MAX_ENTRIES,
+            records_left: MAX_METADATA_RECORDS,
             bytes_left: MAX_METADATA_BYTES,
         }
     }
@@ -80,7 +79,21 @@ impl<R: Read> Reader<R> {
         let gnu = kind.is_gnu_longname() || kind.is_gnu_longlink();
         let local_pax = kind.is_pax_local_extensions();
         let global_pax = kind.is_pax_global_extensions();
-        let recognized = self.header.as_gnu().is_some() || self.header.as_ustar().is_some();
+        let mut recognized = self.header.as_gnu().is_some() || self.header.as_ustar().is_some();
+        // Some tar writers (e.g. Apache Ant / Commons Compress) emit GNU `L`/`K`
+        // extension records with `ustar\0\0\0` (or `ustar ` + nonstandard version).
+        // Normalize recognized ustar-magic GNU extension headers only after verifying
+        // the original header checksum so corrupt headers are never accepted.
+        if gnu
+            && !recognized
+            && has_ustar_magic(&self.header)
+            && valid_checksum(&self.header)
+            && let Some(slot) = self.header.as_mut_bytes().get_mut(257..265)
+        {
+            slot.copy_from_slice(b"ustar  \0");
+            self.header.set_cksum();
+            recognized = true;
+        }
         let mut size = self.header.entry_size()?;
         if gnu || local_pax || global_pax {
             self.charge(size)?;
@@ -135,6 +148,29 @@ impl<R: Read> Read for Reader<R> {
         self.pending.start += read;
         Ok(read)
     }
+}
+
+fn has_ustar_magic(header: &Header) -> bool {
+    header
+        .as_bytes()
+        .get(257..263)
+        .is_some_and(|magic| magic.starts_with(b"ustar") && matches!(magic.get(5), Some(0 | b' ')))
+}
+
+fn valid_checksum(header: &Header) -> bool {
+    let Ok(expected) = header.cksum() else {
+        return false;
+    };
+    let bytes = header.as_bytes();
+    let (Some(head), Some(tail)) = (bytes.get(..148), bytes.get(156..)) else {
+        return false;
+    };
+    let sum = head
+        .iter()
+        .chain(tail)
+        .fold(0_u32, |acc, &byte| acc + u32::from(byte))
+        + 8 * u32::from(b' ');
+    sum == expected
 }
 
 fn pax_size(bytes: &[u8]) -> Option<u64> {

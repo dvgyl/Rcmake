@@ -1336,6 +1336,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: true,
+            default_error_mode: false,
         };
         assert_eq!(host.metadata(file, Follow::Yes)?.len, 0);
         let mut during_run = None;

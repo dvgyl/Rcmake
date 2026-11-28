@@ -6,16 +6,21 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rcmake_eval::ProbeCacheMode;
 use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, WriteMode, path};
 use rcmake_json::{FieldError, FromJson, ToJson, Value, deny_unknown, object, req};
-use rcmake_store::{Digest, Domain, Entry, InputStamp, Store, StoreConfig, StoreMode, TraceMemo};
+use rcmake_store::{
+    Digest, Domain, Entry, InputStamp, Store, StoreConfig, StoreMode, StoreSession, TraceMemo,
+};
 
 use super::journal::{ImpureReason, Journal, JournalChecks};
+#[cfg(test)]
+use super::plan::process_environment_fingerprint;
 use super::plan::{
-    ArtifactRef, ProbeDiagnostic, ProbeEligibility, ProbeOutcome, ProbeRecipe, ReuseScope,
-    compute_probe_key, process_environment_fingerprint,
+    ArtifactRef, CachedEnv, EnvCache, ProbeDiagnostic, ProbeEligibility, ProbeOutcome, ProbeRecipe,
+    ReuseScope, compute_probe_key,
 };
 use super::template::{Templated, round_trip_verify};
 
@@ -250,7 +255,9 @@ impl fmt::Display for VerifyMismatchReport {
 /// Compile probe cache policy and counters. The store owns atomic publication.
 pub(crate) struct ProbeCache {
     mode: StoreMode,
-    pub(super) memo: std::sync::Arc<TraceMemo>,
+    pub(super) memo: Arc<TraceMemo>,
+    env: EnvCache,
+    store_session: Mutex<Option<(PathBuf, Arc<StoreSession>)>>,
     hits: AtomicU64,
     misses: AtomicU64,
     bypassed: AtomicU64,
@@ -275,6 +282,8 @@ impl ProbeCache {
         Self {
             mode,
             memo: Default::default(),
+            env: EnvCache::default(),
+            store_session: Mutex::new(None),
             hits: AtomicU64::default(),
             misses: AtomicU64::default(),
             bypassed: AtomicU64::default(),
@@ -282,6 +291,54 @@ impl ProbeCache {
             verify_mismatches: AtomicU64::default(),
             store_errors: AtomicU64::default(),
         }
+    }
+
+    /// Return a cached snapshot of the host environment keyed by `Host::env_epoch`.
+    pub(crate) fn env_snapshot(&self, host: &dyn Host) -> CachedEnv {
+        self.env.snapshot(host)
+    }
+
+    fn session_for(&self, host: &dyn Host, root: &Path) -> HostResult<Arc<StoreSession>> {
+        {
+            let guard = self
+                .store_session
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some((cached_root, session)) = guard.as_ref()
+                && cached_root == root
+                && session.matches_configured_root(host, root)
+            {
+                return Ok(Arc::clone(session));
+            }
+        }
+        let session = Arc::new(StoreSession::new(host, root)?);
+        let mut guard = self
+            .store_session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_root, existing)) = guard.as_ref()
+            && cached_root == root
+            && existing.matches_configured_root(host, root)
+        {
+            return Ok(Arc::clone(existing));
+        }
+        *guard = Some((root.to_path_buf(), Arc::clone(&session)));
+        Ok(session)
+    }
+
+    fn with_store<R>(
+        &self,
+        host: &dyn Host,
+        config: StoreConfig,
+        f: impl FnOnce(&Store<'_>) -> R,
+    ) -> HostResult<R> {
+        if matches!(config.mode, StoreMode::Off | StoreMode::Verify) {
+            let store = Store::new(host, config)?.with_trace_memo(&self.memo);
+            return Ok(f(&store));
+        }
+        let session = self.session_for(host, &config.root)?;
+        let store = Store::with_session(host, config, &session).with_trace_memo(&self.memo);
+        Ok(f(&store))
     }
 
     /// Return true when this cache can publish speculative results.
@@ -294,17 +351,30 @@ impl ProbeCache {
     /// Use the probe's filesystem view and a host that reads current inputs.
     /// Keep the verified snapshot stable through use. In verify mode,
     /// the caller executes the probe and applies the fresh result.
+    #[cfg(test)]
     pub(crate) fn lookup(
         &self,
         host: &dyn Host,
         config: &StoreConfig,
         recipe: &ProbeRecipe,
     ) -> Option<ObservedOutcome> {
+        self.lookup_for_probe(host, config, recipe, true)
+    }
+
+    /// Look up a reusable result, skipping artifact blob reads when `!need_artifact`.
+    pub(crate) fn lookup_for_probe(
+        &self,
+        host: &dyn Host,
+        config: &StoreConfig,
+        recipe: &ProbeRecipe,
+        need_artifact: bool,
+    ) -> Option<ObservedOutcome> {
         if self.mode == StoreMode::Off || recipe.eligibility != ProbeEligibility::Eligible {
             self.bypassed.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let outcome = self.lookup_with_mode(host, config, recipe, self.mode);
+        let need_artifact = need_artifact || self.mode == StoreMode::Verify;
+        let outcome = self.lookup_with_mode(host, config, recipe, self.mode, need_artifact);
         let counter = if outcome.is_some() {
             &self.hits
         } else {
@@ -321,12 +391,24 @@ impl ProbeCache {
         config: &StoreConfig,
         recipe: &ProbeRecipe,
     ) -> Option<ObservedOutcome> {
+        self.lookup_uncounted_for_probe(host, config, recipe, true)
+    }
+
+    /// Look up an outcome without updating counters, skipping artifact reads when `!need_artifact`.
+    pub(crate) fn lookup_uncounted_for_probe(
+        &self,
+        host: &dyn Host,
+        config: &StoreConfig,
+        recipe: &ProbeRecipe,
+        need_artifact: bool,
+    ) -> Option<ObservedOutcome> {
         let mode = if self.mode == StoreMode::Verify {
             StoreMode::Verify
         } else {
             StoreMode::ReadOnly
         };
-        self.lookup_with_mode(host, config, recipe, mode)
+        let need_artifact = need_artifact || self.mode == StoreMode::Verify;
+        self.lookup_with_mode(host, config, recipe, mode, need_artifact)
     }
 
     fn lookup_with_mode(
@@ -335,12 +417,13 @@ impl ProbeCache {
         config: &StoreConfig,
         recipe: &ProbeRecipe,
         mode: StoreMode,
+        need_artifact: bool,
     ) -> Option<ObservedOutcome> {
         if self.mode == StoreMode::Off
             || config.mode == StoreMode::Off
             || recipe.eligibility != ProbeEligibility::Eligible
             || (recipe.try_run && recipe.scope != ReuseScope::ExactBindings)
-            || recipe.environment != process_environment_fingerprint(&host.env_all())
+            || recipe.environment != self.env.fingerprint(host)
         {
             return None;
         }
@@ -349,8 +432,10 @@ impl ProbeCache {
             (StoreMode::ReadWrite, mode) | (_, mode @ StoreMode::Verify) => mode,
             (mode, _) => mode,
         };
-        let store = Store::new(host, config).ok()?.with_trace_memo(&self.memo);
-        read_outcome(host, &store, recipe)
+        self.with_store(host, config, |store| {
+            read_outcome(host, store, recipe, need_artifact)
+        })
+        .ok()?
     }
 
     /// Publish a verified foreground result. Treat cache failures as optional.
@@ -404,7 +489,7 @@ impl ProbeCache {
             if cancelled() {
                 return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
             }
-            if recipe.environment != process_environment_fingerprint(&host.env_all()) {
+            if recipe.environment != self.env.fingerprint(host) {
                 return Ok(inputs_changed());
             }
             let bindings = recipe.bindings.clone().with_canonical(host);
@@ -415,47 +500,58 @@ impl ProbeCache {
                 return Ok(ProbePublishOutcome::Skipped(SkipReason::Outcome));
             }
             let key = compute_probe_key(recipe);
-            let store = Store::new(host, config.clone())?.with_trace_memo(&self.memo);
-            let blobs = match &outcome.artifact {
-                Some(artifact) => vec![store.put_blob(&artifact.bytes)?],
-                None => Vec::new(),
-            };
-            if cancelled() {
-                return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
-            }
-            let entry = Entry {
-                trace: trace.clone(),
-                blobs,
-                payload: CachedProbe {
-                    outcome: payload,
-                    checks: checks.clone(),
+            self.with_store(
+                host,
+                config.clone(),
+                |store| -> HostResult<ProbePublishOutcome> {
+                    let blobs = match &outcome.artifact {
+                        Some(artifact) => vec![store.put_blob(&artifact.bytes)?],
+                        None => Vec::new(),
+                    };
+                    if cancelled() {
+                        return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
+                    }
+                    let entry = Entry {
+                        trace: trace.clone(),
+                        blobs,
+                        payload: CachedProbe {
+                            outcome: payload,
+                            checks: checks.clone(),
+                        },
+                    };
+                    use rcmake_store::PublishOutcome;
+                    let fresh_valid = || {
+                        !cancelled()
+                            && recipe.environment == self.env.fingerprint(host)
+                            && checks.verify(host)
+                    };
+                    match store.put_entry_checked(
+                        Domain::ProbeV1,
+                        key,
+                        &entry,
+                        |previous, reader| decode_outcome(host, reader, recipe, previous).is_some(),
+                        fresh_valid,
+                    )? {
+                        PublishOutcome::Published => Ok(ProbePublishOutcome::Published),
+                        PublishOutcome::AlreadyPresent => Ok(ProbePublishOutcome::AlreadyPresent),
+                        PublishOutcome::Stale if cancelled() => {
+                            Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled))
+                        }
+                        PublishOutcome::Stale => {
+                            Ok(ProbePublishOutcome::Skipped(SkipReason::Stale))
+                        }
+                        PublishOutcome::SkippedBusy => {
+                            Ok(ProbePublishOutcome::Skipped(SkipReason::Busy))
+                        }
+                        PublishOutcome::Disabled => {
+                            Ok(ProbePublishOutcome::Skipped(SkipReason::Disabled))
+                        }
+                        PublishOutcome::SkippedUnsupported => {
+                            Ok(ProbePublishOutcome::Skipped(SkipReason::Unsupported))
+                        }
+                    }
                 },
-            };
-            use rcmake_store::PublishOutcome;
-            let fresh_valid = || {
-                !cancelled()
-                    && recipe.environment == process_environment_fingerprint(&host.env_all())
-                    && checks.verify(host)
-            };
-            match store.put_entry_checked(
-                Domain::ProbeV1,
-                key,
-                &entry,
-                |previous, reader| decode_outcome(host, reader, recipe, previous).is_some(),
-                fresh_valid,
-            )? {
-                PublishOutcome::Published => Ok(ProbePublishOutcome::Published),
-                PublishOutcome::AlreadyPresent => Ok(ProbePublishOutcome::AlreadyPresent),
-                PublishOutcome::Stale if cancelled() => {
-                    Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled))
-                }
-                PublishOutcome::Stale => Ok(ProbePublishOutcome::Skipped(SkipReason::Stale)),
-                PublishOutcome::SkippedBusy => Ok(ProbePublishOutcome::Skipped(SkipReason::Busy)),
-                PublishOutcome::Disabled => Ok(ProbePublishOutcome::Skipped(SkipReason::Disabled)),
-                PublishOutcome::SkippedUnsupported => {
-                    Ok(ProbePublishOutcome::Skipped(SkipReason::Unsupported))
-                }
-            }
+            )?
         };
         publish().unwrap_or_else(|error| ProbePublishOutcome::StoreError(error.to_string()))
     }
@@ -723,13 +819,14 @@ fn read_outcome(
     host: &dyn Host,
     store: &Store<'_>,
     recipe: &ProbeRecipe,
+    need_artifact: bool,
 ) -> Option<ObservedOutcome> {
     // The recipe check runs before the store restores blobs from an import candidate.
     let accept = |entry: &Entry<CachedProbe>| payload_fits_recipe(host, recipe, entry);
     let entry = store
         .get_entry_accepted::<CachedProbe>(Domain::ProbeV1, compute_probe_key(recipe), &accept)
         .ok()??;
-    decode_outcome(host, store, recipe, &entry)
+    decode_outcome_with_artifact(host, store, recipe, &entry, need_artifact)
 }
 
 pub(super) fn decode_outcome(
@@ -737,6 +834,16 @@ pub(super) fn decode_outcome(
     store: &Store<'_>,
     recipe: &ProbeRecipe,
     entry: &Entry<CachedProbe>,
+) -> Option<ObservedOutcome> {
+    decode_outcome_with_artifact(host, store, recipe, entry, true)
+}
+
+fn decode_outcome_with_artifact(
+    host: &dyn Host,
+    store: &Store<'_>,
+    recipe: &ProbeRecipe,
+    entry: &Entry<CachedProbe>,
+    need_artifact: bool,
 ) -> Option<ObservedOutcome> {
     if !entry.payload.checks.verify(host) {
         return None;
@@ -749,19 +856,23 @@ pub(super) fn decode_outcome(
     let artifact = match (&outcome.artifact, entry.blobs.as_slice()) {
         (None, []) => None,
         (Some(artifact), [blob]) if outcome.compiled && artifact.blob == *blob => {
-            let bytes = store.get_blob(*blob).ok()??;
-            if bytes.len() > MAX_ARTIFACT_BYTES {
-                return None;
-            }
             let relative_path = path::to_native(&artifact.relative_path.render(&bindings)?);
             if !is_relative_artifact(&relative_path) {
                 return None;
             }
-            Some(Artifact {
-                bytes,
-                relative_path,
-                mode: artifact.mode,
-            })
+            if need_artifact {
+                let bytes = store.get_blob(*blob).ok()??;
+                if bytes.len() > MAX_ARTIFACT_BYTES {
+                    return None;
+                }
+                Some(Artifact {
+                    bytes,
+                    relative_path,
+                    mode: artifact.mode,
+                })
+            } else {
+                None
+            }
         }
         _ => return None,
     };
@@ -771,10 +882,11 @@ pub(super) fn decode_outcome(
 pub(super) fn rebind_speculation(
     host: &dyn Host,
     recipe: &ProbeRecipe,
+    env_fingerprint: Digest,
     spec: crate::configure::probe_pool::ChildResult,
 ) -> Option<ObservedOutcome> {
     if compute_probe_key(&spec.recipe) != compute_probe_key(recipe)
-        || recipe.environment != process_environment_fingerprint(&host.env_all())
+        || recipe.environment != env_fingerprint
         || spec.journal.verified_inputs(host).is_none()
     {
         return None;

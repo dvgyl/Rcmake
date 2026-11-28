@@ -380,6 +380,15 @@ pub trait GenexHost {
             .map(|value| value == "NEW")
     }
 
+    /// Return the full policy status at target creation, if known.
+    fn target_policy_status(
+        &self,
+        _target: TargetHandle,
+        _policy: rcmake_diag::PolicyId,
+    ) -> Option<rcmake_diag::PolicyStatus> {
+        None
+    }
+
     /// Return object paths for the target and the optional source filter.
     fn target_objects(
         &self,

@@ -180,6 +180,7 @@ fn rejects_unverified_process_before_it_starts() -> HostResult<()> {
         stderr: Output::Capture,
         timeout: Some(Duration::from_secs(1)),
         tee: false,
+        default_error_mode: false,
     };
     assert!(journal.run(&request, &mut |_, _| {}).is_err());
     let journal = journal.finish();
@@ -251,6 +252,7 @@ fn compiler_request(scratch: &Path) -> RunRequest {
         stderr: Output::Capture,
         timeout: Some(Duration::from_secs(1)),
         tee: false,
+        default_error_mode: false,
     }
 }
 
@@ -566,6 +568,40 @@ fn cached_probe_json_round_trips_and_rejects_unknown_fields()
             ("extra", Value::Null),
         ]))
         .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn scalar_lookup_skips_artifact_blob_read_while_copy_file_reads_it() -> HostResult<()> {
+    let host = PureHost::default();
+    let config = StoreConfig::new("/cache".into());
+    let cache = ProbeCache::new(StoreMode::ReadWrite);
+    let scratch = Path::new("/work/scratch");
+    host.create_dir_all(scratch)?;
+    let original = recipe(&host, Path::new("/work"))?;
+    let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?.finish();
+    assert_eq!(
+        cache.publish(&host, &config, &original, &success(), &journal),
+        ProbePublishOutcome::Published
+    );
+
+    // Scalar lookup (`need_artifact = false`) succeeds without materializing artifact bytes.
+    let scalar = cache
+        .lookup_for_probe(&host, &config, &original, false)
+        .ok_or_else(|| HostError::unsupported("Expected scalar warm hit."))?;
+    assert!(scalar.compiled);
+    assert_eq!(scalar.exit_code, 0);
+    assert_eq!(scalar.output, b"/work/scratch/cmTC_1");
+    assert!(scalar.artifact.is_none());
+
+    // COPY_FILE lookup (`need_artifact = true`) returns the full verified artifact.
+    let with_artifact = cache
+        .lookup_for_probe(&host, &config, &original, true)
+        .ok_or_else(|| HostError::unsupported("Expected artifact warm hit."))?;
+    assert_eq!(
+        with_artifact.artifact.as_ref().map(|a| a.bytes.as_slice()),
+        Some(b"test executable".as_slice())
     );
     Ok(())
 }

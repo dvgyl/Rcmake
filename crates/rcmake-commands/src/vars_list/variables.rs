@@ -56,9 +56,7 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             );
         }
         let value = rest.first().map_or(b"".as_slice(), bytes);
-        if !value.is_empty() || cx.host().env_get(key).is_some() {
-            cx.host().env_set(key, Some(value));
-        }
+        set_env_var(cx.host(), key, value, cfg!(windows));
     } else if let Some(key) = wrapped(name, b"CACHE{") {
         set_cache_keywords(cx, key, rest)?;
     } else {
@@ -72,6 +70,14 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
     }
     Ok(Flow::Normal)
+}
+
+fn set_env_var(host: &dyn rcmake_host::Host, key: &[u8], value: &[u8], windows: bool) {
+    if value.is_empty() && windows {
+        host.env_set(key, None);
+    } else if !value.is_empty() || host.env_get(key).is_some() {
+        host.env_set(key, Some(value));
+    }
 }
 
 fn set_normal_or_cache(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Result<(), CmdError> {
@@ -268,7 +274,7 @@ pub(super) fn option(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 CMP0077,
                 b"",
                 &cat(&[
-                    b"\nFor compatibility with older versions of CMake, option is clearing the normal variable '",
+                    b"For compatibility with older versions of CMake, option is clearing the normal variable '",
                     name,
                     b"'.",
                 ]),
@@ -317,4 +323,26 @@ pub(super) fn mark_as_advanced(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
         }
     }
     Ok(Flow::Normal)
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use rcmake_host::{Host, PureHost};
+
+    use super::set_env_var;
+
+    #[test]
+    fn windows_empty_env_set_removes_variable() {
+        let host = PureHost::default();
+        host.env_set(b"SET_THEN_EMPTY", Some(b"set"));
+        set_env_var(&host, b"SET_THEN_EMPTY", b"", true);
+        assert_eq!(host.env_get(b"SET_THEN_EMPTY"), None);
+
+        set_env_var(&host, b"UNSET_THEN_EMPTY", b"", true);
+        assert_eq!(host.env_get(b"UNSET_THEN_EMPTY"), None);
+
+        host.env_set(b"POSIX_EMPTY", Some(b"set"));
+        set_env_var(&host, b"POSIX_EMPTY", b"", false);
+        assert_eq!(host.env_get(b"POSIX_EMPTY"), Some("".into()));
+    }
 }

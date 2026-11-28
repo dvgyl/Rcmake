@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use rcmake_archive::{
     ArchiveError, ArchiveFormat, CreateOptions, ExtractOptions, SevenZipCompression,
     TarCompression, ZipCompression, create_filtered_archive, extract_archive, list_archive_details,
@@ -10,9 +12,10 @@ use rcmake_eval::{
     args::{KeywordParser, Parsed, Slot},
 };
 use rcmake_host::{
-    Stream,
-    path::{from_native, to_native},
+    FileKind, Follow, Host, Stream,
+    path::{from_native, from_native_cmake, to_native},
 };
+use rcmake_regex::{MatchOptions, Regex};
 
 use super::{Result, error, file::binary_destination};
 
@@ -92,6 +95,21 @@ pub(super) fn create(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         .iter()
         .map(|path| cx.resolve_path(&from_native(&base.join(to_native(path)))))
         .collect::<Vec<_>>();
+    if oem_restricts_pathnames(format, &encoding, cfg!(windows))
+        && let Some(bad) =
+            first_non_oem_entry(cx.host(), &base, &inputs, request.multi("PATTERNS_EXCLUDE"))
+    {
+        archive_diagnostic(
+            cx,
+            &[
+                b"archive_write_header: Can't translate pathname '".as_slice(),
+                bad.as_slice(),
+                b"' to OEM",
+            ]
+            .concat(),
+        );
+        return Err(failure());
+    }
     let options = CreateOptions {
         format: archive_format,
         mtime,
@@ -365,5 +383,152 @@ fn print_entries(cx: &Cx<'_>, entries: &[BString], prefix: &[u8]) {
     for entry in entries {
         cx.host()
             .write_out(Stream::Stdout, &[prefix, entry.as_slice(), b"\n"].concat());
+    }
+}
+
+fn oem_restricts_pathnames(format: &[u8], encoding: &[u8], windows: bool) -> bool {
+    windows && encoding.eq_ignore_ascii_case(b"OEM") && matches!(format, b"gnutar" | b"zip")
+}
+
+fn first_non_oem_entry(
+    host: &dyn Host,
+    base: &Path,
+    inputs: &[PathBuf],
+    excludes: &[BString],
+) -> Option<BString> {
+    let compiled: Vec<Regex> = excludes
+        .iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect();
+    let mut visited = 0usize;
+    for input in inputs {
+        let relative = input.strip_prefix(base).unwrap_or(input);
+        let rel_bytes = from_native_cmake(relative);
+        let rel_slice = rel_bytes.strip_prefix(b"/").unwrap_or(&rel_bytes);
+        if let Some(found) = scan_non_oem(host, input, rel_slice, &compiled, 0, &mut visited) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn scan_non_oem(
+    host: &dyn Host,
+    path: &Path,
+    relative: &[u8],
+    excludes: &[Regex],
+    depth: usize,
+    visited: &mut usize,
+) -> Option<BString> {
+    if depth > 64 || *visited >= 100_000 {
+        return None;
+    }
+    *visited += 1;
+    let is_excluded = |candidate: &[u8]| {
+        let mut budget = 1_000_000_u64;
+        excludes.iter().any(|regex| {
+            regex
+                .find_at(candidate, 0, MatchOptions::default(), &mut budget)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+    };
+    if !relative.is_empty() && is_excluded(relative) {
+        return None;
+    }
+    if !is_oem_cp437_representable(relative) {
+        return Some(BString::from(relative));
+    }
+    let meta = host.metadata(path, Follow::No).ok()?;
+    if meta.kind != FileKind::Dir {
+        return None;
+    }
+    let mut entries = host.read_dir(path).ok()?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for entry in entries {
+        let child_path = path.join(to_native(&entry.name));
+        let child_rel = if relative.is_empty() {
+            entry.name.clone()
+        } else {
+            BString::from([relative, b"/", entry.name.as_slice()].concat())
+        };
+        if let Some(found) =
+            scan_non_oem(host, &child_path, &child_rel, excludes, depth + 1, visited)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn is_oem_cp437_representable(bytes: &[u8]) -> bool {
+    if bytes.is_ascii() {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.chars()
+        .all(|ch| ch.is_ascii() || CP437_HIGH.contains(&ch))
+}
+
+const CP437_HIGH: [char; 128] = [
+    '\u{00C7}', '\u{00FC}', '\u{00E9}', '\u{00E2}', '\u{00E4}', '\u{00E0}', '\u{00E5}', '\u{00E7}',
+    '\u{00EA}', '\u{00EB}', '\u{00E8}', '\u{00EF}', '\u{00EE}', '\u{00EC}', '\u{00C4}', '\u{00C5}',
+    '\u{00C9}', '\u{00E6}', '\u{00C6}', '\u{00F4}', '\u{00F6}', '\u{00F2}', '\u{00FB}', '\u{00F9}',
+    '\u{00FF}', '\u{00D6}', '\u{00DC}', '\u{00A2}', '\u{00A3}', '\u{00A5}', '\u{20A7}', '\u{0192}',
+    '\u{00E1}', '\u{00ED}', '\u{00F3}', '\u{00FA}', '\u{00F1}', '\u{00D1}', '\u{00AA}', '\u{00BA}',
+    '\u{00BF}', '\u{2310}', '\u{00AC}', '\u{00BD}', '\u{00BC}', '\u{00A1}', '\u{00AB}', '\u{00BB}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255D}', '\u{255C}', '\u{255B}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252C}', '\u{251C}', '\u{2500}', '\u{253C}', '\u{255E}', '\u{255F}',
+    '\u{255A}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256C}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256B}',
+    '\u{256A}', '\u{2518}', '\u{250C}', '\u{2588}', '\u{2584}', '\u{258C}', '\u{2590}', '\u{2580}',
+    '\u{03B1}', '\u{00DF}', '\u{0393}', '\u{03C0}', '\u{03A3}', '\u{03C3}', '\u{00B5}', '\u{03C4}',
+    '\u{03A6}', '\u{0398}', '\u{03A9}', '\u{03B4}', '\u{221E}', '\u{03C6}', '\u{03B5}', '\u{2229}',
+    '\u{2261}', '\u{00B1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00F7}', '\u{2248}',
+    '\u{00B0}', '\u{2219}', '\u{00B7}', '\u{221A}', '\u{207F}', '\u{00B2}', '\u{25A0}', '\u{00A0}',
+];
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use rcmake_host::{HostResult, PureHost};
+
+    use super::*;
+
+    #[test]
+    fn windows_oem_restricts_only_gnutar_and_zip_on_unrepresentable_names() -> HostResult<()> {
+        assert!(oem_restricts_pathnames(b"gnutar", b"OEM", true));
+        assert!(oem_restricts_pathnames(b"zip", b"OEM", true));
+        assert!(!oem_restricts_pathnames(b"pax", b"OEM", true));
+        assert!(!oem_restricts_pathnames(b"paxr", b"OEM", true));
+        assert!(!oem_restricts_pathnames(b"7zip", b"OEM", true));
+        assert!(!oem_restricts_pathnames(b"zip", b"UTF-8", true));
+        assert!(!oem_restricts_pathnames(b"zip", b"OEM", false));
+
+        assert!(is_oem_cp437_representable("café.txt".as_bytes()));
+        assert!(!is_oem_cp437_representable("hungarian-hűtő.txt".as_bytes()));
+        assert!(!is_oem_cp437_representable("emoji-🎉.txt".as_bytes()));
+
+        let base = Path::new("/work");
+        let host = PureHost::new(base.to_path_buf(), base.join("cmake"));
+        let dir = base.join("compress_dir");
+        host.seed_file(&dir.join("ascii.txt"), b"ok")?;
+        host.seed_file(&dir.join("café.txt"), b"cp437")?;
+        assert_eq!(
+            first_non_oem_entry(&host, base, std::slice::from_ref(&dir), &[]),
+            None
+        );
+
+        host.seed_file(&dir.join("arabic-نَسِيج.txt"), b"utf8")?;
+        assert_eq!(
+            first_non_oem_entry(&host, base, &[dir], &[]),
+            Some(BString::from("compress_dir/arabic-نَسِيج.txt"))
+        );
+        Ok(())
     }
 }

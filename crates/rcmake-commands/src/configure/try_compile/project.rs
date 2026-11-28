@@ -116,6 +116,7 @@ pub(super) fn write_project(
     super::seed::warn_ignored_standards(cx, options, &languages);
     let properties = language_properties(cx, options, &languages);
     let probe_languages = languages.iter().map(|&lang| BString::from(lang)).collect();
+    let module_path = cx.var(b"CMAKE_MODULE_PATH");
     let code = render_project(
         ProjectInputs {
             archive,
@@ -123,6 +124,7 @@ pub(super) fn write_project(
             languages,
             compile_flags,
             language,
+            module_path,
             policies: outer_policies(cx),
             properties: &properties,
         },
@@ -199,6 +201,7 @@ pub(super) fn render_literal_probe(
     let languages = vec![language];
     let options = Options::default();
     let properties = language_properties_peek(cx, &options, &languages);
+    let module_path = cx.peek_var(b"CMAKE_MODULE_PATH").cloned();
     let project = render_project(
         ProjectInputs {
             archive: cx
@@ -208,6 +211,7 @@ pub(super) fn render_literal_probe(
             languages,
             compile_flags: Vec::new(),
             language: None,
+            module_path,
             policies: outer_policies(cx),
             properties: &properties,
         },
@@ -241,10 +245,21 @@ fn source_copy_error(cx: &mut Cx<'_>, file: &[u8], error: &rcmake_host::HostErro
             b"SOURCE_FROM_FILE failed to copy \"".as_slice(),
             file,
             b"\": ",
-            error.os_message.as_bytes(),
+            copy_error_reason(error).as_bytes(),
         ]
         .concat(),
     )
+}
+
+fn copy_error_reason(error: &rcmake_host::HostError) -> &str {
+    match error.kind {
+        std::io::ErrorKind::NotFound => "No such file or directory",
+        std::io::ErrorKind::PermissionDenied => "Permission denied",
+        std::io::ErrorKind::IsADirectory => "Is a directory",
+        std::io::ErrorKind::NotADirectory => "Not a directory",
+        std::io::ErrorKind::AlreadyExists => "File exists",
+        _ => &error.os_message,
+    }
 }
 
 /// Policies that the test project takes from the calling project. They can affect the
@@ -260,6 +275,7 @@ struct ProjectInputs<'a> {
     languages: Vec<&'a [u8]>,
     compile_flags: Vec<BString>,
     language: Option<&'a [u8]>,
+    module_path: Option<BString>,
     policies: [(u16, PolicyStatus); 4],
     properties: &'a [(BString, BString)],
 }
@@ -271,6 +287,7 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
         languages,
         compile_flags,
         language,
+        module_path,
         policies,
         properties,
     } = inputs;
@@ -279,6 +296,11 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
         if status != PolicyStatus::New {
             code.extend_from_slice(format!("cmake_policy(SET CMP{id:04} OLD)\n").as_bytes());
         }
+    }
+    if let Some(module_path) = module_path {
+        code.extend_from_slice(b"set(CMAKE_MODULE_PATH ");
+        write_quoted_arg(&mut code, &module_path);
+        code.extend_from_slice(b")\n");
     }
     code.extend_from_slice(b"project(CMAKE_TRY_COMPILE LANGUAGES");
     for &lang in &languages {
@@ -501,6 +523,7 @@ fn default_source_language(language: &[u8], extension: &[u8]) -> bool {
         ),
         b"OBJC" => extension == b"m",
         b"OBJCXX" => matches!(extension, b"M" | b"m" | b"mm"),
+        b"CSharp" => extension == b"cs",
         _ => false,
     }
 }
@@ -555,4 +578,32 @@ fn command_words(cx: &mut Cx<'_>, value: &[u8]) -> Vec<BString> {
         cx.unset_var(var);
     }
     words
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use std::io::ErrorKind;
+
+    use rcmake_host::HostError;
+
+    use super::{copy_error_reason, default_source_language};
+
+    #[test]
+    fn normalizes_source_copy_error_wording_portably() {
+        let not_found = HostError::from_io(
+            std::io::Error::new(
+                ErrorKind::NotFound,
+                "The system cannot find the file specified.",
+            ),
+            None,
+        );
+        assert_eq!(copy_error_reason(&not_found), "No such file or directory");
+
+        let perm = HostError::from_io(
+            std::io::Error::new(ErrorKind::PermissionDenied, "Access is denied."),
+            None,
+        );
+        assert_eq!(copy_error_reason(&perm), "Permission denied");
+        assert!(default_source_language(b"CSharp", b"cs"));
+    }
 }

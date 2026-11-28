@@ -89,6 +89,7 @@ fn real_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     } else {
         BString::from(*input)
     };
+    let input = rcmake_base::path_lex::cmake_style(&input);
     let path = if Lexical::new(&input).absolute() || base.is_empty() {
         input.clone()
     } else if input.is_empty() {
@@ -205,18 +206,30 @@ fn relative_absolute_with_case(base: &[u8], input: &[u8], ignore_case: bool) -> 
 }
 
 fn expand_home(cx: &Cx<'_>, input: &[u8]) -> BString {
-    if matches!(input, b"~") || input.starts_with(b"~/") {
-        let home = if cfg!(windows) {
-            cx.host()
-                .env_get(b"USERPROFILE")
-                .or_else(|| cx.host().env_get(b"HOME"))
+    expand_home_for(cx.host(), input, cfg!(windows))
+}
+
+fn expand_home_for(host: &dyn rcmake_host::Host, input: &[u8], windows: bool) -> BString {
+    if matches!(input, b"~") || input.starts_with(b"~/") || (windows && input.starts_with(b"~\\")) {
+        let home = if windows {
+            host.env_get(b"USERPROFILE")
+                .or_else(|| host.env_get(b"HOME"))
         } else {
-            cx.host().env_get(b"HOME")
+            host.env_get(b"HOME")
         };
         if let Some(home) = home.filter(|home| !home.is_empty()) {
-            return [home.as_slice(), input.get(1..).unwrap_or_default()]
-                .concat()
-                .into();
+            let home = if windows {
+                rcmake_base::path_lex::cmake_style_windows(&home)
+            } else {
+                home
+            };
+            let tail = input.get(1..).unwrap_or_default();
+            let tail = if windows {
+                rcmake_base::path_lex::cmake_style_windows(tail)
+            } else {
+                BString::from(tail)
+            };
+            return [home.as_slice(), tail.as_slice()].concat().into();
         }
     }
     input.into()
@@ -277,4 +290,25 @@ pub(super) fn legacy_separators(path: &[u8], trim_trailing: bool) -> BString {
 pub(super) fn binary_destination(cx: &Cx<'_>, input: &[u8]) -> std::path::PathBuf {
     let input = to_native(input);
     cx.resolve_path(&from_native_cmake(&cx.current_binary_dir().join(input)))
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use rcmake_base::path_lex::Lexical;
+    use rcmake_host::{Host, PureHost};
+
+    use super::expand_home_for;
+
+    #[test]
+    fn windows_expand_home_normalizes_userprofile_before_absolute_check() {
+        let host = PureHost::default();
+        host.env_set(b"USERPROFILE", Some(br"D:\t\rc\TestHome"));
+        let root = expand_home_for(&host, b"~", true);
+        assert_eq!(root, "D:/t/rc/TestHome");
+        assert!(Lexical::windows(&root).absolute());
+
+        let child = expand_home_for(&host, b"~/test.txt", true);
+        assert_eq!(child, "D:/t/rc/TestHome/test.txt");
+        assert!(Lexical::windows(&child).absolute());
+    }
 }

@@ -215,27 +215,19 @@ pub(super) fn hash(cx: &mut Cx<'_>, command: &[u8], algo: HashAlgo, args: &[&[u8
         ));
     };
     let path = cx.resolve_path(input);
-    let data = cx
-        .host()
-        .read(
-            &path,
-            ReadRange::All {
-                limit: cx.limits().max_file_read,
-            },
+    let digest = rcmake_host::path::hash_file(cx.host(), &path, algo).map_err(|e| {
+        error(
+            [
+                command,
+                b" failed to read file \"",
+                input,
+                b"\": ",
+                e.os_message.as_bytes(),
+            ]
+            .concat(),
         )
-        .map_err(|e| {
-            error(
-                [
-                    command,
-                    b" failed to read file \"",
-                    input,
-                    b"\": ",
-                    e.os_message.as_bytes(),
-                ]
-                .concat(),
-            )
-        })?;
-    set(cx, out, algo.hex_digest(&data))
+    })?;
+    set(cx, out, digest)
 }
 
 fn open_error(path: &std::path::Path, err: &HostError) -> rcmake_eval::CmdError {
@@ -312,4 +304,49 @@ fn format_time(cx: &Cx<'_>, time: FileTime, format: &[u8], utc: bool) -> Option<
         }
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use rcmake_base::hash::HashAlgo;
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream};
+
+    use crate::test_support::TestResult;
+
+    #[test]
+    fn file_hash_streams_beyond_single_read_cap_and_reports_missing_errors() -> TestResult {
+        let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = Arc::new(PureHost::new(root.to_path_buf(), root.join("cmake")));
+        let payload = vec![b'z'; 256];
+        host.seed_file(&root.join("big.bin"), &payload)?;
+        let script = root.join("hash.cmake");
+        host.seed_file(
+            &script,
+            b"file(SHA256 big.bin OUT)\nfile(MD5 missing.bin BAD)\n",
+        )?;
+        let mut config = InterpConfig::new(
+            host.clone(),
+            RunMode::Script,
+            root.join("data"),
+            root.join("cmake"),
+            root.to_path_buf(),
+        );
+        config.limits.max_file_read = 64;
+        let mut interp = Interp::new(config, crate::register_all);
+        assert_eq!(interp.run_script(&script).exit_code, 1);
+        assert_eq!(
+            interp.cx().var_or_empty(b"OUT"),
+            HashAlgo::Sha256.hex_digest(&payload)
+        );
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(
+            stderr.contains("MD5 failed to read file \"missing.bin\""),
+            "{stderr}"
+        );
+        Ok(())
+    }
 }

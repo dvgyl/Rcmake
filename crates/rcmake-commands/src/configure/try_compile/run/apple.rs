@@ -170,6 +170,7 @@ fn run(host: &dyn Host, cwd: &Path, tool: &str, args: &[BString]) -> Result<BStr
                 stderr: Output::Capture,
                 timeout: Some(Duration::from_secs(20)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

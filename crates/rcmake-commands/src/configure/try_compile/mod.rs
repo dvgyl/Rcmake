@@ -11,6 +11,8 @@ use rcmake_host::{CopyOptions, Host, HostError, Input, Output, RunRequest, path}
 use rcmake_model::{CacheEntry, CacheType};
 
 use args::{Options, Signature, parse};
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub(super) use child::begin_probe_prelude;
 pub(crate) use child::finish_probe_prelude;
 use child::{ChildBuild, ChildConfig};
 use log::log_probe;
@@ -229,7 +231,7 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
             format!(
                 "Executing {command} ({}) in:\n  {}",
                 BString::from(build_var),
-                dirs.binary.display()
+                path::from_native_cmake(&dirs.binary)
             )
             .into(),
         );
@@ -262,6 +264,7 @@ fn process_denial(host: &dyn Host) -> Option<BString> {
         stderr: Output::Null,
         timeout: None,
         tee: false,
+        default_error_mode: false,
     };
     if let Err(error) = host.run_bounded(&request, 0)
         && error.kind == std::io::ErrorKind::Unsupported
@@ -438,6 +441,8 @@ fn build_probe(
             prewarm,
             #[cfg(all(feature = "native", any(unix, windows)))]
             prelude,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            journal: journal.as_ref(),
         },
         |child, capture| initialize_probe(cx, child, journaled, capture),
     );

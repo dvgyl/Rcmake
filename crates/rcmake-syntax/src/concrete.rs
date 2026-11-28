@@ -352,7 +352,7 @@ fn parse_concrete_command(
             None => {
                 return Err(error(
                     name.start,
-                    "Unexpected end of file.\n\nParse error.  Function missing opening \"(\".",
+                    "Unexpected end of file.\nParse error.  Function missing opening \"(\".",
                 ));
             }
         }
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(parsed.attached_warnings[0].arg_index, 1);
         assert_eq!(
             parsed.list_file.warnings[0].body.as_slice(),
-            b"Syntax Warning in cmake code at column 8\n\nArgument not separated from preceding token by whitespace."
+            b"Syntax Warning in cmake code at column 8\nArgument not separated from preceding token by whitespace."
         );
 
         let tolerant = parse_tolerant(sid, src);

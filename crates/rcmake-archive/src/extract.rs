@@ -10,7 +10,7 @@ use tar::{Archive, EntryType};
 
 use crate::pattern::Patterns;
 use crate::{
-    ArchiveError, ExtractRequest, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
+    ArchiveError, ExtractRequest, absolute, archive_error, checked_name, emit_names,
     is_mac_metadata_name, read_bounded, relative_path,
 };
 use crate::{codec, external_filter, seven_zip, tar_budget, timestamp, zip_codec};
@@ -41,6 +41,8 @@ const RATIO: u64 = 200;
 const FLOOR: u64 = 1024 * 1024 * 1024;
 const TRAILER_BYTES: u64 = 16 * 1024 * 1024;
 const MIN_TAR_OVERHEAD: u64 = 64 * 1024;
+/// Bounded entry count for large source tarballs such as LLVM.
+const MAX_EXTRACT_ENTRIES: usize = 500_000;
 /// The largest AppleDouble metadata entry that the macOS tar reader accepts.
 const MAX_MAC_METADATA: u64 = 16 * 1024 * 1024;
 
@@ -331,10 +333,10 @@ impl Scan<'_> {
     }
     fn count_entry(&mut self, name_size: usize) -> Result<(), ArchiveError> {
         self.count += 1;
-        if self.count > MAX_ENTRIES {
+        if self.count > MAX_EXTRACT_ENTRIES {
             return Err(ArchiveError::new("Archive exceeds the entry or size limit"));
         }
-        self.reserve_metadata(name_size.saturating_mul(2).saturating_add(512))
+        self.reserve_metadata(name_size.saturating_mul(2).saturating_add(256))
     }
 
     fn reserve_metadata(&mut self, bytes: usize) -> Result<(), ArchiveError> {

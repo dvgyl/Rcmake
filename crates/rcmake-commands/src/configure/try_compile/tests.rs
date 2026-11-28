@@ -389,6 +389,7 @@ fn builds_real_macho_archive_and_runs_a_probe() -> TestResult {
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(15)),
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     )?;
@@ -1400,6 +1401,7 @@ fn ninja_verified_query_keeps_observe_and_speculate_probes_pure() -> TestResult 
                 stderr: rcmake_host::Output::Capture,
                 timeout: Some(std::time::Duration::from_secs(5)),
                 tee: false,
+                default_error_mode: false,
             }),
             "caller-dir VerifiedNinja must not replay into a different scratch directory"
         );
@@ -1698,4 +1700,174 @@ endif()
         assert_eq!(checks.first(), checks.get(1));
         Ok(())
     }
+}
+
+#[test]
+fn forwards_cmake_module_path_before_project_in_sources_signature() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    let root = PathBuf::from(format!("{DRIVE}/work"));
+    host.seed_file(&root.join("probe-cc"), b"")?;
+    host.seed_file(&root.join("main.c"), b"int main(void) { return 0; }\n")?;
+    host.seed_file(
+        &root.join("CMakeLists.txt"),
+        &format!(
+            "cmake_minimum_required(VERSION 4.5)\n\
+             project(Parent NONE)\n\
+             set(CMAKE_C_COMPILER {DRIVE}/work/probe-cc)\n\
+             set(CMAKE_MODULE_PATH \"{DRIVE}/work/custom_modules;{DRIVE}/work/more_modules\")\n\
+             set(CMAKE_DEBUG_TRY_COMPILE ON)\n\
+             try_compile(OK SOURCES {DRIVE}/work/main.c NO_CACHE)\n"
+        )
+        .into_bytes(),
+    )?;
+    host.set_command_handler(|_, _, _| {
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    let mut interp = interpreter(host.clone(), &root)?;
+    let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+    assert_eq!(
+        outcome.exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let scratch_root = root.join("build/CMakeFiles/CMakeScratch");
+    let entries = host.read_dir(&scratch_root)?;
+    let scratch_dir = scratch_root.join(rcmake_host::path::to_native(
+        &entries.first().ok_or("missing scratch dir")?.name,
+    ));
+    let lists = host.read(
+        &scratch_dir.join("CMakeLists.txt"),
+        ReadRange::All { limit: 1 << 20 },
+    )?;
+    let lists_text = String::from_utf8_lossy(&lists);
+    let expected_line = format!(
+        "set(CMAKE_MODULE_PATH \"{DRIVE}/work/custom_modules;{DRIVE}/work/more_modules\")\n"
+    );
+    let mp_pos = lists_text
+        .find(&expected_line)
+        .ok_or_else(|| format!("missing CMAKE_MODULE_PATH in:\n{lists_text}"))?;
+    let proj_pos = lists_text
+        .find("project(CMAKE_TRY_COMPILE")
+        .ok_or("missing project()")?;
+    assert!(
+        mp_pos < proj_pos,
+        "CMAKE_MODULE_PATH must be emitted before project():\n{lists_text}"
+    );
+    // Also verify `--debug-trycompile` emits forward-slash CMake paths (Windows parity).
+    let stderr = String::from_utf8_lossy(host.stream_bytes(Stream::Stderr).as_slice()).into_owned();
+    let expected_cmake_dir = rcmake_host::path::from_native_cmake(&scratch_dir);
+    assert!(
+        stderr.contains(std::str::from_utf8(&expected_cmake_dir)?),
+        "expected CMake-style path in debug-trycompile output:\n{stderr}"
+    );
+    // Also verify CMAKE_MODULE_PATH is recorded in the configure log YAML even when not listed
+    // in CMAKE_TRY_COMPILE_PLATFORM_VARIABLES.
+    let log_bytes = host.read(
+        &root.join("build/CMakeFiles/CMakeConfigureLog.yaml"),
+        ReadRange::All { limit: 1 << 20 },
+    )?;
+    let log_text = String::from_utf8_lossy(&log_bytes);
+    let expected_yaml =
+        format!("CMAKE_MODULE_PATH: \"{DRIVE}/work/custom_modules;{DRIVE}/work/more_modules\"");
+    assert!(
+        log_text.contains(&expected_yaml),
+        "expected CMAKE_MODULE_PATH in CMakeConfigureLog.yaml:\n{log_text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn project_signature_evaluates_file_generate_before_building() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    let root = PathBuf::from(format!("{DRIVE}/work"));
+    host.seed_file(&root.join("probe-cc"), b"")?;
+    host.seed_file(
+        &root.join("sub/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\n\
+          project(GenChild C)\n\
+          file(GENERATE OUTPUT \"${CMAKE_CURRENT_BINARY_DIR}/gen_main.c\" CONTENT \"int main(void) { return $<BOOL:1>; }\\n\")\n\
+          add_executable(genapp \"${CMAKE_CURRENT_BINARY_DIR}/gen_main.c\")\n",
+    )?;
+    host.seed_file(
+        &root.join("CMakeLists.txt"),
+        &format!(
+            "cmake_minimum_required(VERSION 4.5)\n\
+             project(Parent NONE)\n\
+             set(CMAKE_C_COMPILER {DRIVE}/work/probe-cc)\n\
+             try_compile(GEN_OK PROJECT GenChild SOURCE_DIR {DRIVE}/work/sub BINARY_DIR {DRIVE}/work/build/gen TARGET genapp NO_CACHE NO_LOG)\n"
+        )
+        .into_bytes(),
+    )?;
+    let saw_generated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&saw_generated);
+    let expected_gen = root.join("build/gen/gen_main.c");
+    host.set_command_handler(move |h, _, _| {
+        if let Ok(bytes) = h.read(&expected_gen, ReadRange::All { limit: 1024 })
+            && bytes == b"int main(void) { return 1; }\n"
+        {
+            seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    let mut interp = interpreter(host.clone(), &root)?;
+    let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+    assert_eq!(
+        outcome.exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    assert_eq!(interp.cx().var(b"GEN_OK"), Some("TRUE".into()));
+    assert!(
+        saw_generated.load(std::sync::atomic::Ordering::Relaxed),
+        "file(GENERATE) output must be written before build_child executes"
+    );
+    Ok(())
+}
+
+#[test]
+fn project_signature_file_generate_rejects_lexically_duplicate_outputs() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    let root = PathBuf::from(format!("{DRIVE}/work"));
+    host.seed_file(&root.join("probe-cc"), b"")?;
+    host.seed_file(
+        &root.join("sub/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\n\
+          project(DupChild C)\n\
+          file(GENERATE OUTPUT \"${CMAKE_CURRENT_BINARY_DIR}/out.c\" CONTENT \"int main(void) { return 0; }\\n\")\n\
+          file(GENERATE OUTPUT \"${CMAKE_CURRENT_BINARY_DIR}/sub/../out.c\" CONTENT \"int main(void) { return 0; }\\n\")\n\
+          add_executable(dupapp \"${CMAKE_CURRENT_BINARY_DIR}/out.c\")\n",
+    )?;
+    host.seed_file(
+        &root.join("CMakeLists.txt"),
+        &format!(
+            "cmake_minimum_required(VERSION 4.5)\n\
+             project(Parent NONE)\n\
+             set(CMAKE_C_COMPILER {DRIVE}/work/probe-cc)\n\
+             try_compile(DUP_OK PROJECT DupChild SOURCE_DIR {DRIVE}/work/sub BINARY_DIR {DRIVE}/work/build/dup TARGET dupapp OUTPUT_VARIABLE DUP_OUT NO_CACHE NO_LOG)\n"
+        )
+        .into_bytes(),
+    )?;
+    host.set_command_handler(|_, _, _| {
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    let mut interp = interpreter(host.clone(), &root)?;
+    let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+    assert_ne!(outcome.exit_code, 0);
+    let output = interp.cx().var(b"DUP_OUT").unwrap_or_default();
+    assert!(
+        String::from_utf8_lossy(&output).contains("multiple different commands"),
+        "expected duplicate output error, got:\n{output}"
+    );
+    Ok(())
 }

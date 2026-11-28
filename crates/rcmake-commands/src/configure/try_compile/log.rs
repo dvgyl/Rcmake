@@ -20,8 +20,8 @@ pub(super) fn log_probe(
 ) -> Result<(), CmdError> {
     let cached = !options.has(b"NO_CACHE");
     let merged = options.has(b"RUN_OUTPUT_VARIABLE");
-    let source = path::from_native(&dirs.source);
-    let binary = path::from_native(&dirs.binary);
+    let source = path::from_native_cmake(&dirs.source);
+    let binary = path::from_native_cmake(&dirs.binary);
     let run = run.map(|(variable, result)| TryRunOutcome {
         variable,
         cached,
@@ -50,4 +50,18 @@ pub(super) fn log_probe(
         run,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_base::path_lex;
+
+    #[test]
+    fn normalizes_windows_try_compile_directories_to_forward_slashes() {
+        let raw = br"D:/t/Inspect-build\CMakeFiles/CMakeScratch\TryCompile-48c-0";
+        assert_eq!(
+            path_lex::cmake_style_windows(raw),
+            "D:/t/Inspect-build/CMakeFiles/CMakeScratch/TryCompile-48c-0"
+        );
+    }
 }

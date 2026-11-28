@@ -186,6 +186,7 @@ impl BuildToolFacts {
             stderr: Output::Capture,
             timeout: Some(std::time::Duration::from_secs(5)),
             tee: false,
+            default_error_mode: false,
         };
         let output = host.run_bounded(&request, 4096).ok()?;
         if output.results != [ProcessResult::Exited(0)] {

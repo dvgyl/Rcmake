@@ -740,7 +740,7 @@ fn signature_error(target: &Target, signature: Signature, has_item: bool) -> Opt
     let calls = target.props.get(property)?;
     let name = &target.name;
     Some(format!(
-        "The {previous} signature for target_link_libraries has already been used with the target \"{name}\".  All uses of target_link_libraries with a target must be either all-keyword or all-plain.\nThe uses of the {previous} signature are here:\n{calls}\n"
+        "The {previous} signature for target_link_libraries has already been used with the target \"{name}\".  All uses of target_link_libraries with a target must be either all-keyword or all-plain.\nThe uses of the {previous} signature are here:{calls}\n"
     ))
 }
 

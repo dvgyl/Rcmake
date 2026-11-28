@@ -482,3 +482,159 @@ endforeach()
     );
     Ok(())
 }
+
+#[test]
+fn cold_configure_defers_executable_hashing_until_manifest_save() -> TestResult {
+    let f = Fixture::new()?;
+    // An unrecorded/unclassified command prevents any replay record from being emitted.
+    f.script("CMakeLists.txt", b"set(A 1)\n")?;
+    // Remove the executable before a cold run (`cached = None`): if cold start tried to
+    // hash the executable eagerly, `ReplaySession::start` would return `None` early.
+    // Here we verify a cold run without replayable output never reads the missing exe,
+    // and when the exe IS present, lazy hashing stamps it cleanly on manifest save.
+    f.host.remove_file(&f.root.join("rcmake"))?;
+    let mut cold = f.interp();
+    let record = f.run(&mut cold, None);
+    assert!(record.is_none());
+
+    // Restore the exe and verify cold save + warm hit works cleanly under configure.v6.
+    f.host.seed_file(&f.root.join("rcmake"), b"v6 binary")?;
+    let mut cold = f.interp();
+    let record = f
+        .run(&mut cold, None)
+        .ok_or("Missing cold replay record.")?;
+    let decoded = ConfigureSnapshot::<Regions>::decode(&record)?;
+    assert_eq!(decoded.schema, "configure.v6");
+    let mut warm = f.interp();
+    f.run(&mut warm, Some(&record));
+    assert_eq!(warm.replay_hits(), 1);
+    Ok(())
+}
+
+#[test]
+fn typed_setup_domains_distinguish_none_vs_empty_and_stacked_policies() -> TestResult {
+    let f = Fixture::new()?;
+    let base = f.interp();
+    let base_domains = base.setup_domains();
+
+    // Multi-frame policy stack with different weak flags must change only `policies`.
+    let mut pushed = f.interp();
+    pushed.policies.push_copy();
+    assert_ne!(pushed.setup_domains(), base_domains);
+    let mut weak = f.interp();
+    weak.policies.push_weak(rcmake_diag::PolicyMap::default());
+    assert_ne!(weak.setup_domains(), pushed.setup_domains());
+
+    // `None` vs `Some("")` on `DefinedProperty::initialize_from_variable` must differ.
+    let mut prop_none = f.interp();
+    prop_none
+        .project
+        .global
+        .defined_props
+        .push(rcmake_model::DefinedProperty {
+            scope: "TARGET".into(),
+            name: "P".into(),
+            inherited: false,
+            brief_docs: BString::default(),
+            full_docs: BString::default(),
+            initialize_from_variable: None,
+        });
+    let mut prop_empty = f.interp();
+    prop_empty
+        .project
+        .global
+        .defined_props
+        .push(rcmake_model::DefinedProperty {
+            scope: "TARGET".into(),
+            name: "P".into(),
+            inherited: false,
+            brief_docs: BString::default(),
+            full_docs: BString::default(),
+            initialize_from_variable: Some(BString::default()),
+        });
+    assert_ne!(prop_none.setup_domains(), prop_empty.setup_domains());
+
+    // Multi-frame diagnostic stacks with different weak flags or frame states must differ.
+    let mut diag_strong = f.interp();
+    diag_strong.diags.push_copy();
+    let mut diag_weak = f.interp();
+    diag_weak.diags.push_weak(rcmake_diag::DiagState::default());
+    assert_ne!(diag_strong.setup_domains(), base_domains);
+    assert_ne!(diag_weak.setup_domains(), diag_strong.setup_domains());
+    Ok(())
+}
+
+#[test]
+fn startup_exe_pinning_and_strict_memo_admission() -> TestResult {
+    let f = Fixture::new()?;
+    let exe = f.root.join("rcmake");
+
+    // Pin startup identity, then replace the binary on disk mid-configure -> must refuse to hash/publish.
+    let pinned = capture_startup_exe(f.host.as_ref(), &exe).ok_or("missing startup exe id")?;
+    assert!(executable_digest_pinned(f.host.as_ref(), &exe, Some(&pinned)).is_some());
+    f.host.seed_file(&exe, b"replaced binary with new size")?;
+    assert!(executable_digest_pinned(f.host.as_ref(), &exe, Some(&pinned)).is_none());
+
+    // Verify `ExeMemoKey::from_immutable` mirrors `TraceMemo`'s strict admission rules.
+    f.host.set_effective_uid(Some(1000))?;
+    f.host.sleep(std::time::Duration::from_secs(10));
+    let now = f.host.now();
+    let old_ctime = rcmake_host::FileTime {
+        secs: now.secs - 5,
+        nanos: 123_456,
+    };
+    let immutable_meta = rcmake_host::Metadata {
+        kind: FileKind::File,
+        len: 1024,
+        mode: 0o755,
+        mtime: old_ctime,
+        ctime: Some(old_ctime),
+        atime: old_ctime,
+        dev: 1,
+        ino: 42,
+        nlink: 1,
+        owner: Some(0),
+    };
+    assert!(ExeMemoKey::from_immutable(f.host.as_ref(), &exe, &immutable_meta).is_some());
+
+    // Missing ctime -> declined.
+    let mut no_ctime = immutable_meta.clone();
+    no_ctime.ctime = None;
+    assert!(ExeMemoKey::from_immutable(f.host.as_ref(), &exe, &no_ctime).is_none());
+
+    // Coarse second-resolution ctime (nanos == 0) -> declined.
+    let mut coarse_ctime = immutable_meta.clone();
+    coarse_ctime.ctime = Some(rcmake_host::FileTime {
+        secs: old_ctime.secs,
+        nanos: 0,
+    });
+    assert!(ExeMemoKey::from_immutable(f.host.as_ref(), &exe, &coarse_ctime).is_none());
+
+    // Recent ctime (within 1s of now) -> declined.
+    let mut recent_ctime = immutable_meta.clone();
+    recent_ctime.ctime = Some(rcmake_host::FileTime {
+        secs: now.secs,
+        nanos: 500,
+    });
+    assert!(ExeMemoKey::from_immutable(f.host.as_ref(), &exe, &recent_ctime).is_none());
+
+    // Zero inode -> declined.
+    let mut zero_ino = immutable_meta.clone();
+    zero_ino.ino = 0;
+    assert!(ExeMemoKey::from_immutable(f.host.as_ref(), &exe, &zero_ino).is_none());
+
+    // Owned by current user -> declined (writable/chmod-able by current user).
+    let mut owned_by_self = immutable_meta.clone();
+    owned_by_self.owner = Some(1000);
+    assert!(ExeMemoKey::from_immutable(f.host.as_ref(), &exe, &owned_by_self).is_none());
+
+    // Group-writable -> declined.
+    let mut group_writable = immutable_meta.clone();
+    group_writable.mode = 0o775;
+    assert!(ExeMemoKey::from_immutable(f.host.as_ref(), &exe, &group_writable).is_none());
+
+    // Root caller (uid == 0) -> declined.
+    f.host.set_effective_uid(Some(0))?;
+    assert!(ExeMemoKey::from_immutable(f.host.as_ref(), &exe, &immutable_meta).is_none());
+    Ok(())
+}

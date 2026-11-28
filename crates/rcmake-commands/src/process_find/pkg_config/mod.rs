@@ -107,7 +107,7 @@ fn load(
         }
         message
     })?;
-    let file = path::from_native(&path);
+    let file = path::from_native_cmake(&path);
     let fail = |stage| BString::from(format!("{stage} failed for file: '{file}'"));
     let content = cx
         .host()

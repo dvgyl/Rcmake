@@ -6,6 +6,7 @@ use rcmake_base::{
     BString,
     limits::Limits,
     list::{self, Empty},
+    path_lex::Lexical,
     truth::{if_constant, is_off},
     version,
 };
@@ -367,12 +368,17 @@ fn file_predicate(op: &[u8], operand: &[u8], env: &dyn CondEnv) -> bool {
     else {
         return false;
     };
+    file_predicate_for(op, metadata.kind, metadata.mode, cfg!(windows))
+}
+
+fn file_predicate_for(op: &[u8], kind: FileKind, mode: u32, windows: bool) -> bool {
     match op {
-        b"EXISTS" | b"IS_READABLE" => metadata.mode & 0o444 != 0,
-        b"IS_WRITABLE" => metadata.mode & 0o222 != 0,
-        b"IS_EXECUTABLE" => metadata.mode & 0o111 != 0,
-        b"IS_DIRECTORY" => metadata.kind == FileKind::Dir,
-        b"IS_SYMLINK" => metadata.kind == FileKind::Symlink,
+        b"EXISTS" => windows || mode & 0o444 != 0,
+        b"IS_READABLE" => windows || mode & 0o444 != 0,
+        b"IS_WRITABLE" => (windows && kind == FileKind::Dir) || mode & 0o222 != 0,
+        b"IS_EXECUTABLE" => windows || mode & 0o111 != 0,
+        b"IS_DIRECTORY" => kind == FileKind::Dir,
+        b"IS_SYMLINK" => kind == FileKind::Symlink,
         _ => true,
     }
 }
@@ -541,7 +547,7 @@ fn warn_policy(id: PolicyId, note: &str, env: &mut dyn CondEnv) {
         "Policy {id} is not set: {summary}  Run \"cmake --help-policy {id}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.",
     );
     if !note.is_empty() {
-        body.push_str("\n\n");
+        body.push('\n');
         body.push_str(note);
     }
     env.warn(Diagnostic {
@@ -555,27 +561,8 @@ fn warn_policy(id: PolicyId, note: &str, env: &mut dyn CondEnv) {
     });
 }
 
-fn is_separator(byte: u8) -> bool {
-    byte == b'/' || (cfg!(windows) && byte == b'\\')
-}
-
-fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
-    path.split(|&byte| is_separator(byte))
-        .filter(|part| !part.is_empty())
-}
-
-fn rooted(path: &[u8]) -> bool {
-    path.first().copied().is_some_and(is_separator)
-}
-
-fn has_trailing_separator(path: &[u8]) -> bool {
-    path.last().copied().is_some_and(is_separator)
-}
-
 fn path_equal(left: &[u8], right: &[u8]) -> bool {
-    rooted(left) == rooted(right)
-        && has_trailing_separator(left) == has_trailing_separator(right)
-        && components(left).eq(components(right))
+    Lexical::new(left).equal(Lexical::new(right))
 }
 
 fn path_prefix(prefix: &[u8], path: &[u8], env: &mut dyn CondEnv) -> bool {
@@ -590,20 +577,64 @@ fn path_prefix(prefix: &[u8], path: &[u8], env: &mut dyn CondEnv) -> bool {
             }
         };
     }
-    if rooted(prefix) != rooted(path) {
-        return false;
-    }
-    let mut path_parts = components(path);
-    for part in components(prefix) {
-        if path_parts.next() != Some(part) {
-            return false;
-        }
-    }
-    path_parts.next().is_some() || !has_trailing_separator(prefix) || has_trailing_separator(path)
+    Lexical::new(prefix).prefix(Lexical::new(path))
 }
 
 fn error(message: impl Into<BString>) -> CondError {
     CondError {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn windows_file_permissions_match_cmake() {
+        assert!(file_predicate_for(
+            b"IS_READABLE",
+            FileKind::File,
+            0o444,
+            true
+        ));
+        assert!(!file_predicate_for(
+            b"IS_WRITABLE",
+            FileKind::File,
+            0o444,
+            true
+        ));
+        assert!(file_predicate_for(
+            b"IS_EXECUTABLE",
+            FileKind::File,
+            0o444,
+            true
+        ));
+        assert!(file_predicate_for(
+            b"IS_WRITABLE",
+            FileKind::Dir,
+            0o555,
+            true
+        ));
+
+        assert!(!file_predicate_for(
+            b"IS_EXECUTABLE",
+            FileKind::File,
+            0o444,
+            false
+        ));
+        assert!(!file_predicate_for(
+            b"IS_WRITABLE",
+            FileKind::Dir,
+            0o555,
+            false
+        ));
+    }
+
+    #[test]
+    fn path_prefix_matches_lexical_on_windows_paths() {
+        assert!(Lexical::windows(br"C:\a").prefix(Lexical::windows(br"C:\a\b")));
+        assert!(!Lexical::windows(b"/a").prefix(Lexical::windows(b"//a/b")));
+        assert!(Lexical::windows(b"//host/share").prefix(Lexical::windows(b"//host/share/a")));
     }
 }

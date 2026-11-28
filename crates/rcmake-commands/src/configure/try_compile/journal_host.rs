@@ -18,6 +18,7 @@ impl Host for JournalHost<'_> {
     }
 
     fn read(&self, path: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Read);
         let result = self.inner.read(path, range);
         if !self.unobserved_read(path) {
             match (&result, range) {
@@ -45,6 +46,7 @@ impl Host for JournalHost<'_> {
     }
 
     fn read_chunks(&self, path: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Read);
         if self.private_path(path) {
             return self.inner.read_chunks(path, consume);
         }
@@ -67,11 +69,13 @@ impl Host for JournalHost<'_> {
     }
 
     fn write(&self, path: &Path, bytes: &[u8], mode: WriteMode) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         self.guard_write(path)?;
         self.inner.write(path, bytes, mode)
     }
 
     fn read_dir(&self, path: &Path) -> HostResult<Vec<DirEntry>> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         let mut result = self.inner.read_dir(path);
         if self.sorted_listings
             && let Ok(entries) = &mut result
@@ -107,37 +111,46 @@ impl Host for JournalHost<'_> {
     }
 
     fn create_dir_all(&self, path: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::CreateDir);
         self.guard_write(path)?;
         self.inner.create_dir_all(path)
     }
 
     fn create_private_dir(&self, path: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::CreateDir);
         self.guard_write(path)?;
         self.inner.create_private_dir(path)
     }
 
     fn remove_file(&self, path: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         self.guard_write(path)?;
         self.inner.remove_file(path)
     }
 
     fn remove_dir(&self, path: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         self.guard_write(path)?;
         self.inner.remove_dir(path)
     }
 
     fn remove_dir_all(&self, path: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         self.guard_write(path)?;
         self.inner.remove_dir_all(path)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(from, ScratchAccessKind::Other);
+        self.note_prelude_scratch_access(to, ScratchAccessKind::Other);
         self.guard_write(from)?;
         self.guard_write(to)?;
         self.inner.rename(from, to)
     }
 
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(from, ScratchAccessKind::Other);
+        self.note_prelude_scratch_access(to, ScratchAccessKind::Other);
         self.guard_write(from)?;
         self.guard_write(to)?;
         self.inner.rename_noreplace(from, to)
@@ -153,6 +166,8 @@ impl Host for JournalHost<'_> {
     }
 
     fn copy_file(&self, from: &Path, to: &Path, options: CopyOptions) -> HostResult<()> {
+        self.note_prelude_scratch_access(from, ScratchAccessKind::Other);
+        self.note_prelude_scratch_access(to, ScratchAccessKind::Other);
         self.guard_write(to)?;
         let _ = self.record_dependency(from);
         if options.preserve_permissions || options.preserve_mtime {
@@ -166,16 +181,20 @@ impl Host for JournalHost<'_> {
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(link, ScratchAccessKind::Other);
         self.guard_effect(ImpureReason::ExternalWrite)?;
         self.inner.symlink(target, link)
     }
 
     fn hard_link(&self, source: &Path, destination: &Path) -> HostResult<()> {
+        self.note_prelude_scratch_access(source, ScratchAccessKind::Other);
+        self.note_prelude_scratch_access(destination, ScratchAccessKind::Other);
         self.guard_effect(ImpureReason::ExternalWrite)?;
         self.inner.hard_link(source, destination)
     }
 
     fn read_link(&self, path: &Path) -> HostResult<PathBuf> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         let result = self.inner.read_link(path);
         if is_absolute(path)
             && path
@@ -208,6 +227,7 @@ impl Host for JournalHost<'_> {
     }
 
     fn set_permissions(&self, path: &Path, mode: u32) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         self.guard_write(path)?;
         self.inner.set_permissions(path, mode)
     }
@@ -218,6 +238,7 @@ impl Host for JournalHost<'_> {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         self.guard_write(path)?;
         self.inner.set_times(path, atime, mtime)
     }
@@ -284,6 +305,7 @@ impl Host for JournalHost<'_> {
     }
 
     fn open_read(&self, p: &Path) -> HostResult<Box<dyn rcmake_host::ReadSeek + '_>> {
+        self.note_prelude_scratch_access(p, ScratchAccessKind::Other);
         self.guard_effect(ImpureReason::UnverifiableInput)?;
         self.inner.open_read(p)
     }
@@ -303,6 +325,7 @@ impl Host for JournalHost<'_> {
         input: &mut dyn std::io::Read,
         len: u64,
     ) -> HostResult<()> {
+        self.note_prelude_scratch_access(p, ScratchAccessKind::Other);
         self.guard_write(p)?;
         self.guard_effect(ImpureReason::UnverifiableInput)?;
         self.inner.write_from(p, mode, input, len)
@@ -524,6 +547,17 @@ impl JournalHost<'_> {
 impl JournalHost<'_> {
     /// Record a metadata result in the journal, as [`Host::metadata`] does.
     fn observe_metadata(&self, path: &Path, follow: Follow, result: &HostResult<Metadata>) {
+        let access = if result
+            .as_ref()
+            .is_err_and(|err| err.kind == ErrorKind::NotFound)
+        {
+            ScratchAccessKind::MetadataMissing {
+                follow_yes: follow == Follow::Yes,
+            }
+        } else {
+            ScratchAccessKind::Metadata
+        };
+        self.note_prelude_scratch_access(path, access);
         if !self.unobserved_read(path) {
             match result {
                 Ok(meta) if is_absolute(path) && meta.kind != FileKind::Other => {
@@ -551,6 +585,7 @@ impl JournalHost<'_> {
 
     /// Record a canonicalization result in the journal, as [`Host::canonicalize`] does.
     fn observe_canonical(&self, path: &Path, result: &HostResult<PathBuf>) {
+        self.note_prelude_scratch_access(path, ScratchAccessKind::Other);
         if !self.unobserved_read(path) {
             match result {
                 Ok(target) if is_absolute(path) => {

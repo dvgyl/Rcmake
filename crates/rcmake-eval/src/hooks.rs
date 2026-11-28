@@ -394,6 +394,18 @@ impl Interp {
         self.lookup_var(name).cloned()
     }
 
+    /// Borrow a variable without cloning when no watch or deprecation warning applies.
+    /// When a watch applies, run the full watch path and return the post-watch value.
+    pub(crate) fn read_var_ref(&mut self, name: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        if !self.needs_var_watch(name) {
+            return self
+                .lookup_var(name)
+                .map(|value| std::borrow::Cow::Borrowed(value.as_slice()));
+        }
+        self.read_var(name)
+            .map(|value| std::borrow::Cow::Owned(value.into()))
+    }
+
     /// Install or remove the trace configuration. With `--trace-redirect`, truncate the
     /// output file. With JSON output, write the format version line.
     pub(crate) fn install_trace(&mut self, config: Option<TraceConfig>) {

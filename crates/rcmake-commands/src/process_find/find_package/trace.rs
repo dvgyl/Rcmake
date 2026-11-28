@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rcmake_base::BString;
+use rcmake_base::{BString, path_lex::cmake_style_windows};
 use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::Cx;
 use rcmake_host::path;
@@ -32,7 +32,7 @@ impl SearchTrace {
                 body.extend_from_slice(b"  none\n");
             } else {
                 for path in paths {
-                    append_path(body, &path::from_native(path));
+                    append_path(body, &path::from_native_cmake(path));
                 }
             }
         }
@@ -47,7 +47,8 @@ impl SearchTrace {
 
     pub(super) fn candidate(&mut self, dir: &Path, filename: &Path) {
         if self.body.is_some() {
-            self.candidates.push(path::from_native(&dir.join(filename)));
+            self.candidates
+                .push(path::from_native_cmake(&dir.join(filename)));
         }
     }
 
@@ -62,7 +63,7 @@ impl SearchTrace {
         } else {
             self.section(&heading, paths);
         }
-        let found = found.map(path::from_native);
+        let found = found.map(path::from_native_cmake);
         self.result(found.as_ref().map(|value| value.as_slice()));
     }
 
@@ -114,6 +115,36 @@ impl SearchTrace {
 
 fn append_path(body: &mut BString, path: &[u8]) {
     body.extend_from_slice(b"  ");
-    body.extend_from_slice(path);
+    let normalized = normalize_trace_path(path, cfg!(windows));
+    body.extend_from_slice(&normalized);
     body.push(b'\n');
+}
+
+fn normalize_trace_path(path: &[u8], windows: bool) -> BString {
+    if windows {
+        cmake_style_windows(path)
+    } else {
+        path.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_trace_path;
+
+    #[test]
+    fn normalizes_windows_separators_at_trace_boundary() {
+        assert_eq!(
+            normalize_trace_path(br"D:/work/pkgRedirects\SearchPathsConfig.cmake", true),
+            "D:/work/pkgRedirects/SearchPathsConfig.cmake"
+        );
+        assert_eq!(
+            normalize_trace_path(br"D:\work\Modules\FindFoo.cmake", true),
+            "D:/work/Modules/FindFoo.cmake"
+        );
+        assert_eq!(
+            normalize_trace_path(br"/unix/dir\with\backslash/FindFoo.cmake", false),
+            r"/unix/dir\with\backslash/FindFoo.cmake"
+        );
+    }
 }

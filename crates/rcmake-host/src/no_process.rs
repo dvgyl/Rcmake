@@ -347,6 +347,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: true,
+            default_error_mode: false,
         }
     }
 

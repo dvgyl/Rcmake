@@ -376,7 +376,13 @@ fn list_index_policy_applies_before_bounds_checks() {
     let mut state = Script::new(Vec::new());
     state.success("set(xs a;b;c)\nlist(GET xs 1word result)");
     state.var("result", b"b");
-    assert!(state.stderr().contains("Invalid list index \"1word\"."));
+    let stderr = state.stderr();
+    assert!(stderr.contains("Invalid list index \"1word\"."), "{stderr}");
+    assert!(
+        stderr.contains("suppress this warning.\n\n  Invalid list index \"1word\"."),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("\n\n\n\n  Invalid list index"), "{stderr}");
 
     let mut state = Script::new(Vec::new());
     state.policy(121, rcmake_diag::PolicyStatus::Old);
@@ -389,6 +395,32 @@ fn list_index_policy_applies_before_bounds_checks() {
     let exit = state.run("set(xs a;b;c)\nlist(GET xs 9 word result)");
     assert_eq!(exit, 1);
     assert!(state.stderr().contains("index: word is not a valid index"));
+}
+
+#[test]
+fn option_and_exec_program_policy_warnings_use_single_blank_line() {
+    let mut opt = Script::new(Vec::new());
+    opt.success("set(MY_OPT ON)\noption(MY_OPT \"help\" OFF)");
+    let stderr = opt.stderr();
+    assert!(
+        stderr.contains(
+            "suppress this warning.\n\n  For compatibility with older versions of CMake, option is clearing the"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("\n\n\n\n  For compatibility"), "{stderr}");
+
+    let mut exec = Script::new(Vec::new());
+    exec.success("exec_program(true OUTPUT_VARIABLE out RETURN_VALUE rc)");
+    let stderr = exec.stderr();
+    assert!(
+        stderr.contains("suppress this warning.\n\n  Use execute_process() instead."),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("\n\n\n\n  Use execute_process"),
+        "{stderr}"
+    );
 }
 
 #[test]

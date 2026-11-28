@@ -515,13 +515,15 @@ impl<'a> Search<'a> {
             || cx
                 .var_normal_only(b"CMAKE_FIND_PACKAGE_NAME")
                 .is_some_and(|package| cx.find_package_debug(&package));
+        let is_windows = sysname == b"Windows";
         Self {
             kind,
             options,
             is_darwin,
-            is_windows: sysname == b"Windows",
+            is_windows,
             hermetic,
-            decoration: matches!(kind, Kind::Library).then(|| LibraryNames::new(cx, is_darwin)),
+            decoration: matches!(kind, Kind::Library)
+                .then(|| LibraryNames::new(cx, is_darwin, is_windows)),
             ignored: IgnoredPaths::new(cx),
             considered: debug.then(String::new),
             match_path: None,
@@ -1221,7 +1223,7 @@ impl<'a> Search<'a> {
         let file = file_path.strip_prefix(&base).unwrap_or(&file_path);
         let mut log = format!(
             "CMake Debug Log at {}:{} ({command}):\n  {command} called with the following settings:\n\n    VAR: {}\n",
-            file.display(),
+            path::from_native_cmake(file),
             cx.current_line(),
             var.to_str_lossy(),
         );
@@ -1280,7 +1282,11 @@ impl<'a> Search<'a> {
         let _ = writeln!(log, "\n  {command} considered the following locations:\n");
         log.push_str(trace);
         if let Some(found) = &self.match_path {
-            let _ = writeln!(log, "\n  The item was found at\n\n    {}", found.display());
+            let _ = writeln!(
+                log,
+                "\n  The item was found at\n\n    {}",
+                path::from_native_cmake(found)
+            );
         } else {
             if !trace.is_empty() {
                 log.push('\n');
@@ -1299,7 +1305,7 @@ impl<'a> Search<'a> {
             for frame in callers {
                 let file = path::to_native(&frame.file);
                 let display = file.strip_prefix(&base).unwrap_or(&file);
-                let _ = write!(log, "  {}:{}", display.display(), frame.line);
+                let _ = write!(log, "  {}:{}", path::from_native_cmake(display), frame.line);
                 if let Some(name) = &frame.name {
                     let _ = write!(log, " ({})", name.to_str_lossy());
                 }
@@ -1342,14 +1348,17 @@ struct LibraryNames {
 }
 
 impl LibraryNames {
-    fn new(cx: &Cx<'_>, is_darwin: bool) -> Self {
-        let prefixes = library_parts(cx, b"CMAKE_FIND_LIBRARY_PREFIXES", b"lib");
-        let defaults: &[u8] = if is_darwin {
+    fn new(cx: &Cx<'_>, is_darwin: bool, is_windows: bool) -> Self {
+        let default_prefixes: &[u8] = if is_windows { b";lib" } else { b"lib" };
+        let prefixes = library_parts(cx, b"CMAKE_FIND_LIBRARY_PREFIXES", default_prefixes);
+        let default_suffixes: &[u8] = if is_windows {
+            b".lib;.dll.a;.a"
+        } else if is_darwin {
             b".tbd;.dylib;.so;.a"
         } else {
             b".so;.a"
         };
-        let suffixes = library_parts(cx, b"CMAKE_FIND_LIBRARY_SUFFIXES", defaults);
+        let suffixes = library_parts(cx, b"CMAKE_FIND_LIBRARY_SUFFIXES", default_suffixes);
         Self { prefixes, suffixes }
     }
 
@@ -1367,7 +1376,19 @@ impl LibraryNames {
     fn pattern(&self, dir: &Path, name: &Path) -> String {
         use rcmake_base::ByteSlice as _;
 
-        let dir = dir.join(name.parent().unwrap_or_else(|| Path::new("")));
+        let dir = match name
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            Some(parent) => dir.join(parent),
+            None => dir.to_path_buf(),
+        };
+        let dir_text = path::from_native_cmake(&dir);
+        let dir_display = if dir_text.len() > 1 {
+            dir_text.strip_suffix(b"/").unwrap_or(&dir_text)
+        } else {
+            &dir_text
+        };
         let file = name.file_name().unwrap_or_default().to_string_lossy();
         let prefixes: Vec<_> = self
             .prefixes
@@ -1386,7 +1407,7 @@ impl LibraryNames {
         };
         format!(
             "{}//{prefix}{}({})",
-            dir.display(),
+            dir_display.to_str_lossy(),
             regex_literal(&file),
             suffixes.join("|")
         )
@@ -1833,6 +1854,7 @@ fn bundle_executable(
                 stderr: Output::Null,
                 timeout: Some(Duration::from_secs(2)),
                 tee: false,
+                default_error_mode: false,
             };
             host.run(&request, &mut |_, _| {})
                 .ok()
@@ -2423,5 +2445,36 @@ mod plist_tests {
         );
         cache.remove(&dir_a);
         assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[test]
+    fn windows_library_defaults_include_empty_prefix_and_windows_suffixes() {
+        let cwd = path::to_native(if cfg!(windows) { b"C:/work" } else { b"/work" });
+        let host = Arc::new(rcmake_host::PureHost::new(cwd.clone(), cwd.join("cmake")));
+        let mut interp = rcmake_eval::Interp::new(
+            rcmake_eval::InterpConfig::new(
+                host,
+                RunMode::Script,
+                cwd.join("data"),
+                cwd.join("cmake"),
+                cwd,
+            ),
+            crate::register_all,
+        );
+        let cx = interp.cx();
+        let win = LibraryNames::new(&cx, false, true);
+        assert_eq!(win.prefixes, [BString::from(""), BString::from("lib")]);
+        assert_eq!(
+            win.suffixes,
+            [
+                BString::from(".lib"),
+                BString::from(".dll.a"),
+                BString::from(".a"),
+            ]
+        );
+        assert_eq!(
+            win.pattern(Path::new("/opt/lib"), Path::new("foo")),
+            "/opt/lib//(|lib)foo(\\.lib|\\.dll\\.a|\\.a)"
+        );
     }
 }

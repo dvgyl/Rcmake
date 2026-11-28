@@ -111,6 +111,8 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         download
             .flags
             .extend(["--output".into(), path::from_native(file)]);
+    } else {
+        append_discard_output_flag(&mut download.flags, cfg!(windows));
     }
     if let Some((start, end)) = download.ranges.last() {
         let mut range = BString::from(*start);
@@ -146,6 +148,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 stderr: Output::Capture,
                 timeout,
                 tee: false,
+                default_error_mode: false,
             },
             cx.limits().max_value_bytes,
         )
@@ -405,6 +408,12 @@ impl ExpectedHash {
     }
 }
 
+fn append_discard_output_flag(flags: &mut Vec<BString>, windows: bool) {
+    if windows {
+        flags.extend(["--output".into(), "NUL".into()]);
+    }
+}
+
 fn setting(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
     cx.var(name).or_else(|| cx.host().env_get(name))
 }
@@ -556,5 +565,16 @@ mod tests {
             "{stderr}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn windows_download_without_output_file_discards_to_nul() {
+        let mut win_flags = Vec::new();
+        super::append_discard_output_flag(&mut win_flags, true);
+        assert_eq!(win_flags, vec!["--output", "NUL"]);
+
+        let mut unix_flags = Vec::new();
+        super::append_discard_output_flag(&mut unix_flags, false);
+        assert!(unix_flags.is_empty());
     }
 }

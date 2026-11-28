@@ -396,6 +396,7 @@ fn run_tool(
         stderr: Output::Capture,
         timeout: Some(std::time::Duration::from_secs(1800)),
         tee: false,
+        default_error_mode: false,
     };
     let output = cx
         .host

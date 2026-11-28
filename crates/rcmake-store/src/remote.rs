@@ -459,6 +459,7 @@ impl<'a> RemoteStoreClient<'a> {
             stderr: Output::Null,
             timeout: Some(time),
             tee: false,
+            default_error_mode: false,
         };
         let result = self
             .host

@@ -1323,6 +1323,7 @@ fn read_macho_reads_system_and_compiler_binaries_on_macos() -> TestResult {
                 stderr: Output::Capture,
                 timeout: Some(Duration::from_secs(30)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )?;

@@ -160,6 +160,23 @@ pub(super) fn initialize(cx: &mut Cx<'_>, generator: GeneratorKind) -> Result<()
                 b"CMAKE_VS_PLATFORM_TOOLSET_HOST_ARCHITECTURE",
                 toolset.host.clone().unwrap_or_else(|| default_host.into()),
             );
+            if let Some(vctargets) = &toolset.vctargets
+                && !vctargets.is_empty()
+            {
+                let normalized: Vec<u8> = vctargets
+                    .iter()
+                    .map(|&byte| if byte == b'/' { b'\\' } else { byte })
+                    .collect();
+                cx.set_var(
+                    b"CMAKE_VS_PLATFORM_TOOLSET_VCTARGETS_CUSTOM_DIR",
+                    normalized.into(),
+                );
+            }
+            if !cx.var_defined(b"CMAKE_VS_TARGET_FRAMEWORK_VERSION")
+                && matches!(version, VsVersion::Vs17 | VsVersion::Vs18)
+            {
+                cx.set_var(b"CMAKE_VS_TARGET_FRAMEWORK_VERSION", "v4.7.2".into());
+            }
         }
         _ => {}
     }
@@ -303,6 +320,7 @@ fn find_installed_msbuild(
         stderr: Output::Null,
         timeout: Some(Duration::from_secs(5)),
         tee: false,
+        default_error_mode: false,
     };
     let output = host.run_bounded(&request, 64 * 1024).ok()?;
     if output.results != [ProcessResult::Exited(0)] {
@@ -361,6 +379,7 @@ fn xcode_version(cx: &mut Cx<'_>) -> Option<XcodeVersion> {
         stderr: Output::Null,
         timeout: Some(Duration::from_secs(5)),
         tee: false,
+        default_error_mode: false,
     };
     let version = host
         .run(&request, &mut |_, _| {})

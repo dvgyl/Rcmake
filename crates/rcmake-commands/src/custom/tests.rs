@@ -423,3 +423,24 @@ fn if_rule_uses_directory_and_global_visibility() -> TestResult {
         0,
     )
 }
+
+#[test]
+fn cmp0175_warning_uses_single_blank_line_before_policy_text() -> TestResult {
+    let mut f = Fixture::new();
+    f.configure(
+        r#"
+        cmake_policy(VERSION 3.30)
+        project(CustomWarn LANGUAGES NONE)
+        add_custom_target(t)
+        add_custom_command(TARGET t POST_BUILD COMMENT "no command")
+        "#,
+        0,
+    )?;
+    let stderr = f.host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("At least one COMMAND must be given.\n\n  Policy CMP0175 is not set:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("\n\n\n\n  Policy CMP0175"), "{stderr}");
+    Ok(())
+}

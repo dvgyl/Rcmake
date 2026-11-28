@@ -39,6 +39,15 @@ impl Interp {
         self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
+        let abs = if self.is_regular_file(&abs) {
+            let on_disk = self
+                .config
+                .host
+                .path_on_disk(&rcmake_host::path::to_native(&abs));
+            rcmake_host::path::from_native_cmake(&on_disk)
+        } else {
+            abs
+        };
 
         if standalone {
             self.store_var(b"CMAKE_SCRIPT_MODE_FILE", abs.clone());
@@ -103,6 +112,7 @@ impl Interp {
                 }
                 if directory {
                     self.run_deferred(abs);
+                    self.run_legacy_subdirs();
                     self.add_user_configure_depends();
                 }
                 true
@@ -317,6 +327,15 @@ impl Interp {
         self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
+        let abs = if self.is_regular_file(&abs) {
+            let on_disk = self
+                .config
+                .host
+                .path_on_disk(&rcmake_host::path::to_native(&abs));
+            rcmake_host::path::from_native_cmake(&on_disk)
+        } else {
+            abs
+        };
         let display = path.to_string_lossy();
         self.config.host.write_out(
             Stream::Stdout,
@@ -414,6 +433,70 @@ impl Interp {
             let abs = collapse_full_path(&dep, &base);
             self.record_list_file(&abs);
         }
+    }
+
+    /// Run legacy `subdirs()` directories queued during the current directory listfile,
+    /// using the parent's end-of-listfile variables, policies, and directory state while
+    /// preserving each subdirectory's original `install_position`.
+    fn run_legacy_subdirs(&mut self) {
+        const LEGACY_SUBDIRS_PROP: &[u8] = b"\0rcmake-legacy-subdirs";
+        let id = self.current_dir_id();
+        let Some(raw) = self.project.dir(id).props.get(LEGACY_SUBDIRS_PROP).cloned() else {
+            return;
+        };
+        let mut cursor = 0;
+        while !self.fatal && self.exit_override.is_none() && !self.over_budget() {
+            let Some(tail) = raw.as_slice().get(cursor..) else {
+                break;
+            };
+            let Some(record) = parse_legacy_subdir_record(tail) else {
+                break;
+            };
+            cursor += record.consumed;
+            // Release this entry's own reservation right before configuring it while keeping
+            // any later queued legacy subdirs reserved against sibling `add_subdirectory` calls.
+            match raw.as_slice().get(cursor..) {
+                Some(remaining) if !remaining.is_empty() => {
+                    self.project
+                        .dir_mut(id)
+                        .props
+                        .set(LEGACY_SUBDIRS_PROP.into(), remaining.into());
+                }
+                _ => {
+                    self.project.dir_mut(id).props.unset(LEGACY_SUBDIRS_PROP);
+                }
+            }
+            if record.src.is_empty() {
+                continue;
+            }
+            if self
+                .project
+                .dirs()
+                .any(|(_, entry)| entry.binary_dir.as_slice() == record.bin)
+            {
+                self.error_here(cat(&[
+                    b"The binary directory\n  ",
+                    record.bin,
+                    b"\nis already used to build a source directory.  It cannot be used to build source directory\n  ",
+                    record.src,
+                    b"\nSpecify a unique binary directory name.",
+                ]));
+                continue;
+            }
+            let options = SubdirOptions {
+                exclude_from_all: record.exclude == b"1",
+                system: false,
+            };
+            let src_native = path::to_native(record.src);
+            let bin_native = path::to_native(record.bin);
+            if let Ok(child_id) = self.run_subdirectory(&src_native, &bin_native, options)
+                && let Ok(pos_str) = core::str::from_utf8(record.install_pos)
+                && let Ok(pos) = pos_str.parse::<usize>()
+            {
+                self.project.dir_mut(child_id).install_position = pos;
+            }
+        }
+        self.project.dir_mut(id).props.unset(LEGACY_SUBDIRS_PROP);
     }
 
     pub(super) fn record_list_file(&mut self, abs: &[u8]) {
@@ -554,5 +637,180 @@ impl Interp {
 
     pub(crate) fn current_source_dir_bytes(&self) -> BString {
         rcmake_base::path_lex::cmake_style(&self.project.dir(self.current_dir_id()).source_dir)
+    }
+}
+
+struct LegacySubdirRecord<'a> {
+    src: &'a [u8],
+    bin: &'a [u8],
+    exclude: &'a [u8],
+    install_pos: &'a [u8],
+    consumed: usize,
+}
+
+fn parse_legacy_subdir_record(bytes: &[u8]) -> Option<LegacySubdirRecord<'_>> {
+    let mut offset = 0;
+    let mut next_field = || {
+        let rest = bytes.get(offset..)?;
+        let nul = rest.iter().position(|&byte| byte == 0)?;
+        let field = rest.get(..nul)?;
+        offset += nul + 1;
+        Some(field)
+    };
+    let src = next_field()?;
+    let bin = next_field()?;
+    let exclude = next_field()?;
+    let install_pos = next_field()?;
+    Some(LegacySubdirRecord {
+        src,
+        bin,
+        exclude,
+        install_pos,
+        consumed: offset,
+    })
+}
+
+#[cfg(test)]
+mod path_on_disk_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use rcmake_host::{Host, PureHost, forward_host};
+
+    use crate::{Interp, InterpConfig, RunMode};
+
+    /// Host wrapper that resolves paths case-insensitively on lookup and returns the
+    /// on-disk spelling from `Host::path_on_disk`, modeling macOS/Windows filesystems.
+    struct CaseInsensitiveHost {
+        base: PureHost,
+    }
+
+    impl Host for CaseInsensitiveHost {
+        forward_host!(base, env, process, services);
+
+        fn metadata(
+            &self,
+            p: &Path,
+            follow: rcmake_host::Follow,
+        ) -> rcmake_host::HostResult<rcmake_host::Metadata> {
+            let resolved = self.path_on_disk(p);
+            self.base.metadata(&resolved, follow)
+        }
+
+        fn read(
+            &self,
+            p: &Path,
+            range: rcmake_host::ReadRange,
+        ) -> rcmake_host::HostResult<Vec<u8>> {
+            let resolved = self.path_on_disk(p);
+            self.base.read(&resolved, range)
+        }
+
+        fn write(
+            &self,
+            p: &Path,
+            data: &[u8],
+            mode: rcmake_host::WriteMode,
+        ) -> rcmake_host::HostResult<()> {
+            self.base.write(p, data, mode)
+        }
+
+        fn read_dir(&self, p: &Path) -> rcmake_host::HostResult<Vec<rcmake_host::DirEntry>> {
+            self.base.read_dir(p)
+        }
+
+        fn create_dir_all(&self, p: &Path) -> rcmake_host::HostResult<()> {
+            self.base.create_dir_all(p)
+        }
+
+        fn remove_file(&self, p: &Path) -> rcmake_host::HostResult<()> {
+            self.base.remove_file(p)
+        }
+
+        fn remove_dir(&self, p: &Path) -> rcmake_host::HostResult<()> {
+            self.base.remove_dir(p)
+        }
+
+        fn remove_dir_all(&self, p: &Path) -> rcmake_host::HostResult<()> {
+            self.base.remove_dir_all(p)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> rcmake_host::HostResult<()> {
+            self.base.rename(from, to)
+        }
+
+        fn copy_file(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: rcmake_host::CopyOptions,
+        ) -> rcmake_host::HostResult<()> {
+            self.base.copy_file(from, to, opts)
+        }
+
+        fn symlink(&self, target: &Path, link: &Path) -> rcmake_host::HostResult<()> {
+            self.base.symlink(target, link)
+        }
+
+        fn hard_link(&self, src: &Path, dst: &Path) -> rcmake_host::HostResult<()> {
+            self.base.hard_link(src, dst)
+        }
+
+        fn read_link(&self, p: &Path) -> rcmake_host::HostResult<PathBuf> {
+            self.base.read_link(p)
+        }
+
+        fn canonicalize(&self, p: &Path) -> rcmake_host::HostResult<PathBuf> {
+            self.base.canonicalize(p)
+        }
+
+        fn path_on_disk(&self, p: &Path) -> PathBuf {
+            rcmake_host::path::path_on_disk_with(p, |dir| self.base.read_dir(dir))
+        }
+
+        fn set_permissions(&self, p: &Path, mode: u32) -> rcmake_host::HostResult<()> {
+            self.base.set_permissions(p, mode)
+        }
+
+        fn set_times(
+            &self,
+            p: &Path,
+            atime: Option<rcmake_host::FileTime>,
+            mtime: Option<rcmake_host::FileTime>,
+        ) -> rcmake_host::HostResult<()> {
+            self.base.set_times(p, atime, mtime)
+        }
+    }
+
+    #[test]
+    fn script_mode_uses_host_path_on_disk_for_script_and_list_file_vars() {
+        let base = PureHost::new(PathBuf::from("/Work"), PathBuf::from("/bin/cmake"));
+        base.seed_file(Path::new("/Work/P_PathOnDisk.cmake"), b"capture()\n")
+            .unwrap();
+        let host: Arc<dyn Host> = Arc::new(CaseInsensitiveHost { base });
+        let config = InterpConfig::new(host, RunMode::Script, "/share", "/bin/cmake", "/Work");
+        let mut interp = Interp::new(config, |reg| {
+            reg.add(
+                "capture",
+                |cx, _| {
+                    let script = cx.var_or_empty(b"CMAKE_SCRIPT_MODE_FILE");
+                    let list = cx.var_or_empty(b"CMAKE_CURRENT_LIST_FILE");
+                    cx.set_var(b"CAPTURED_SCRIPT", script);
+                    cx.set_var(b"CAPTURED_LIST", list);
+                    Ok(crate::Flow::Normal)
+                },
+                crate::CmdFlags { scriptable: true },
+            );
+        });
+        let outcome = interp.run_script(Path::new("/work/p_pathondisk.cmake"));
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            interp.cx().var_or_empty(b"CAPTURED_SCRIPT"),
+            "/Work/P_PathOnDisk.cmake"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"CAPTURED_LIST"),
+            "/Work/P_PathOnDisk.cmake"
+        );
     }
 }

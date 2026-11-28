@@ -194,6 +194,7 @@ fn run(cx: &Cx<'_>, command: CommandSpec) -> Option<Vec<u8>> {
                 stderr: Output::Null,
                 timeout: Some(Duration::from_secs(30)),
                 tee: false,
+                default_error_mode: false,
             },
             cx.limits().max_value_bytes.min(4 * 1024 * 1024),
         )

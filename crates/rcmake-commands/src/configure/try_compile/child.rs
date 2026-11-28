@@ -115,6 +115,8 @@ impl ChildConfig {
             prewarm,
             #[cfg(all(feature = "native", any(unix, windows)))]
             prelude,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            journal,
         } = build;
         let mut recursion_exceeded = false;
         let mut failure = None;
@@ -157,14 +159,19 @@ impl ChildConfig {
                     crate::configure::concurrent::join(|| prewarm.run(&dirs.binary), build_interp);
                 (verified.unwrap_or(false), child)
             } else {
-                let verified = !matches!(
-                    self.generator,
-                    Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-                );
+                let verified = journal.is_some()
+                    || !matches!(
+                        self.generator,
+                        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+                    );
                 (verified, build_interp())
             };
             #[cfg(not(all(feature = "native", any(unix, windows))))]
             let mut child = build_interp();
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            let mut prelude_applied_delta: Option<usize> = None;
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            let mut capture_handle: Option<Arc<super::prelude::PreludeCapture>> = None;
             {
                 let mut context = child.cx();
                 let model = context.project();
@@ -188,19 +195,56 @@ impl ChildConfig {
                     }
                 }
                 #[cfg(all(feature = "native", any(unix, windows)))]
-                if let super::prelude::PreludePlan::Hit(snapshot) = &prelude
-                    && ninja_verified
-                {
-                    snapshot.apply(&mut context);
+                match &prelude {
+                    super::prelude::PreludePlan::Hit(snapshot) if ninja_verified => {
+                        let depth_ok = (self.depth as usize)
+                            .saturating_add(snapshot.peak_depth_delta())
+                            <= (context.recursion_limit() as usize);
+                        if depth_ok {
+                            let journal_ok = match journal {
+                                Some(journal) => snapshot
+                                    .journal_slice()
+                                    .is_some_and(|slice| journal.splice_prelude_slice(slice)),
+                                None => true,
+                            };
+                            if journal_ok {
+                                snapshot.apply(&mut context);
+                                prelude_applied_delta = Some(snapshot.peak_depth_delta());
+                            }
+                        }
+                    }
+                    super::prelude::PreludePlan::Capture(capture) => {
+                        capture.defer_publish();
+                        capture.record_initial_state(&context);
+                        capture_handle = Some(Arc::clone(capture));
+                    }
+                    _ => {}
                 }
             }
             #[cfg(all(feature = "native", any(unix, windows)))]
-            if let super::prelude::PreludePlan::Capture(capture) = prelude {
-                capture.attach_host(Arc::clone(&host));
-                child.add_session_data(capture);
+            if let Some(capture) = &capture_handle {
+                capture.attach_host(&host);
+                if let Some(journal) = journal {
+                    capture.attach_journal(journal);
+                }
+                child.add_session_data(Arc::clone(capture));
             }
             let configure = child.run_configure(&dirs.source, &dirs.binary, &[]);
             max_start_depth = child.max_inherited_recursion_depth();
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            if let Some(capture) = capture_handle {
+                capture.finalize_and_publish(
+                    configure.exit_code == 0,
+                    child.recursion_exceeded(),
+                    max_start_depth,
+                );
+            }
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            if let Some(delta) = prelude_applied_delta {
+                let child_limit = child.cx().recursion_limit();
+                let delta_u32 = u32::try_from(delta).unwrap_or(u32::MAX);
+                max_start_depth = max_start_depth.min(child_limit.saturating_sub(delta_u32));
+            }
             if save_cache {
                 let data = probe_cache(&mut child.cx());
                 host.write(
@@ -280,6 +324,15 @@ impl ChildConfig {
     }
 }
 
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub(in crate::configure) fn begin_probe_prelude(cx: &Cx<'_>) {
+    if cx.current_dir_id() == DirId::ROOT
+        && let Some(capture) = cx.session_data::<Arc<super::prelude::PreludeCapture>>()
+    {
+        capture.begin_body(cx);
+    }
+}
+
 pub(crate) fn finish_probe_prelude(cx: &Cx<'_>) {
     if cx.current_dir_id() == DirId::ROOT {
         #[cfg(all(feature = "native", any(unix, windows)))]
@@ -331,4 +384,6 @@ pub(super) struct ChildBuild<'a> {
     pub(super) prewarm: Option<super::prelude::PrewarmContext>,
     #[cfg(all(feature = "native", any(unix, windows)))]
     pub(super) prelude: super::prelude::PreludePlan,
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    pub(super) journal: Option<&'a Arc<super::journal::JournalHost<'static>>>,
 }

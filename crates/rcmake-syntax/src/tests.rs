@@ -182,7 +182,7 @@ fn invalid_command_tokens_and_missing_delimiters() {
         (
             b"abc",
             1,
-            b"Unexpected end of file.\n\nParse error.  Function missing opening \"(\".",
+            b"Unexpected end of file.\nParse error.  Function missing opening \"(\".",
         ),
         (
             b"a(\n((x)\n",
@@ -393,7 +393,7 @@ fn adjacency_warning_uses_byte_columns_after_the_bom() {
     ));
     assert_eq!(
         warning.body.as_slice(),
-        b"Syntax Warning in cmake code at column 8\n\nArgument not separated from preceding token by whitespace."
+        b"Syntax Warning in cmake code at column 8\nArgument not separated from preceding token by whitespace."
     );
 }
 
@@ -410,7 +410,7 @@ fn bracket_adjacency_is_fatal_except_at_parentheses() {
         assert_eq!((error.line, error.column), (1, column), "{src:?}");
         assert_eq!(
             error.message.as_slice(),
-            format!("Syntax Error in cmake code at column {column}\n\nArgument not separated from preceding token by whitespace.").as_bytes()
+            format!("Syntax Error in cmake code at column {column}\nArgument not separated from preceding token by whitespace.").as_bytes()
         );
     }
     for src in [

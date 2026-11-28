@@ -1069,6 +1069,7 @@ fn confined_processes_invalidate_every_search_digest() -> HostResult<()> {
         stderr: Output::Null,
         timeout: None,
         tee: false,
+        default_error_mode: false,
     };
     // A declared write scope does not prove where links and hard links lead,
     // so a confined process also gives the SDK a new generation.
@@ -1646,5 +1647,89 @@ fn refuses_a_root_that_is_not_a_directory() -> HostResult<()> {
     let host = private_root_host(1000)?;
     host.seed_file(&host.initial_cwd().join("cache"), b"")?;
     assert_refused(store(&host)?.put_blob(b"payload"), "not a directory");
+    Ok(())
+}
+
+#[test]
+fn store_session_reuses_root_and_still_detects_replacement() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let root = host.initial_cwd().join("cache");
+    let session = StoreSession::new(&host, &root)?;
+    let s1 = Store::with_session(&host, StoreConfig::new(root.clone()), &session);
+    let digest = s1.put_blob(b"session-payload")?;
+    let s2 = Store::with_session(&host, StoreConfig::new(root.clone()), &session);
+    assert_eq!(
+        s2.get_blob(digest)?.as_deref(),
+        Some(b"session-payload".as_slice())
+    );
+
+    // Replacing the root directory must still be caught by `PrivateDir::recheck`.
+    host.remove_dir_all(&root)?;
+    host.create_private_dir(&root)?;
+    let s3 = Store::with_session(&host, StoreConfig::new(root), &session);
+    assert!(
+        s3.get_blob(digest)
+            .is_err_and(|error| error.kind == ErrorKind::PermissionDenied
+                && error.os_message.contains("replaced"))
+    );
+    assert_refused(s3.put_blob(b"other"), "replaced");
+    Ok(())
+}
+
+#[test]
+fn hit_touch_interval_defers_mtime_updates_until_elapsed() -> HostResult<()> {
+    let host = host();
+    let root = host.initial_cwd().join("cache");
+    let config = StoreConfig::new(root).with_hit_touch_interval(Duration::from_secs(3600));
+    let store = Store::new(&host, config)?;
+    let domain = Domain::ProbeV1;
+    let key = domain.key(b"throttled");
+    let data = entry("ok");
+    assert_eq!(
+        store.put_entry(domain, key, &data)?,
+        PublishOutcome::Published
+    );
+    let entry_file = store.entry_path(domain, key);
+    let initial_mtime = host.metadata(&entry_file, Follow::No)?.mtime;
+
+    // Hit within the interval does not update mtime.
+    host.sleep(Duration::from_secs(60));
+    assert_eq!(store.get_entry::<String>(domain, key)?, Some(data.clone()));
+    assert_eq!(host.metadata(&entry_file, Follow::No)?.mtime, initial_mtime);
+
+    // Hit after the interval elapses updates mtime.
+    host.sleep(Duration::from_secs(3600));
+    assert_eq!(store.get_entry::<String>(domain, key)?, Some(data));
+    assert!(host.metadata(&entry_file, Follow::No)?.mtime > initial_mtime);
+    Ok(())
+}
+
+#[test]
+fn store_session_detects_mid_session_symlink_retargeting() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let work = host.initial_cwd();
+    let real1 = work.join("real1");
+    let real2 = work.join("real2");
+    host.create_dir_all(&real1)?;
+    host.create_dir_all(&real2)?;
+    let link = work.join("cache-link");
+    host.symlink(&real1, &link)?;
+
+    let configured = link.join("store");
+    let session = StoreSession::new(&host, &configured)?;
+    assert!(session.matches_configured_root(&host, &configured));
+    let s1 = Store::with_session(&host, StoreConfig::new(configured.clone()), &session);
+    let digest = s1.put_blob(b"from-real1")?;
+
+    // Retarget the symlink mid-session to a different directory.
+    host.remove_file(&link)?;
+    host.symlink(&real2, &link)?;
+    assert!(!session.matches_configured_root(&host, &configured));
+    let s2 = Store::with_session(&host, StoreConfig::new(configured), &session);
+    assert!(
+        s2.get_blob(digest)
+            .is_err_and(|error| error.kind == ErrorKind::PermissionDenied
+                && error.os_message.contains("symbolic link target changed"))
+    );
     Ok(())
 }

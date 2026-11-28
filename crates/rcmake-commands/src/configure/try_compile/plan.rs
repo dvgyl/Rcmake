@@ -5,12 +5,85 @@
 use std::collections::BTreeMap;
 #[cfg(all(test, unix))]
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rcmake_base::BString;
-use rcmake_host::{Input, Output, RunRequest, path};
+use rcmake_host::{Host, Input, Output, RunRequest, path};
 use rcmake_json::{FieldError, FromJson, ToJson, Value, deny_unknown, object, req};
 use rcmake_store::{Digest, Domain, KeyHasher, StoreMode};
+
+/// Cached snapshot of the host environment keyed by [`Host::env_epoch`].
+#[derive(Clone)]
+pub(crate) struct CachedEnv {
+    epoch: u64,
+    /// Full environment pairs as returned by `Host::env_all`.
+    pub(crate) raw: Arc<[(BString, BString)]>,
+    /// Whether [`super::active::admit_environment`] admits this environment.
+    pub(crate) admitted: bool,
+    /// Result of [`process_environment_fingerprint`] on `raw`.
+    pub(crate) fingerprint: Digest,
+    /// Process environment fingerprint excluding locale variables (`LC_*`, `LANG`, `LANGUAGE`).
+    pub(crate) tool_fingerprint: Digest,
+}
+
+/// Race-free session cache for [`Host::env_all`] keyed by [`Host::env_epoch`].
+#[derive(Default)]
+pub(crate) struct EnvCache {
+    cached: Mutex<Option<CachedEnv>>,
+}
+
+impl EnvCache {
+    /// Return a current environment snapshot, reusing the cached snapshot when the host
+    /// reports an unchanged [`Host::env_epoch`] before and after reading.
+    pub(crate) fn snapshot(&self, host: &dyn Host) -> CachedEnv {
+        let before = host.env_epoch();
+        if let Some(epoch) = before
+            && let Some(hit) = self
+                .cached
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .filter(|entry| entry.epoch == epoch)
+        {
+            return hit.clone();
+        }
+        let raw_vec = host.env_all();
+        let admitted = super::active::admit_environment(&raw_vec);
+        let fingerprint = process_environment_fingerprint(&raw_vec);
+        let tool_filtered: Vec<(BString, BString)> = raw_vec
+            .iter()
+            .filter(|(name, _)| {
+                !matches!(
+                    name.as_slice(),
+                    b"LC_ALL" | b"LC_MESSAGES" | b"LANG" | b"LC_CTYPE" | b"LANGUAGE"
+                )
+            })
+            .cloned()
+            .collect();
+        let tool_fingerprint = process_environment_fingerprint(&tool_filtered);
+        let raw: Arc<[(BString, BString)]> = Arc::from(raw_vec);
+        let after = host.env_epoch();
+        let entry = CachedEnv {
+            epoch: before.unwrap_or(0),
+            raw,
+            admitted,
+            fingerprint,
+            tool_fingerprint,
+        };
+        if let (Some(b), Some(a)) = (before, after)
+            && b == a
+        {
+            *self.cached.lock().unwrap_or_else(PoisonError::into_inner) = Some(entry.clone());
+        }
+        entry
+    }
+
+    /// Return the current process environment fingerprint.
+    pub(crate) fn fingerprint(&self, host: &dyn Host) -> Digest {
+        self.snapshot(host).fingerprint
+    }
+}
 
 /// Bindings and byte templates used by a probe recipe.
 pub(crate) use super::template::{PathBindings, Templated};

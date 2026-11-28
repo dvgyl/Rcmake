@@ -6,9 +6,7 @@ use rcmake_model::{DirId, PropScope};
 use crate::custom::{SOURCE_BINARY_ALTERNATIVE, bind_source};
 
 use super::computed::boolean;
-use super::scope::{
-    RESOLVED_SOURCE_LOCATION, select_source, source_file_resolves_path, source_paths,
-};
+use super::scope::{RESOLVED_SOURCE_LOCATION, select_source, source_paths};
 use super::set::Update;
 
 const CMP0118: PolicyId = PolicyId::new(118);
@@ -109,12 +107,12 @@ pub(super) fn set(
 
 fn mark_source(cx: &mut Cx<'_>, dir: DirId, source: &[u8], scoped: bool) {
     let [source_path, binary_path] = source_paths(cx, source);
-    let fallback =
-        if scoped || source_path == binary_path || source_file_resolves_path(cx, &source_path) {
-            source_path
-        } else {
-            binary_path
-        };
+    let relative = !scoped && !rcmake_base::path_lex::Lexical::new(source).absolute();
+    let fallback = if relative && source_path != binary_path {
+        binary_path
+    } else {
+        source_path
+    };
     let (path, created) = if let Some(PropScope::Source { path, .. }) =
         select_source(cx, dir, source, scoped, false)
     {
@@ -123,7 +121,12 @@ fn mark_source(cx: &mut Cx<'_>, dir: DirId, source: &[u8], scoped: bool) {
             .dir(dir)
             .source_props
             .get(&path)
-            .is_some_and(|props| props.get(SOURCE_BINARY_ALTERNATIVE).is_some());
+            .is_some_and(|props| {
+                props.get(SOURCE_BINARY_ALTERNATIVE).is_some()
+                    || (relative
+                        && props.get(b"\0rcmake-source-absolute").is_none()
+                        && path != fallback)
+            });
         if unresolved {
             bind_source(cx.project().dir_mut(dir), &path, &fallback);
             (fallback, false)

@@ -348,6 +348,9 @@ pub(super) fn logged_variables(
 ) -> Vec<(BString, BString)> {
     let mut variables = BTreeMap::new();
     if let Some(languages) = languages {
+        if let Some(module_path) = cx.var(b"CMAKE_MODULE_PATH") {
+            variables.insert(BString::from("CMAKE_MODULE_PATH"), module_path);
+        }
         let config = caller_effective_configuration(cx);
         let config = if config.is_empty() {
             b"DEBUG".to_vec()

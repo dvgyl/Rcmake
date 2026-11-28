@@ -679,6 +679,26 @@ fn language_validates_dependency_provider_context_and_arguments() -> TestResult 
         "{stderr}"
     );
 
+    let (host, mut interp) = context(RunMode::Script);
+    host.seed_file(Path::new("/work/in.txt"), b"hello\n")?;
+    run(
+        &host,
+        &mut interp,
+        "configure_file(/work/in.txt /work/out.txt COPY_ONLY COPYFILE)",
+        0,
+    )?;
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains(
+            "configure_file called with unknown argument(s):\n\n   COPY_ONLY\n   COPYFILE\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("configure_file called with unknown argument(s):\n\n\n"),
+        "{stderr}"
+    );
+
     for (args, error) in [
         ("Provide FIND_PACKAGE", "Unrecognized keyword"),
         (

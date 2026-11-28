@@ -360,6 +360,23 @@ pub(super) fn copy_entry(
             }
             return Ok(());
         }
+        let resolved_target;
+        let (target, existing) = if existing.as_ref().is_some_and(|m| m.kind == FileKind::Dir)
+            && let Some(name) = source.file_name()
+        {
+            resolved_target = target.join(name);
+            let target_meta = host.metadata(&resolved_target, Follow::No).ok();
+            if target_meta
+                .as_ref()
+                .is_some_and(|m| (m.dev, m.ino) == (meta.dev, meta.ino))
+            {
+                observe(&resolved_target, false, true);
+                return Ok(());
+            }
+            (resolved_target.as_path(), target_meta)
+        } else {
+            (target, existing)
+        };
         let current = !options.force
             && existing.as_ref().is_some_and(|m| {
                 m.kind == FileKind::File
@@ -385,6 +402,9 @@ pub(super) fn copy_entry(
             .map_err(|e| copy_error(command, "copy file", source, &e))?;
         }
         observe(target, false, current);
+        host.set_permissions(target, mode)
+            .map_err(|e| copy_error(command, "set permissions on", target, &e))?;
+        return Ok(());
     }
     host.set_permissions(target, mode)
         .map_err(|e| copy_error(command, "set permissions on", target, &e))?;
@@ -418,4 +438,65 @@ fn copy_error(
         path.display(),
         err.os_message
     ))
+}
+
+#[cfg(test)]
+mod copy_existing_dir_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{FileKind, Follow, Host, PureHost, ReadRange, Stream};
+
+    use crate::test_support::TestResult;
+
+    #[test]
+    fn install_rename_to_existing_directory_copies_into_directory_with_source_basename()
+    -> TestResult {
+        let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = Arc::new(PureHost::new(root.to_path_buf(), root.join("cmake")));
+        host.seed_file(&root.join("src.txt"), b"hello salome")?;
+        host.create_dir_all(&root.join("dest/existing_dir"))?;
+        host.set_permissions(&root.join("dest/existing_dir"), 0o755)?;
+        let script = root.join("install.cmake");
+        host.seed_file(
+            &script,
+            b"file(INSTALL src.txt DESTINATION dest RENAME existing_dir)\n",
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Script,
+                root.join("data"),
+                root.join("cmake"),
+                root.to_path_buf(),
+            ),
+            crate::register_all,
+        );
+        assert_eq!(
+            interp.run_script(&script).exit_code,
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        assert_eq!(
+            host.metadata(&root.join("dest/existing_dir"), Follow::No)?
+                .kind,
+            FileKind::Dir
+        );
+        assert_eq!(
+            host.metadata(&root.join("dest/existing_dir"), Follow::No)?
+                .mode
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            host.read(
+                &root.join("dest/existing_dir/src.txt"),
+                ReadRange::All { limit: 64 }
+            )?,
+            b"hello salome"
+        );
+        Ok(())
+    }
 }

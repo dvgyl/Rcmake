@@ -6,7 +6,7 @@ use rcmake_host::{FileKind, Follow, Host, ScratchFile};
 use crate::{ArchiveError, archive_error};
 
 pub(crate) const MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-pub(crate) const METADATA_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const METADATA_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const BUFFER: usize = 64 * 1024;
 // Keep small archives in memory until validation completes.
 const MEMORY_BYTES: usize = 8 * 1024 * 1024;

@@ -53,12 +53,10 @@ fn write(cx: &Cx<'_>, append: bool, args: &[&[u8]]) -> Result {
         }));
     };
     let path = cx.resolve_path(input);
-    let size = content
-        .iter()
-        .try_fold(0_usize, |size, part| size.checked_add(part.len()));
-    if size.is_none_or(|size| size > cx.limits().max_value_bytes) {
+    let windows_crlf = cx.host().system().sysname.starts_with(b"Windows");
+    let Some(bytes) = encode_text_write(content, windows_crlf, cx.limits().max_value_bytes) else {
         return Err(error("write content exceeds the size limit"));
-    }
+    };
     let mode = if append {
         WriteMode::Append
     } else {
@@ -68,7 +66,7 @@ fn write(cx: &Cx<'_>, append: bool, args: &[&[u8]]) -> Result {
         if let Some(parent) = path.parent() {
             cx.host().create_dir_all(parent)?;
         }
-        cx.host().write(&path, &content.concat(), mode)
+        cx.host().write(&path, &bytes, mode)
     };
     operation().map_err(|e| {
         error(format!(
@@ -78,6 +76,38 @@ fn write(cx: &Cx<'_>, append: bool, args: &[&[u8]]) -> Result {
         ))
     })?;
     Ok(Flow::Normal)
+}
+
+/// Concatenate `file(WRITE)` / `file(APPEND)` chunks, applying Windows text-stream
+/// `\n` -> `\r\n` translation (matching CMake's `std::ofstream`) when `windows_crlf` is set.
+fn encode_text_write(content: &[&[u8]], windows_crlf: bool, limit: usize) -> Option<Vec<u8>> {
+    let total = content.iter().try_fold(0_usize, |size, part| {
+        let extra = if windows_crlf {
+            part.iter().filter(|&&byte| byte == b'\n').count()
+        } else {
+            0
+        };
+        size.checked_add(part.len())?.checked_add(extra)
+    })?;
+    if total > limit {
+        return None;
+    }
+    let mut out = Vec::with_capacity(total);
+    if windows_crlf {
+        for part in content {
+            for &byte in *part {
+                if byte == b'\n' {
+                    out.push(b'\r');
+                }
+                out.push(byte);
+            }
+        }
+    } else {
+        for part in content {
+            out.extend_from_slice(part);
+        }
+    }
+    Some(out)
 }
 
 fn touch(cx: &mut Cx<'_>, create: bool, args: &[&[u8]]) -> Result {
@@ -655,4 +685,69 @@ fn chmod(cx: &mut Cx<'_>, recurse: bool, args: &[&[u8]]) -> Result {
         }
     }
     Ok(Flow::Normal)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{Host, PureHost, ReadRange};
+
+    use super::encode_text_write;
+
+    #[test]
+    fn text_write_converts_lf_to_crlf_on_windows_and_respects_limit() {
+        assert_eq!(
+            encode_text_write(&[b"a\nb\n", b"c"], true, 32),
+            Some(b"a\r\nb\r\nc".to_vec())
+        );
+        assert_eq!(
+            encode_text_write(&[b"a\nb\n", b"c"], false, 32),
+            Some(b"a\nb\nc".to_vec())
+        );
+        // Converted byte count (4 bytes: "a\r\nb") exceeds limit 3 even though raw len is 3.
+        assert_eq!(encode_text_write(&[b"a\nb"], true, 3), None);
+        assert_eq!(
+            encode_text_write(&[b"a\nb"], false, 3),
+            Some(b"a\nb".to_vec())
+        );
+    }
+
+    #[test]
+    fn file_write_and_append_match_host_text_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let run_case = |sysname: &str| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let host = Arc::new(PureHost::default());
+            let mut system = host.system();
+            system.sysname = sysname.into();
+            host.set_system(system)?;
+            let script = Path::new("/work/write.cmake");
+            host.seed_file(
+                script,
+                b"file(WRITE /work/out.txt \"line1\\nline2\")\nfile(APPEND /work/out.txt \"\\nline3\\n\")\n",
+            )?;
+            let mut interp = Interp::new(
+                InterpConfig {
+                    host: host.clone(),
+                    mode: RunMode::Script,
+                    cmake_root: "/cmake".into(),
+                    cmake_command: "/cmake/bin/cmake".into(),
+                    cwd: "/work".into(),
+                    limits: Default::default(),
+                    diag: Default::default(),
+                    services: Default::default(),
+                    defines: Vec::new(),
+                    script_args: Vec::new(),
+                },
+                crate::register_all,
+            );
+            assert_eq!(interp.run_script(script).exit_code, 0);
+            Ok(host.read(Path::new("/work/out.txt"), ReadRange::All { limit: 1024 })?)
+        };
+
+        assert_eq!(run_case("Windows")?, b"line1\r\nline2\r\nline3\r\n");
+        assert_eq!(run_case("Linux")?, b"line1\nline2\nline3\n");
+        Ok(())
+    }
 }

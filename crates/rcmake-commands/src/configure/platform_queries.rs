@@ -1489,6 +1489,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         assert!(query(&host, &request(fixed.clone())).is_some());
         let mut bounded = request(fixed.clone());
@@ -1564,6 +1565,7 @@ mod tests {
             stderr: Output::Inherit,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         let prefix = || vec![BString::from("--prefix")];
         let search = "/work/missing:/opt/homebrew/bin:/usr/bin";
@@ -1670,6 +1672,7 @@ mod tests {
             stderr: Output::Inherit,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         let xs_req = RunRequest {
             pipeline: vec![CommandSpec {
@@ -1683,6 +1686,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         let sw_key = query(&host, &sw_req)
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected sw_vers query."))?;
@@ -1853,6 +1857,7 @@ mod tests {
                     stderr: Output::Capture,
                     timeout: None,
                     tee: false,
+                    default_error_mode: false,
                 };
                 let key = query(&host, &req)
                     .ok_or_else(|| rcmake_host::HostError::unsupported("Expected query."))?;
@@ -1968,6 +1973,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
 
         // 1. State mutation between before and after launch produces state_digest: None and is not persisted.
@@ -2195,6 +2201,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         let ios_key = query(&host, &ios_req)
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected iphoneos xcrun query."))?;
@@ -2320,6 +2327,7 @@ mod tests {
             stderr: Output::Inherit,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         let brew_key = query(host.as_ref(), &brew_req)
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected brew query."))?;
@@ -2511,6 +2519,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
 
         let queries = PlatformQueries::default();

@@ -52,6 +52,21 @@ const CHECK_SYMBOL_EXISTS_WRITES: &[&[u8]] = &[
     b"CMAKE_REQUIRED_FLAGS",
 ];
 
+/// Caller-scope variables written or unset by stock `CheckFunctionExists.cmake`
+/// (including `Internal/CheckCommon.cmake`).
+const CHECK_FUNCTION_EXISTS_WRITES: &[&[u8]] = &[
+    b"_cfe_source",
+    b"_CFE_EXTRA_CMAKE_ARGUMENTS",
+    b"_CFE_INCLUDE_DIRECTORIES",
+    b"_CFE_ADD_LINK_OPTIONS",
+    b"_CFE_ADD_LINK_LIBRARIES",
+    b"_CFE_LINK_DIRECTORIES",
+    b"_CFE_CMP0075",
+    b"_CFE_CMP0075_WARNED",
+    b"MACRO_CHECK_FUNCTION_DEFINITIONS",
+    b"CMAKE_REQUIRED_FLAGS",
+];
+
 /// Probe calls for which the evaluator can consult its call-site index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProbeKind {
@@ -61,8 +76,14 @@ pub(crate) enum ProbeKind {
     CCompilerFlag,
     /// Check a C++ compiler flag.
     CxxCompilerFlag,
+    /// Check whether a C source snippet compiles.
+    CSourceCompiles,
+    /// Check whether a C++ source snippet compiles.
+    CxxSourceCompiles,
     /// Check whether a C symbol is available.
     SymbolExists,
+    /// Check whether a C function is available.
+    FunctionExists,
     /// Compile an embedded source file.
     TryCompile,
 }
@@ -75,7 +96,10 @@ impl ProbeKind {
             Self::IncludeFile => Some("CheckIncludeFile.cmake"),
             Self::CCompilerFlag => Some("CheckCCompilerFlag.cmake"),
             Self::CxxCompilerFlag => Some("CheckCXXCompilerFlag.cmake"),
+            Self::CSourceCompiles => Some("CheckCSourceCompiles.cmake"),
+            Self::CxxSourceCompiles => Some("CheckCXXSourceCompiles.cmake"),
             Self::SymbolExists => Some("CheckSymbolExists.cmake"),
+            Self::FunctionExists => Some("CheckFunctionExists.cmake"),
             Self::TryCompile => None,
         }
     }
@@ -131,12 +155,27 @@ pub(crate) enum ExpandedProbeSpec {
         /// Compiler flag string.
         flag: BString,
     },
+    /// Stock `check_c_source_compiles(<source> <result> [FAIL_REGEX ...])`.
+    CSourceCompiles {
+        /// C source code string.
+        source: BString,
+    },
+    /// Stock `check_cxx_source_compiles(<source> <result> [FAIL_REGEX ...])`.
+    CxxSourceCompiles {
+        /// C++ source code string.
+        source: BString,
+    },
     /// Stock `check_symbol_exists(<symbol> <headers> <result>)`.
     SymbolExists {
         /// Symbol name.
         symbol: BString,
         /// Semicolon-separated header list.
         headers: BString,
+    },
+    /// Stock `check_function_exists(<function> <result>)`.
+    FunctionExists {
+        /// Function name.
+        function: BString,
     },
 }
 
@@ -193,27 +232,101 @@ pub(crate) fn lookahead_expanded(
     let mut probe_results: BTreeSet<BString> = BTreeSet::new();
     let mut saw_include_file = false;
     let mut saw_symbol_exists = false;
+    let mut saw_function_exists = false;
     let mut batch: Vec<ExpandedProbeCandidate> = Vec::new();
     let empty_protected: BTreeSet<BString> = BTreeSet::new();
-
-    for (index, command) in current
+    let commands: Vec<&CommandInvocation> = current
         .into_iter()
         .chain(remaining)
         .take(MAX_SCANNED_COMMANDS)
-        .enumerate()
-    {
+        .collect();
+    let mut open_not_defined_ifs = 0usize;
+    let mut index = 0usize;
+
+    while let Some(&command) = commands.get(index) {
         if batch.len() >= MAX_LOOKAHEAD {
             break;
+        }
+        // Support simple `if(NOT DEFINED <var>) ... endif()` guards (no `else`/`elseif`)
+        // around subsequent probes, matching the dominant pattern in protobuf/qtbase/llvm.
+        if !(current.is_some() && index == 0) {
+            if command.lower.as_slice() == b"endif" && open_not_defined_ifs > 0 {
+                open_not_defined_ifs -= 1;
+                index += 1;
+                continue;
+            }
+            if command.lower.as_slice() == b"if" {
+                let Some(expanded) = expand_pure(command, base, &locals) else {
+                    break;
+                };
+                if expanded.reads.iter().any(|var| {
+                    probe_written.contains(var)
+                        || macro_prefix_conflict(
+                            var,
+                            saw_include_file,
+                            saw_symbol_exists,
+                            saw_function_exists,
+                        )
+                }) || expanded.cache_reads.iter().any(|var| {
+                    probe_written.contains(var)
+                        || macro_prefix_conflict(
+                            var,
+                            saw_include_file,
+                            saw_symbol_exists,
+                            saw_function_exists,
+                        )
+                }) {
+                    break;
+                }
+                let Some(end_idx) = simple_if_endif(&commands, index) else {
+                    break;
+                };
+                let Some(cond_var) = parse_not_defined_guard(&expanded.args) else {
+                    break;
+                };
+                if probe_written.contains(cond_var)
+                    || macro_prefix_conflict(
+                        cond_var,
+                        saw_include_file,
+                        saw_symbol_exists,
+                        saw_function_exists,
+                    )
+                {
+                    break;
+                }
+                let is_defined = match locals.get(cond_var) {
+                    Some(LocalBinding { value: Some(_), .. }) => true,
+                    Some(LocalBinding { value: None, .. }) => base.cache_var(cond_var).is_some(),
+                    None => base.var(cond_var).is_some(),
+                };
+                if is_defined {
+                    index = end_idx + 1;
+                } else {
+                    open_not_defined_ifs += 1;
+                    index += 1;
+                }
+                continue;
+            }
         }
         let Some(expanded) = expand_pure(command, base, &locals) else {
             break;
         };
         if expanded.reads.iter().any(|var| {
             probe_written.contains(var)
-                || macro_prefix_conflict(var, saw_include_file, saw_symbol_exists)
+                || macro_prefix_conflict(
+                    var,
+                    saw_include_file,
+                    saw_symbol_exists,
+                    saw_function_exists,
+                )
         }) || expanded.cache_reads.iter().any(|var| {
             probe_written.contains(var)
-                || macro_prefix_conflict(var, saw_include_file, saw_symbol_exists)
+                || macro_prefix_conflict(
+                    var,
+                    saw_include_file,
+                    saw_symbol_exists,
+                    saw_function_exists,
+                )
         }) {
             break;
         }
@@ -235,13 +348,28 @@ pub(crate) fn lookahead_expanded(
         ) {
             if effects.reads.iter().any(|var| {
                 probe_written.contains(var)
-                    || macro_prefix_conflict(var, saw_include_file, saw_symbol_exists)
+                    || macro_prefix_conflict(
+                        var,
+                        saw_include_file,
+                        saw_symbol_exists,
+                        saw_function_exists,
+                    )
             }) || effects.cache_reads.iter().any(|var| {
                 probe_written.contains(var)
-                    || macro_prefix_conflict(var, saw_include_file, saw_symbol_exists)
+                    || macro_prefix_conflict(
+                        var,
+                        saw_include_file,
+                        saw_symbol_exists,
+                        saw_function_exists,
+                    )
             }) || probe_results.contains(&result)
                 || probe_written.contains(&result)
-                || macro_prefix_conflict(&result, saw_include_file, saw_symbol_exists)
+                || macro_prefix_conflict(
+                    &result,
+                    saw_include_file,
+                    saw_symbol_exists,
+                    saw_function_exists,
+                )
                 || effects
                     .writes
                     .iter()
@@ -254,6 +382,8 @@ pub(crate) fn lookahead_expanded(
                 saw_include_file = true;
             } else if kind == ProbeKind::SymbolExists {
                 saw_symbol_exists = true;
+            } else if kind == ProbeKind::FunctionExists {
+                saw_function_exists = true;
             }
             locals.remove(&result);
             probe_results.insert(result.clone());
@@ -263,6 +393,7 @@ pub(crate) fn lookahead_expanded(
                 probe_written.insert(written);
             }
             batch.push(ExpandedProbeCandidate { kind, result, spec });
+            index += 1;
             continue;
         }
         // Index 0 (`current`, when provided) must itself be an admitted probe.
@@ -280,11 +411,17 @@ pub(crate) fn lookahead_expanded(
             break;
         };
         if probe_written.contains(&target)
-            || macro_prefix_conflict(&target, saw_include_file, saw_symbol_exists)
+            || macro_prefix_conflict(
+                &target,
+                saw_include_file,
+                saw_symbol_exists,
+                saw_function_exists,
+            )
         {
             break;
         }
         locals.insert(target, binding);
+        index += 1;
     }
     if batch.len() < 2 {
         batch.clear();
@@ -349,6 +486,7 @@ pub(crate) fn lookahead_foreach(
     let mut probe_results: BTreeSet<BString> = BTreeSet::new();
     let mut saw_include_file = false;
     let mut saw_symbol_exists = false;
+    let mut saw_function_exists = false;
     let mut upcoming: Vec<ExpandedProbeCandidate> = Vec::new();
 
     let ok = frame.visit_iterations(
@@ -391,7 +529,12 @@ pub(crate) fn lookahead_foreach(
                 for read in &expanded.reads {
                     if iter_probe_writes.contains(read)
                         || (!iter_locals.contains_key(read) && accumulated_writes.contains(read))
-                        || macro_prefix_conflict(read, saw_include_file, saw_symbol_exists)
+                        || macro_prefix_conflict(
+                            read,
+                            saw_include_file,
+                            saw_symbol_exists,
+                            saw_function_exists,
+                        )
                     {
                         return ControlFlow::Break(false);
                     }
@@ -400,7 +543,12 @@ pub(crate) fn lookahead_foreach(
                     if iter_probe_writes.contains(read)
                         || accumulated_writes.contains(read)
                         || probe_results.contains(read)
-                        || macro_prefix_conflict(read, saw_include_file, saw_symbol_exists)
+                        || macro_prefix_conflict(
+                            read,
+                            saw_include_file,
+                            saw_symbol_exists,
+                            saw_function_exists,
+                        )
                     {
                         return ControlFlow::Break(false);
                     }
@@ -429,7 +577,12 @@ pub(crate) fn lookahead_foreach(
                         if iter_probe_writes.contains(read)
                             || (!iter_locals.contains_key(read)
                                 && accumulated_writes.contains(read))
-                            || macro_prefix_conflict(read, saw_include_file, saw_symbol_exists)
+                            || macro_prefix_conflict(
+                                read,
+                                saw_include_file,
+                                saw_symbol_exists,
+                                saw_function_exists,
+                            )
                         {
                             return ControlFlow::Break(false);
                         }
@@ -438,7 +591,12 @@ pub(crate) fn lookahead_foreach(
                         if iter_probe_writes.contains(read)
                             || accumulated_writes.contains(read)
                             || probe_results.contains(read)
-                            || macro_prefix_conflict(read, saw_include_file, saw_symbol_exists)
+                            || macro_prefix_conflict(
+                                read,
+                                saw_include_file,
+                                saw_symbol_exists,
+                                saw_function_exists,
+                            )
                         {
                             return ControlFlow::Break(false);
                         }
@@ -469,13 +627,35 @@ pub(crate) fn lookahead_foreach(
                         ) {
                             return ControlFlow::Break(false);
                         }
+                    } else if kind == ProbeKind::FunctionExists && !saw_function_exists {
+                        saw_function_exists = true;
+                        if has_macro_prefix_history(
+                            &all_reads,
+                            &all_cache_reads,
+                            &loop_vars,
+                            &accumulated_writes,
+                            b"_CFE_",
+                        ) || has_macro_prefix_history(
+                            &all_reads,
+                            &all_cache_reads,
+                            &loop_vars,
+                            &accumulated_writes,
+                            b"_cfe_source",
+                        ) {
+                            return ControlFlow::Break(false);
+                        }
                     }
 
                     if probe_results.contains(&result)
                         || iter_probe_writes.contains(&result)
                         || all_external_reads.contains(&result)
                         || all_cache_reads.contains(&result)
-                        || macro_prefix_conflict(&result, saw_include_file, saw_symbol_exists)
+                        || macro_prefix_conflict(
+                            &result,
+                            saw_include_file,
+                            saw_symbol_exists,
+                            saw_function_exists,
+                        )
                         || effects.writes.iter().any(|var| {
                             probe_results.contains(var)
                                 || var == &result
@@ -517,7 +697,12 @@ pub(crate) fn lookahead_foreach(
                     || iter_probe_writes.contains(&target)
                     || all_external_reads.contains(&target)
                     || all_cache_reads.contains(&target)
-                    || macro_prefix_conflict(&target, saw_include_file, saw_symbol_exists)
+                    || macro_prefix_conflict(
+                        &target,
+                        saw_include_file,
+                        saw_symbol_exists,
+                        saw_function_exists,
+                    )
                 {
                     return ControlFlow::Break(false);
                 }
@@ -535,9 +720,56 @@ pub(crate) fn lookahead_foreach(
     if ok { upcoming } else { Vec::new() }
 }
 
-fn macro_prefix_conflict(name: &[u8], include_file: bool, symbol_exists: bool) -> bool {
+fn macro_prefix_conflict(
+    name: &[u8],
+    include_file: bool,
+    symbol_exists: bool,
+    function_exists: bool,
+) -> bool {
     (include_file && (name.starts_with(b"_CIF_") || name == b"CHECK_INCLUDE_FILE_VAR"))
         || (symbol_exists && name.starts_with(b"_CSE_"))
+        || (function_exists
+            && (name.starts_with(b"_CFE_")
+                || name == b"_cfe_source"
+                || name == b"MACRO_CHECK_FUNCTION_DEFINITIONS"))
+}
+
+fn parse_not_defined_guard(args: &[ExpandedArg]) -> Option<&[u8]> {
+    let [not_kw, def_kw, var] = args else {
+        return None;
+    };
+    if not_kw.value.as_slice() != b"NOT" || def_kw.value.as_slice() != b"DEFINED" {
+        return None;
+    }
+    let name = var.value.as_slice();
+    if name.is_empty()
+        || name.starts_with(b"ENV{")
+        || name.starts_with(b"CACHE{")
+        || name.starts_with(b"POLICY")
+        || !valid_result(name)
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Find the matching `endif()` for `if()` at `start` when the block has no `else`/`elseif`.
+fn simple_if_endif(commands: &[&CommandInvocation], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, cmd) in commands.get(start + 1..)?.iter().enumerate() {
+        match cmd.lower.as_slice() {
+            b"if" => depth += 1,
+            b"else" | b"elseif" if depth == 0 => return None,
+            b"endif" => {
+                if depth == 0 {
+                    return Some(start + 1 + offset);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn has_macro_prefix_history(
@@ -770,6 +1002,74 @@ fn classify_expanded_probe(
                 BString::from(result),
                 ExpandedProbeSpec::CxxCompilerFlag {
                     flag: flag.value.clone(),
+                },
+            ))
+        }
+        b"check_c_source_compiles" | b"check_cxx_source_compiles" => {
+            let [source, result, rest @ ..] = args else {
+                return None;
+            };
+            if !arg_is_loop_pure(arg_loop_pure, 1, require_loop_pure_target) {
+                return None;
+            }
+            if source.value.len() > MAX_SOURCE_BYTES {
+                return None;
+            }
+            let result = result.value.as_slice();
+            if !valid_result(result) || protected.contains(result) {
+                return None;
+            }
+            if !rest.is_empty()
+                && (rest.first()?.value.as_slice() != b"FAIL_REGEX"
+                    || rest.len() < 2
+                    || rest
+                        .iter()
+                        .any(|arg| matches!(arg.value.as_slice(), b"SRC_EXT" | b"OUTPUT_VARIABLE")))
+            {
+                return None;
+            }
+            let (kind, spec) = if command.lower.as_slice() == b"check_cxx_source_compiles" {
+                (
+                    ProbeKind::CxxSourceCompiles,
+                    ExpandedProbeSpec::CxxSourceCompiles {
+                        source: source.value.clone(),
+                    },
+                )
+            } else {
+                (
+                    ProbeKind::CSourceCompiles,
+                    ExpandedProbeSpec::CSourceCompiles {
+                        source: source.value.clone(),
+                    },
+                )
+            };
+            Some((kind, BString::from(result), spec))
+        }
+        b"check_function_exists" => {
+            let [function, result] = args else {
+                return None;
+            };
+            if !arg_is_loop_pure(arg_loop_pure, 1, require_loop_pure_target) {
+                return None;
+            }
+            let result = result.value.as_slice();
+            if function.value.is_empty()
+                || !valid_result(result)
+                || protected.contains(result)
+                || result.starts_with(b"_CFE_")
+                || result == b"_cfe_source"
+                || result == b"MACRO_CHECK_FUNCTION_DEFINITIONS"
+            {
+                return None;
+            }
+            for &written in CHECK_FUNCTION_EXISTS_WRITES {
+                effects.writes.push(BString::from(written));
+            }
+            Some((
+                ProbeKind::FunctionExists,
+                BString::from(result),
+                ExpandedProbeSpec::FunctionExists {
+                    function: function.value.clone(),
                 },
             ))
         }
@@ -1411,28 +1711,35 @@ mod tests {
                 },
                 flags,
             );
-            registry.add(
+            for probe_cmd in [
                 "check_include_file",
-                |cx, _| {
-                    let cx_ref: &Cx<'_> = cx;
-                    if let Some(sink) =
-                        cx_ref.session_data::<Arc<Mutex<Option<Vec<ExpandedProbeCandidate>>>>>()
-                        && let Ok(mut guard) = sink.lock()
-                        && guard.is_none()
-                        && let Some(frame) = cx_ref.foreach_lookahead()
-                    {
-                        let found = lookahead_foreach(
-                            cx_ref,
-                            cx_ref.var_scope_depth(),
-                            &frame,
-                            |_, _, _| true,
-                        );
-                        *guard = Some(found);
-                    }
-                    Ok(Flow::Normal)
-                },
-                flags,
-            );
+                "check_function_exists",
+                "check_c_source_compiles",
+                "check_cxx_source_compiles",
+            ] {
+                registry.add(
+                    probe_cmd,
+                    |cx, _| {
+                        let cx_ref: &Cx<'_> = cx;
+                        if let Some(sink) =
+                            cx_ref.session_data::<Arc<Mutex<Option<Vec<ExpandedProbeCandidate>>>>>()
+                            && let Ok(mut guard) = sink.lock()
+                            && guard.is_none()
+                            && let Some(frame) = cx_ref.foreach_lookahead()
+                        {
+                            let found = lookahead_foreach(
+                                cx_ref,
+                                cx_ref.var_scope_depth(),
+                                &frame,
+                                |_, _, _| true,
+                            );
+                            *guard = Some(found);
+                        }
+                        Ok(Flow::Normal)
+                    },
+                    flags,
+                );
+            }
         });
         interp.add_session_data(capture_hook);
         let outcome = interp.run_script(&root.join("script.cmake"));
@@ -2139,5 +2446,93 @@ endforeach()
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn check_source_compiles_function_exists_and_not_defined_guards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Straight-line `check_cxx_source_compiles` with `FAIL_REGEX` and
+        //    `if(NOT DEFINED ...)` guards (skipping already-defined vars, entering undefined).
+        let mut vars = TestVars::default();
+        vars.vars
+            .insert(b"HAVE_SKIP".as_slice().into(), b"1".as_slice().into());
+        let file = parse(
+            br#"
+check_cxx_source_compiles("int main() { return 0; }" HAVE_A)
+if(NOT DEFINED HAVE_SKIP)
+  check_cxx_source_compiles("int main() { return 1; }" HAVE_SKIP)
+endif()
+if(NOT DEFINED HAVE_B)
+  check_cxx_source_compiles("int main() { return 2; }" HAVE_B FAIL_REGEX "warning")
+endif()
+"#,
+        )?;
+        let (current, remaining) = file
+            .commands
+            .split_first()
+            .ok_or("Missing first command.")?;
+        let batch = lookahead_expanded(&vars, Some(current), remaining, |kind, _, _| {
+            kind == ProbeKind::CxxSourceCompiles
+        });
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].result, "HAVE_A");
+        assert_eq!(batch[1].result, "HAVE_B");
+        assert_eq!(
+            batch[1].spec,
+            ExpandedProbeSpec::CxxSourceCompiles {
+                source: "int main() { return 2; }".into(),
+            }
+        );
+
+        // `SRC_EXT` and `OUTPUT_VARIABLE` must be rejected cleanly.
+        for bad in [
+            "check_c_source_compiles(\"int main(){}\" HAVE_A)\ncheck_c_source_compiles(\"int main(){}\" HAVE_B SRC_EXT .cc)",
+            "check_c_source_compiles(\"int main(){}\" HAVE_A)\ncheck_c_source_compiles(\"int main(){}\" HAVE_B OUTPUT_VARIABLE OUT)",
+        ] {
+            let file = parse(bad.as_bytes())?;
+            let (current, remaining) = file
+                .commands
+                .split_first()
+                .ok_or("Missing first command.")?;
+            assert!(
+                lookahead_expanded(&TestVars::default(), Some(current), remaining, |_, _, _| {
+                    true
+                })
+                .is_empty(),
+                "must reject {bad}"
+            );
+        }
+
+        // 2. `check_function_exists` in `foreach()` plus `_CFE_` write conflict rejection.
+        let clean = eval_foreach_capture(
+            r#"
+foreach(fn IN ITEMS memcpy memmove strlcpy)
+  string(TOUPPER "${fn}" up)
+  check_function_exists("${fn}" HAVE_${up})
+endforeach()
+"#,
+        )?;
+        assert_eq!(clean.len(), 2);
+        assert_eq!(clean[0].kind, ProbeKind::FunctionExists);
+        assert_eq!(clean[0].result, "HAVE_MEMMOVE");
+        assert_eq!(
+            clean[0].spec,
+            ExpandedProbeSpec::FunctionExists {
+                function: "memmove".into(),
+            }
+        );
+        assert_eq!(clean[1].result, "HAVE_STRLCPY");
+
+        let conflict = eval_foreach_capture(
+            r#"
+foreach(fn IN ITEMS memcpy memmove)
+  string(TOUPPER "${fn}" up)
+  check_function_exists("${fn}" HAVE_${up})
+  set(COPY "${_CFE_EXTRA_CMAKE_ARGUMENTS}")
+endforeach()
+"#,
+        )?;
+        assert!(conflict.is_empty());
+        Ok(())
     }
 }

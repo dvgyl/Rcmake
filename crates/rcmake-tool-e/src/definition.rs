@@ -255,6 +255,7 @@ fn read_symbols(
         stderr: Output::Capture,
         timeout: Some(std::time::Duration::from_secs(1800)),
         tee: false,
+        default_error_mode: false,
     };
     let result = cx.host.run(&request, &mut |_, _| {});
     let _ = cx.host.remove_file(&file);

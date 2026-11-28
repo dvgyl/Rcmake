@@ -6,6 +6,7 @@ use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use jiff::tz::TimeZone;
@@ -33,6 +34,20 @@ type CommandHandler = dyn Fn(&PureHost, &RunRequest, &mut dyn FnMut(Stream, &[u8
 
 type RegistryKey = (RegistryRoot, BString, Option<BString>, RegistryView);
 
+type RegistryPathKey = (RegistryRoot, RegistryView, BString);
+
+#[derive(Clone, Debug)]
+enum PureRegistryValue {
+    Scalar(BString),
+    MultiSz(BString),
+}
+
+#[derive(Clone, Debug)]
+struct PureRegistryEntry {
+    original_name: Option<BString>,
+    value: PureRegistryValue,
+}
+
 struct PureState {
     env: BTreeMap<BString, BString>,
     events: Vec<IoEvent>,
@@ -42,7 +57,8 @@ struct PureState {
     stdin: VecDeque<u8>,
     handler: Option<Arc<CommandHandler>>,
     registry_view: Option<RegistryView>,
-    registry: BTreeMap<RegistryKey, BString>,
+    registry: BTreeMap<RegistryKey, PureRegistryEntry>,
+    registry_keys: BTreeMap<RegistryPathKey, BString>,
     system: SystemInfo,
 }
 
@@ -79,6 +95,7 @@ impl Drop for PureFileLock {
 /// In-memory deterministic [`Host`] with recorded stdio event log and virtual clock.
 pub struct PureHost {
     state: Mutex<PureState>,
+    env_epoch: AtomicU64,
     locks: Arc<LockTable>,
 }
 
@@ -112,8 +129,10 @@ impl PureHost {
                 handler: None,
                 registry_view: None,
                 registry: BTreeMap::new(),
+                registry_keys: BTreeMap::new(),
                 system: default_system(),
             }),
+            env_epoch: AtomicU64::new(0),
             locks: Arc::default(),
         }
     }
@@ -124,7 +143,7 @@ impl PureHost {
         Ok(())
     }
 
-    /// Add a value to the simulated Windows registry.
+    /// Add a scalar value (`REG_SZ` / `REG_DWORD` / etc.) to the simulated Windows registry.
     pub fn seed_registry_value(
         &self,
         root: RegistryRoot,
@@ -133,9 +152,51 @@ impl PureHost {
         view: RegistryView,
         value: &[u8],
     ) -> HostResult<()> {
-        self.lock()?
-            .registry
-            .insert(registry_key(root, subkey, name, view), value.into());
+        let mut state = self.lock()?;
+        register_registry_ancestors(&mut state.registry_keys, root, view, subkey);
+        let original_name = name.filter(|name| !name.is_empty()).map(BString::from);
+        state.registry.insert(
+            registry_key(root, subkey, name.filter(|name| !name.is_empty()), view),
+            PureRegistryEntry {
+                original_name,
+                value: PureRegistryValue::Scalar(value.into()),
+            },
+        );
+        Ok(())
+    }
+
+    /// Add a `REG_MULTI_SZ` value (raw NUL-separated bytes) to the simulated Windows registry.
+    pub fn seed_registry_multi_sz(
+        &self,
+        root: RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: RegistryView,
+        raw_value: &[u8],
+    ) -> HostResult<()> {
+        let mut state = self.lock()?;
+        register_registry_ancestors(&mut state.registry_keys, root, view, subkey);
+        let original_name = name.filter(|name| !name.is_empty()).map(BString::from);
+        state.registry.insert(
+            registry_key(root, subkey, name.filter(|name| !name.is_empty()), view),
+            PureRegistryEntry {
+                original_name,
+                value: PureRegistryValue::MultiSz(raw_value.into()),
+            },
+        );
+        Ok(())
+    }
+
+    /// Register an empty key path in the simulated Windows registry so `SUBKEYS` and
+    /// `VALUE_NAMES` enumeration observe it even when it has no values.
+    pub fn seed_registry_key(
+        &self,
+        root: RegistryRoot,
+        subkey: &[u8],
+        view: RegistryView,
+    ) -> HostResult<()> {
+        let mut state = self.lock()?;
+        register_registry_ancestors(&mut state.registry_keys, root, view, subkey);
         Ok(())
     }
 
@@ -214,14 +275,8 @@ impl PureHost {
     }
 }
 
-fn registry_key(
-    root: RegistryRoot,
-    key: &[u8],
-    name: Option<&[u8]>,
-    view: RegistryView,
-) -> RegistryKey {
-    let key: BString = key
-        .iter()
+fn normalize_registry_subkey(key: &[u8]) -> BString {
+    key.iter()
         .map(|byte| {
             if *byte == b'/' {
                 b'\\'
@@ -230,10 +285,47 @@ fn registry_key(
             }
         })
         .collect::<Vec<u8>>()
-        .into();
+        .into()
+}
+
+fn register_registry_ancestors(
+    keys: &mut BTreeMap<RegistryPathKey, BString>,
+    root: RegistryRoot,
+    view: RegistryView,
+    subkey: &[u8],
+) {
+    keys.entry((root, view, BString::default())).or_default();
+    let mut normalized = Vec::new();
+    let mut original = Vec::new();
+    for part in subkey
+        .split(|&byte| byte == b'/' || byte == b'\\')
+        .filter(|part| !part.is_empty())
+    {
+        if !normalized.is_empty() {
+            normalized.push(b'\\');
+            original.push(b'\\');
+        }
+        normalized.extend(part.iter().map(u8::to_ascii_lowercase));
+        original.extend_from_slice(part);
+        keys.entry((root, view, BString::from(normalized.as_slice())))
+            .or_insert_with(|| BString::from(original.as_slice()));
+    }
+}
+
+fn registry_key(
+    root: RegistryRoot,
+    key: &[u8],
+    name: Option<&[u8]>,
+    view: RegistryView,
+) -> RegistryKey {
+    let trimmed = key
+        .split(|&byte| byte == b'/' || byte == b'\\')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(b"\\".as_slice());
     (
         root,
-        key,
+        normalize_registry_subkey(&trimmed),
         name.map(|name| name.to_ascii_lowercase().into()),
         view,
     )
@@ -353,6 +445,10 @@ impl Host for PureHost {
         self.lock()?.fs.canonicalize(p)
     }
 
+    fn path_on_disk(&self, p: &Path) -> PathBuf {
+        crate::path::path_on_disk_with(p, |dir| self.read_dir(dir))
+    }
+
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
         self.lock()?.fs.set_permissions(p, mode)
     }
@@ -386,14 +482,99 @@ impl Host for PureHost {
         name: Option<&[u8]>,
         view: RegistryView,
     ) -> HostResult<Option<BString>> {
+        self.registry_value_with_separator(root, key, name, view, None)
+    }
+
+    fn registry_value_with_separator(
+        &self,
+        root: RegistryRoot,
+        key: &[u8],
+        name: Option<&[u8]>,
+        view: RegistryView,
+        separator: Option<&[u8]>,
+    ) -> HostResult<Option<BString>> {
         let state = self.lock()?;
         if state.registry_view == Some(RegistryView::Bits32) && view == RegistryView::Bits64 {
             return Ok(None);
         }
-        Ok(state
+        let lookup = registry_key(root, key, name.filter(|name| !name.is_empty()), view);
+        Ok(state.registry.get(&lookup).map(|entry| match &entry.value {
+            PureRegistryValue::Scalar(value) => value.clone(),
+            PureRegistryValue::MultiSz(raw) => crate::format_multi_sz(raw, separator),
+        }))
+    }
+
+    fn registry_value_names(
+        &self,
+        root: RegistryRoot,
+        key: &[u8],
+        view: RegistryView,
+    ) -> HostResult<Option<Vec<BString>>> {
+        let state = self.lock()?;
+        if state.registry_view == Some(RegistryView::Bits32) && view == RegistryView::Bits64 {
+            return Ok(None);
+        }
+        let target = registry_key(root, key, None, view).1;
+        if !state
+            .registry_keys
+            .contains_key(&(root, view, target.clone()))
+        {
+            return Ok(None);
+        }
+        let names = state
             .registry
-            .get(&registry_key(root, key, name, view))
-            .cloned())
+            .iter()
+            .filter(|((entry_root, entry_key, _, entry_view), _)| {
+                *entry_root == root && *entry_view == view && *entry_key == target
+            })
+            .map(|(_, entry)| {
+                entry
+                    .original_name
+                    .clone()
+                    .unwrap_or_else(|| BString::from("(default)"))
+            })
+            .collect();
+        Ok(Some(names))
+    }
+
+    fn registry_subkeys(
+        &self,
+        root: RegistryRoot,
+        key: &[u8],
+        view: RegistryView,
+    ) -> HostResult<Option<Vec<BString>>> {
+        let state = self.lock()?;
+        if state.registry_view == Some(RegistryView::Bits32) && view == RegistryView::Bits64 {
+            return Ok(None);
+        }
+        let target = registry_key(root, key, None, view).1;
+        if !state
+            .registry_keys
+            .contains_key(&(root, view, target.clone()))
+        {
+            return Ok(None);
+        }
+        let mut subkeys = Vec::new();
+        for ((entry_root, entry_view, entry_key), original_path) in &state.registry_keys {
+            if *entry_root != root || *entry_view != view || entry_key.is_empty() {
+                continue;
+            }
+            let suffix = if target.is_empty() {
+                Some(entry_key.as_slice())
+            } else {
+                entry_key
+                    .strip_prefix(target.as_slice())
+                    .and_then(|rest| rest.strip_prefix(b"\\"))
+            };
+            if let Some(child) = suffix
+                && !child.is_empty()
+                && !child.contains(&b'\\')
+                && let Some(original_leaf) = original_path.rsplit(|&byte| byte == b'\\').next()
+            {
+                subkeys.push(BString::from(original_leaf));
+            }
+        }
+        Ok(Some(subkeys))
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
@@ -402,6 +583,7 @@ impl Host for PureHost {
 
     fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
         if let Ok(mut guard) = self.state.lock() {
+            self.env_epoch.fetch_add(1, Ordering::AcqRel);
             match value {
                 Some(v) => {
                     guard.env.insert(BString::from(key), BString::from(v));
@@ -418,6 +600,10 @@ impl Host for PureHost {
             .lock()
             .map(|g| g.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default()
+    }
+
+    fn env_epoch(&self) -> Option<u64> {
+        Some(self.env_epoch.load(Ordering::Acquire))
     }
 
     fn run(
@@ -572,5 +758,154 @@ mod tests {
         assert_eq!(updated.atime, atime);
         assert_eq!(updated.mtime, mtime);
         Ok(())
+    }
+
+    #[test]
+    fn env_epoch_increments_on_set_and_unset() {
+        let host = PureHost::default();
+        let e0 = host.env_epoch();
+        assert_eq!(e0, Some(0));
+        host.env_set(b"RCMAKE_TEST_EPOCH", Some(b"1"));
+        let e1 = host.env_epoch();
+        assert_eq!(e1, Some(1));
+        host.env_set(b"RCMAKE_TEST_EPOCH", Some(b"2"));
+        let e2 = host.env_epoch();
+        assert_eq!(e2, Some(2));
+        host.env_set(b"RCMAKE_TEST_EPOCH", None);
+        let e3 = host.env_epoch();
+        assert_eq!(e3, Some(3));
+    }
+
+    #[test]
+    fn pure_host_enumerates_registry_values_subkeys_and_multi_sz() -> HostResult<()> {
+        let host = PureHost::default();
+        host.set_registry_host_view(RegistryView::Bits64)?;
+        let key = b"Software/Classes/CLSID/CMake-Tests/chsi-registry";
+        host.seed_registry_value(
+            RegistryRoot::CurrentUser,
+            key,
+            None,
+            RegistryView::Bits64,
+            b"default 64bit",
+        )?;
+        host.seed_registry_multi_sz(
+            RegistryRoot::CurrentUser,
+            key,
+            Some(b"VALUE_MULTI_SZ"),
+            RegistryView::Bits64,
+            b"data1\0data2\0",
+        )?;
+        host.seed_registry_multi_sz(
+            RegistryRoot::CurrentUser,
+            key,
+            Some(b"VALUE2_MULTI_SZ"),
+            RegistryView::Bits64,
+            b"data1|data2\0",
+        )?;
+        host.seed_registry_key(
+            RegistryRoot::CurrentUser,
+            b"Software/Classes/CLSID/CMake-Tests/chsi-registry/subkey1",
+            RegistryView::Bits64,
+        )?;
+        host.seed_registry_key(
+            RegistryRoot::CurrentUser,
+            b"Software/Classes/CLSID/CMake-Tests/chsi-registry/subkey2",
+            RegistryView::Bits64,
+        )?;
+        host.seed_registry_key(
+            RegistryRoot::CurrentUser,
+            b"Software/Classes/CLSID/CMake-Tests/chsi-registry/subkey3",
+            RegistryView::Bits32,
+        )?;
+
+        assert_eq!(
+            host.registry_value_with_separator(
+                RegistryRoot::CurrentUser,
+                key,
+                Some(b"VALUE_MULTI_SZ"),
+                RegistryView::Bits64,
+                None,
+            )?,
+            Some("data1;data2".into())
+        );
+        assert_eq!(
+            host.registry_value_with_separator(
+                RegistryRoot::CurrentUser,
+                key,
+                Some(b"VALUE2_MULTI_SZ"),
+                RegistryView::Bits64,
+                Some(b"|"),
+            )?,
+            Some("data1;data2".into())
+        );
+        let mut names = host
+            .registry_value_names(RegistryRoot::CurrentUser, key, RegistryView::Bits64)?
+            .unwrap_or_default();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                BString::from("(default)"),
+                BString::from("VALUE2_MULTI_SZ"),
+                BString::from("VALUE_MULTI_SZ"),
+            ]
+        );
+        assert_eq!(
+            host.registry_subkeys(RegistryRoot::CurrentUser, key, RegistryView::Bits64)?,
+            Some(vec![BString::from("subkey1"), BString::from("subkey2")])
+        );
+        assert_eq!(
+            host.registry_subkeys(RegistryRoot::CurrentUser, key, RegistryView::Bits32)?,
+            Some(vec![BString::from("subkey3")])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn path_on_disk_recovers_component_case_and_windows_drive_letter() -> HostResult<()> {
+        let host = PureHost::new(PathBuf::from("/Work"), PathBuf::from("/bin/cmake"));
+        host.seed_file(
+            Path::new("/Work/Tests/RunCMake/CommandLine/P_PathOnDisk.cmake"),
+            b"",
+        )?;
+        assert_eq!(
+            host.path_on_disk(Path::new(
+                "/work/tests/runcmake/commandline/../CommandLine/p_pathondisk.cmake"
+            )),
+            PathBuf::from("/Work/Tests/RunCMake/CommandLine/P_PathOnDisk.cmake")
+        );
+
+        let win_case = crate::path::path_on_disk_with(
+            Path::new(r"d:/t/tests/runcmake/commandline/p_working-dir-build"),
+            |dir| {
+                let s = crate::path::from_native(dir);
+                let name = match s.as_slice() {
+                    b"D:/" => "t",
+                    b"D:/t" => "Tests",
+                    b"D:/t/Tests" => "RunCMake",
+                    b"D:/t/Tests/RunCMake" => "CommandLine",
+                    b"D:/t/Tests/RunCMake/CommandLine" => "P_working-dir-build",
+                    _ => return Ok(Vec::new()),
+                };
+                Ok(vec![DirEntry {
+                    name: name.into(),
+                    kind: crate::FileKind::Dir,
+                }])
+            },
+        );
+        assert_eq!(
+            win_case,
+            PathBuf::from("D:/t/Tests/RunCMake/CommandLine/P_working-dir-build")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_interactive_debug_creation_flags_require_explicit_opt_in() {
+        assert_eq!(
+            crate::windows_child_creation_flags(true),
+            crate::WINDOWS_CREATE_DEFAULT_ERROR_MODE
+        );
+        assert_eq!(crate::windows_child_creation_flags(false), 0);
     }
 }

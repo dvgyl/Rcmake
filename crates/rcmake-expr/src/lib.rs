@@ -44,8 +44,23 @@ pub trait ExpandEnv {
     /// Look up a normal variable (falling back to cache if normal binding is absent).
     fn var(&mut self, name: &[u8]) -> Option<BString>;
 
+    /// Borrow a normal variable (falling back to cache) without cloning when possible.
+    ///
+    /// Implementations with variable watches must run the full watch path when a watch
+    /// applies and only return a direct borrow when no watch or side effect can run.
+    fn var_ref(&mut self, name: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        self.var(name)
+            .map(|value| std::borrow::Cow::Owned(value.into()))
+    }
+
     /// Look up a cache variable directly (`$CACHE{...}`).
     fn cache_var(&mut self, name: &[u8]) -> Option<BString>;
+
+    /// Borrow a cache variable directly (`$CACHE{...}`) without cloning when possible.
+    fn cache_var_ref(&mut self, name: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        self.cache_var(name)
+            .map(|value| std::borrow::Cow::Owned(value.into()))
+    }
 
     /// Look up a host environment variable (`$ENV{...}`).
     fn env_var(&mut self, name: &[u8]) -> Option<BString>;

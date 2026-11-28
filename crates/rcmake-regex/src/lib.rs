@@ -12,7 +12,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rcmake_base::{BString, Limits};
@@ -100,7 +101,11 @@ pub struct Scratch(program::Scratch);
 #[derive(Clone, Debug)]
 pub struct Regex {
     group_count: usize,
-    program: Arc<[program::Instruction]>,
+    program: Arc<program::Compiled>,
+}
+
+thread_local! {
+    static THREAD_SCRATCH: RefCell<program::Scratch> = RefCell::new(program::Scratch::default());
 }
 
 impl Regex {
@@ -109,7 +114,7 @@ impl Regex {
         let (expression, group_count) = parse::parse(pattern)?;
         Ok(Self {
             group_count,
-            program: program::compile(expression).into(),
+            program: Arc::new(program::compile(expression)),
         })
     }
 
@@ -129,7 +134,16 @@ impl Regex {
         options: MatchOptions,
         budget: &mut u64,
     ) -> Result<Option<Captures>, RegexLimit> {
-        self.find_at_with_scratch(hay, start, options, budget, &mut Scratch::default())
+        THREAD_SCRATCH.with(|cell| {
+            if let Ok(mut scratch) = cell.try_borrow_mut() {
+                let result =
+                    program::find(&self.program, hay, start, options, budget, &mut scratch);
+                scratch.trim();
+                result
+            } else {
+                self.find_at_with_scratch(hay, start, options, budget, &mut Scratch::default())
+            }
+        })
     }
 
     /// Search like [`Self::find_at`] and reuse the storage in `scratch`.
@@ -145,25 +159,62 @@ impl Regex {
     }
 }
 
-/// Per-interpreter cache of compiled [`Regex`] instances.
+/// Bounded capacity for [`RegexCache`] using CLOCK (second-chance) eviction.
+const REGEX_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Debug)]
+struct CacheSlot {
+    key: BString,
+    regex: Arc<Regex>,
+    referenced: bool,
+}
+
+/// Per-interpreter bounded CLOCK cache of compiled [`Regex`] instances.
 #[derive(Default, Debug)]
 pub struct RegexCache {
-    entries: BTreeMap<BString, Arc<Regex>>,
+    index: HashMap<BString, usize>,
+    slots: Vec<CacheSlot>,
+    hand: usize,
 }
 
 impl RegexCache {
     /// Look up or compile `pattern`.
     pub fn get_or_compile(&mut self, pattern: &[u8]) -> Result<Arc<Regex>, RegexError> {
-        if let Some(re) = self.entries.get(pattern) {
-            return Ok(Arc::clone(re));
+        if let Some(&slot_idx) = self.index.get(pattern)
+            && let Some(slot) = self.slots.get_mut(slot_idx)
+        {
+            slot.referenced = true;
+            return Ok(Arc::clone(&slot.regex));
         }
         let compiled = Arc::new(Regex::new(pattern)?);
-        if self.entries.len() >= 256 {
-            self.entries.clear();
+        let key = BString::from(pattern);
+        if self.slots.len() < REGEX_CACHE_CAPACITY {
+            let slot_idx = self.slots.len();
+            self.slots.push(CacheSlot {
+                key: key.clone(),
+                regex: Arc::clone(&compiled),
+                referenced: false,
+            });
+            self.index.insert(key, slot_idx);
+            return Ok(compiled);
         }
-        self.entries
-            .insert(BString::from(pattern), Arc::clone(&compiled));
-        Ok(compiled)
+        let len = self.slots.len();
+        loop {
+            let idx = self.hand % len;
+            self.hand = (idx + 1) % len;
+            if let Some(slot) = self.slots.get_mut(idx) {
+                if slot.referenced {
+                    slot.referenced = false;
+                } else {
+                    self.index.remove(&slot.key);
+                    slot.key = key.clone();
+                    slot.regex = Arc::clone(&compiled);
+                    slot.referenced = false;
+                    self.index.insert(key, idx);
+                    return Ok(compiled);
+                }
+            }
+        }
     }
 }
 

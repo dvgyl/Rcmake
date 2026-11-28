@@ -146,22 +146,6 @@ impl Interp {
         body: BString,
         mark_failed: bool,
     ) {
-        let location = if self
-            .project
-            .global
-            .props
-            .get(b"\0RCMAKE_IN_RULE_CONFIGURATOR")
-            .is_some()
-        {
-            let directory = &self.project.dir(self.current_dir_id()).source_dir;
-            let file = rcmake_base::path_lex::Lexical::new(directory).append(b"CMakeLists.txt");
-            Location::FileLine {
-                file: file.as_slice().into(),
-                line: 0,
-            }
-        } else {
-            Location::Backtrace(self.bt.clone())
-        };
         self.issue_at(
             IssueClass {
                 kind,
@@ -169,7 +153,7 @@ impl Interp {
                 category,
                 policy: None,
             },
-            location,
+            Location::Backtrace(self.bt.clone()),
             body,
             mark_failed,
         );

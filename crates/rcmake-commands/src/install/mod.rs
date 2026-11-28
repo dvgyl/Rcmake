@@ -240,10 +240,50 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         return Ok(Flow::Normal);
     };
     if *signature == b"IMPORTED_RUNTIME_ARTIFACTS" {
-        return runtime::imported(cx, rest);
+        let before = cx.project().installs.len();
+        let flow = runtime::imported(cx, rest)?;
+        let extra = cx
+            .project()
+            .installs
+            .get(before..)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|rule| rule.options.destination.as_ref())
+            .filter(|path| is_unix_rooted_windows_destination(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in extra {
+            warn_absolute_destination(cx, &path);
+        }
+        return Ok(flow);
     }
     if *signature == b"RUNTIME_DEPENDENCY_SET" {
-        return runtime::set(cx, rest);
+        let before = cx.project().runtime_dependency_installs.len();
+        let flow = runtime::set(cx, rest)?;
+        let extra = cx
+            .project()
+            .runtime_dependency_installs
+            .get(before..)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|install| {
+                install.library.destination.iter().chain(
+                    install
+                        .framework
+                        .iter()
+                        .filter_map(|f| f.destination.as_ref()),
+                )
+            })
+            .filter(|path| is_unix_rooted_windows_destination(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in extra {
+            warn_absolute_destination(cx, &path);
+        }
+        if cx.fatal_occurred() {
+            cx.project().runtime_dependency_installs.truncate(before);
+        }
+        return Ok(flow);
     }
     if matches!(*signature, b"CODE" | b"SCRIPT") {
         return scripts(cx, signature, rest);
@@ -294,8 +334,13 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         .destination
         .iter()
         .chain(destinations)
-        .filter(|_| *signature != b"EXPORT_ANDROID_MK")
-        .filter(|path| Lexical::new(path).absolute())
+        .filter(|path| {
+            if *signature == b"EXPORT_ANDROID_MK" {
+                is_unix_rooted_windows_destination(path)
+            } else {
+                is_absolute_destination(path)
+            }
+        })
         .cloned()
         .collect::<Vec<_>>();
     for path in absolute_destinations {
@@ -369,7 +414,24 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         options,
     });
     let section = format!("_RCMAKE_INSTALL_{index}");
-    record_args(cx, &section, &input);
+    if *signature == b"TARGETS" {
+        let mut recorded: Vec<BString> = input.iter().copied().map(BString::from).collect();
+        for (argument, path, _) in extra_destinations {
+            if let Some(slot) = recorded.get_mut(argument) {
+                *slot = path;
+            }
+        }
+        let sanitized = sanitize_target_recorded_args(&input, &recorded);
+        let refs: Vec<&[u8]> = sanitized.iter().map(|arg| arg.as_slice()).collect();
+        record_args(cx, &section, &refs);
+    } else {
+        record_args(cx, &section, &input);
+        for (argument, path, _) in extra_destinations {
+            cx.global()
+                .props
+                .set(format!("{section}_ARG{argument}").into(), path);
+        }
+    }
     if let Some(components) = target_components {
         cx.global().props.set(
             format!("{section}_COMPONENTS").into(),
@@ -402,17 +464,44 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
             .props
             .set(format!("{section}_MESSAGE").into(), message);
     }
-    for (argument, path, _) in extra_destinations {
-        cx.global()
-            .props
-            .set(format!("{section}_ARG{argument}").into(), path);
-    }
     if let Some((name, targets)) = members {
         let set = ensure_export_set(cx, &name);
         set.targets.extend(targets);
         set.install_rules.push(index);
     }
     Ok(Flow::Normal)
+}
+
+/// Drop genuinely empty or valueless `DESTINATION` clauses in `install(TARGETS)` recorded
+/// arguments (excluding `INCLUDES DESTINATION`) using the pre-normalization `raw` tokens
+/// so a valid destination such as `./COMPONENT` normalized to `COMPONENT` under `CMP0177 NEW`
+/// is preserved while empty/missing destinations fall back to defaults downstream.
+fn sanitize_target_recorded_args(raw: &[&[u8]], normalized: &[BString]) -> Vec<BString> {
+    let mut out = Vec::with_capacity(normalized.len());
+    let mut index = 0;
+    while let (Some(&raw_token), Some(norm_token)) = (raw.get(index), normalized.get(index)) {
+        let after_includes =
+            index > 0 && raw.get(index - 1).copied() == Some(b"INCLUDES".as_slice());
+        if raw_token == b"DESTINATION" && !after_includes {
+            match (raw.get(index + 1).copied(), normalized.get(index + 1)) {
+                (Some(raw_next), Some(norm_next)) if !keyword(raw_next) => {
+                    if !raw_next.is_empty() && !norm_next.is_empty() {
+                        out.push(norm_token.clone());
+                        out.push(norm_next.clone());
+                    }
+                    index += 2;
+                    continue;
+                }
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+        out.push(norm_token.clone());
+        index += 1;
+    }
+    out
 }
 
 fn ensure_export_set<'a>(cx: &'a mut Cx<'_>, name: &[u8]) -> &'a mut ExportSet {
@@ -423,6 +512,34 @@ fn ensure_export_set<'a>(cx: &'a mut Cx<'_>, name: &[u8]) -> &'a mut ExportSet {
             name: name.into(),
             ..ExportSet::default()
         })
+}
+
+/// Return whether `path` is an absolute destination under CMake's `FileIsFullPath` rule.
+fn is_absolute_destination(path: &[u8]) -> bool {
+    is_absolute_destination_for(path, cfg!(windows))
+}
+
+fn is_absolute_destination_for(path: &[u8], windows: bool) -> bool {
+    if path.starts_with(b"/") {
+        return true;
+    }
+    if windows {
+        if path.starts_with(b"\\") {
+            return true;
+        }
+        if let [drive, b':', ..] = path
+            && drive.is_ascii_alphabetic()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `path` is recognized by CMake's `FileIsFullPath` rule on Windows
+/// (for example `/absolute/path`), even though `Lexical::new(path).absolute()` is false.
+fn is_unix_rooted_windows_destination(path: &[u8]) -> bool {
+    is_absolute_destination(path) && !Lexical::new(path).absolute()
 }
 
 fn warn_absolute_destination(cx: &mut Cx<'_>, path: &[u8]) {
@@ -694,3 +811,155 @@ pub(crate) fn record_request(cx: &mut Cx<'_>, prefix: &str, args: &[&[u8]]) -> u
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod parity_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream};
+    use rcmake_model::InstallKind;
+
+    use crate::test_support::TestResult;
+
+    fn run(
+        code: &str,
+        expected: i32,
+    ) -> Result<(Arc<PureHost>, Interp), Box<dyn std::error::Error>> {
+        let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = Arc::new(PureHost::new(work.to_path_buf(), work.join("cmake")));
+        let source = work.join("src");
+        host.seed_file(&source.join("CMakeLists.txt"), code.as_bytes())?;
+        let mut interp = Interp::new(
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Configure,
+                work.join("data"),
+                work.join("cmake"),
+                work.to_path_buf(),
+            ),
+            crate::register_all,
+        );
+        assert_eq!(
+            interp
+                .run_configure(&source, &work.join("build"), &[])
+                .exit_code,
+            expected,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        Ok((host, interp))
+    }
+
+    #[test]
+    fn files_empty_list_and_repeated_keyword_and_empty_file_set_destination() -> TestResult {
+        let (_, mut interp) = run(
+            r#"
+cmake_minimum_required(VERSION 4.5)
+project(p NONE)
+set(EMPTY "")
+set(EMPTY_DEST "")
+install(FILES ${EMPTY} DESTINATION ${EMPTY_DEST})
+install(FILES a.h FILES b.h DESTINATION include)
+add_library(m INTERFACE)
+target_sources(m INTERFACE FILE_SET HEADERS FILES a.h)
+install(TARGETS m EXPORT sdk FILE_SET HEADERS DESTINATION "")
+install(TARGETS m EXPORT sdk2 FILE_SET HEADERS DESTINATION ${EMPTY_DEST} COMPONENT dev)
+"#,
+            0,
+        )?;
+        let mut cx = interp.cx();
+        let model = cx.project();
+        assert_eq!(model.installs.len(), 3);
+        let InstallKind::Files(files) = &model.installs[0].kind else {
+            return Err("expected FILES rule".into());
+        };
+        assert_eq!(files.len(), 2);
+        assert!(files[0].value.ends_with(b"/a.h"));
+        assert!(files[1].value.ends_with(b"/b.h"));
+
+        let first = rcmake_resolve::file_sets::options_for_set(model, 1, b"HEADERS")
+            .ok_or("first FILE_SET HEADERS group was dropped")?;
+        assert_eq!(first.destination, None);
+
+        let second = rcmake_resolve::file_sets::options_for_set(model, 2, b"HEADERS")
+            .ok_or("second FILE_SET HEADERS group was dropped")?;
+        assert_eq!(second.destination, None);
+        assert_eq!(second.component, Some("dev".into()));
+
+        let (host, _) = run(
+            r#"
+cmake_minimum_required(VERSION 4.5)
+project(p NONE)
+install(FILES a.h DESTINATION)
+"#,
+            1,
+        )?;
+        assert!(
+            host.stream_bytes(Stream::Stderr)
+                .to_string()
+                .contains("FILES given no DESTINATION!"),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targets_preserves_cmp0177_normalized_destination_named_like_keyword() -> TestResult {
+        let (_, mut interp) = run(
+            r#"
+cmake_minimum_required(VERSION 4.5)
+project(p NONE)
+add_library(m INTERFACE)
+target_sources(m INTERFACE FILE_SET HEADERS FILES a.h)
+install(TARGETS m FILE_SET HEADERS DESTINATION ./COMPONENT COMPONENT dev)
+install(TARGETS m FILE_SET HEADERS DESTINATION ./DESTINATION COMPONENT dev2)
+"#,
+            0,
+        )?;
+        let mut cx = interp.cx();
+        let model = cx.project();
+        assert_eq!(model.installs.len(), 2);
+
+        let first = rcmake_resolve::file_sets::options_for_set(model, 0, b"HEADERS")
+            .ok_or("first FILE_SET HEADERS group was dropped")?;
+        assert_eq!(first.destination, Some("COMPONENT".into()));
+        assert_eq!(first.component, Some("dev".into()));
+
+        let second = rcmake_resolve::file_sets::options_for_set(model, 1, b"HEADERS")
+            .ok_or("second FILE_SET HEADERS group was dropped")?;
+        assert_eq!(second.destination, Some("DESTINATION".into()));
+        assert_eq!(second.component, Some("dev2".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn windows_install_recognizes_unix_style_absolute_destinations() {
+        for path in [
+            b"/absolute/path".as_slice(),
+            b"/lib/bmi",
+            br"\absolute\path",
+            b"C:/absolute/path",
+            b"C:drive-prefixed",
+            b"//server/share",
+        ] {
+            assert!(
+                super::is_absolute_destination_for(path, true),
+                "{}",
+                rcmake_base::BString::from(path)
+            );
+        }
+        for path in [b"".as_slice(), b"relative/path", b"bin", b"./lib"] {
+            assert!(
+                !super::is_absolute_destination_for(path, true),
+                "{}",
+                rcmake_base::BString::from(path)
+            );
+        }
+        assert!(super::is_absolute_destination_for(b"/absolute/path", false));
+        assert!(!super::is_absolute_destination_for(
+            b"C:/absolute/path",
+            false
+        ));
+    }
+}

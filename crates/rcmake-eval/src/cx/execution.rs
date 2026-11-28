@@ -62,6 +62,20 @@ impl Cx<'_> {
         self.interp.call_command(name, args)
     }
 
+    /// Invoke a command by name with already expanded arguments inside the current
+    /// backtrace frame (used for generation-time rule configurators).
+    ///
+    /// Preserves step accounting, recursion checks, cancellation handling, and
+    /// command status error reporting without pushing a synthetic caller frame
+    /// for `name`.
+    pub fn call_command_in_current_frame(
+        &mut self,
+        name: &[u8],
+        args: Vec<ExpandedArg>,
+    ) -> CmdResult {
+        self.interp.call_command_in_current_frame(name, args)
+    }
+
     /// Include and execute a CMake file (`include()` without module lookup).
     ///
     /// Returns `Err(CmdError::Status)` with CMake's text when the file is missing or can
@@ -83,11 +97,21 @@ impl Cx<'_> {
         let directory = self.interp.project.dir(dir);
         let definitions = directory.vars.clone();
         let policies = directory.final_policies;
+        let lists = self.interp.directory_list_file(&directory.source_dir);
         self.interp.dir_stack.push(crate::DirFrame {
             id: dir,
             trace_base: self.interp.depth,
             defer: None,
         });
+        let saved_bt = core::mem::replace(
+            &mut self.interp.bt,
+            rcmake_diag::Backtrace::default().push(rcmake_diag::Frame {
+                file: Arc::from(lists.as_slice()),
+                line: 0,
+                name: None,
+                kind: rcmake_diag::FrameKind::Command,
+            }),
+        );
         let policy_base = self.interp.policies.len();
         self.interp.policies.push_copy();
         if let Some(policies) = policies {
@@ -101,6 +125,7 @@ impl Cx<'_> {
             }
             run(cx)
         });
+        self.interp.bt = saved_bt;
         self.interp.policies.pop_above(policy_base);
         self.interp.dir_stack.pop();
         result

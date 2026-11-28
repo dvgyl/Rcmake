@@ -146,6 +146,7 @@ mod tests {
             stderr: Output::Null,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         let key = super::super::query(&host, &machine).ok_or("uname -m is not admitted")?;
         assert!(verify(&host, &key, executable, program, &machine).is_none());
@@ -162,6 +163,7 @@ mod tests {
                 stderr: Output::Null,
                 timeout: None,
                 tee: false,
+                default_error_mode: false,
             };
             let plain = request(Vec::new());
             let key = super::super::query(&host, &plain).ok_or("uname is not admitted")?;

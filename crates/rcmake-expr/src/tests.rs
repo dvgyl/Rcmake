@@ -591,6 +591,14 @@ fn condition_checks_paths_using_policies_and_the_host() {
             .collect::<Vec<_>>(),
         [223, 139, 222].map(|number| Some(PolicyId::new(number)))
     );
+    for warning in &env.warnings[1..] {
+        let body = warning.body.to_string();
+        assert!(
+            !body.contains("\n\n"),
+            "policy warning body must use single newline between paragraphs: {body:?}"
+        );
+        assert!(body.contains("suppress this warning.\nPATH_"), "{body:?}");
+    }
 
     env.policies.insert(139, PolicyStatus::Old);
     env.policies.insert(222, PolicyStatus::Old);

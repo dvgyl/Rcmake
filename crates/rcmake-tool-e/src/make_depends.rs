@@ -121,7 +121,7 @@ fn write_files(
 }
 
 fn relative(file: &Path, build_root: &Path) -> BString {
-    path::from_native(file.strip_prefix(build_root).unwrap_or(file))
+    path::from_native_cmake(file.strip_prefix(build_root).unwrap_or(file))
 }
 
 fn collect(

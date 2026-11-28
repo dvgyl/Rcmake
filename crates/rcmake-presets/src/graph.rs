@@ -103,7 +103,7 @@ pub(crate) struct Record {
     pub(crate) condition: Option<Arc<(Condition, Arc<Value>)>>,
     pub(crate) vendor: Option<BTreeMap<BString, Value>>,
     offset: Option<usize>,
-    inherits: Vec<BString>,
+    pub(crate) inherits: Vec<BString>,
 }
 
 impl Record {
@@ -318,7 +318,11 @@ fn load_graph(
     let project = graph.presets.source_dir.join(PROJECT);
     let user = graph.presets.source_dir.join(USER);
     let roots = if let Some(entry) = entry {
-        let entry = normalize(&host.initial_cwd().join(entry));
+        let entry = if entry.has_root() {
+            normalize(entry)
+        } else {
+            normalize(&host.initial_cwd().join(entry))
+        };
         vec![graph.visit(&entry, None, None, 0)?]
     } else {
         let user_value = graph.read(&user)?;
@@ -502,7 +506,12 @@ impl FileGraph<'_> {
                 let text = expand::include_path(&self.presets, &include, &self.env)
                     .map_err(|_| include.invalid("Invalid \"include\" field"))?;
                 let dir = path.parent().unwrap_or(&self.presets.source_dir);
-                let included = normalize(&dir.join(path::to_native(text.as_slice())));
+                let include_native = path::to_native(text.as_slice());
+                let included = if include_native.has_root() {
+                    normalize(&include_native)
+                } else {
+                    normalize(&dir.join(include_native))
+                };
                 let included = self.visit(&included, None, None, depth + 1)?;
                 reachable.extend(self.reachable.get(&included).into_iter().flatten().cloned());
             }
@@ -890,4 +899,29 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcmake_host::PureHost;
+
+    #[test]
+    fn rooted_missing_presets_file_preserves_leading_slash_in_error() {
+        let host = PureHost::default();
+        let Err(err) = load(
+            Path::new("/project"),
+            &host,
+            None,
+            Some(Path::new("/nonexistent/path/presets.json")),
+        ) else {
+            panic!("missing presets file must fail");
+        };
+        assert!(
+            err.message
+                .ends_with("File not found: /nonexistent/path/presets.json"),
+            "{}",
+            err.message
+        );
+    }
 }

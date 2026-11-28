@@ -174,6 +174,24 @@ pub struct ResolvedPreset {
     pub settings: PresetSettings,
 }
 
+/// Full inspection snapshot of a resolved preset, including hidden and condition state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresetInspection {
+    /// Fully resolved preset with inherited fields and expanded macros.
+    pub preset: ResolvedPreset,
+    /// Whether the preset is marked `hidden: true`.
+    pub hidden: bool,
+    /// Whether the preset's condition (and any referenced configure preset or workflow steps)
+    /// evaluated to `true`.
+    pub enabled: bool,
+    /// Effective condition JSON (including inherited condition), if any.
+    pub condition: Option<Value>,
+    /// Direct parent preset names declared in `inherits`.
+    pub inherits: Vec<BString>,
+    /// Absolute path of the preset file where this preset was declared.
+    pub source_file: PathBuf,
+}
+
 /// Error from the preset loader or resolver.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error("{message}")]

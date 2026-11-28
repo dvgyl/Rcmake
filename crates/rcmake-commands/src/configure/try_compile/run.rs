@@ -11,6 +11,7 @@ use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult, GraphTarget};
 
 mod apple;
 pub(super) mod cross;
+mod file_generate;
 
 use super::args::Options;
 use super::child::ProbeProfile;
@@ -93,6 +94,14 @@ pub(super) fn build_child(
         return Err(ChildError::Generate(
             "The resolver returned no build graph.".into(),
         ));
+    }
+    if model
+        .global
+        .props
+        .get(b"_RCMAKE_FILE_GENERATE_COUNT")
+        .is_some()
+    {
+        file_generate::write(&model, &resolved, child.host()).map_err(ChildError::Generate)?;
     }
     let mut graphs_to_run = Vec::with_capacity(plan.build_configs.len());
     for target_cfg in &plan.build_configs {
@@ -537,6 +546,7 @@ fn build_log_header(
         .unwrap_or_else(|| {
             match generator {
                 Some(GeneratorKind::UnixMakefiles) | None => "make",
+                Some(GeneratorKind::NMakeMakefiles) => "nmake",
                 Some(GeneratorKind::Xcode) => "xcodebuild",
                 Some(GeneratorKind::VisualStudio(_)) => "MSBuild.exe",
                 _ => "ninja",
@@ -554,6 +564,14 @@ fn build_log_header(
             "-f".into(),
             "Makefile".into(),
         ]);
+    } else if generator == Some(GeneratorKind::NMakeMakefiles) {
+        command.extend([
+            make_program,
+            "/nologo".into(),
+            "-f".into(),
+            "Makefile".into(),
+            "VERBOSE=1".into(),
+        ]);
     } else {
         command.push(make_program);
         if matches!(
@@ -568,7 +586,12 @@ fn build_log_header(
     }
     if let Some(target) = target {
         let mut target = BString::from(target);
-        if source_signature && generator == Some(GeneratorKind::UnixMakefiles) {
+        if source_signature
+            && matches!(
+                generator,
+                Some(GeneratorKind::UnixMakefiles | GeneratorKind::NMakeMakefiles)
+            )
+        {
             target.extend_from_slice(b"/fast");
         }
         command.push(target);
@@ -636,6 +659,7 @@ pub(super) fn run_executable(
                         },
                         timeout: Some(TIMEOUT),
                         tee: false,
+                        default_error_mode: false,
                     },
                     &mut |_, _| {},
                 )

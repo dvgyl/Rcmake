@@ -129,6 +129,7 @@ fn request(cwd: &Path, pipeline: Vec<CommandSpec>) -> RunRequest {
         stderr: Output::Capture,
         timeout: Some(Duration::from_secs(5)),
         tee: false,
+        default_error_mode: false,
     }
 }
 

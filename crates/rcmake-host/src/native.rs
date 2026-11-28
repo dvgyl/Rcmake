@@ -8,6 +8,7 @@ use std::fs::{self, File, FileType, OpenOptions};
 use std::io::{self, ErrorKind, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::tz::TimeZone;
@@ -35,6 +36,7 @@ mod process;
 #[derive(Debug)]
 pub struct NativeHost {
     env: RwLock<BTreeMap<BString, BString>>,
+    env_epoch: AtomicU64,
     initial_cwd: PathBuf,
     start: Instant,
 }
@@ -56,6 +58,7 @@ impl NativeHost {
         let initial_cwd = platform::logical_cwd(&physical_cwd, pwd.as_deref());
         Ok(Self {
             env: RwLock::new(map),
+            env_epoch: AtomicU64::new(0),
             initial_cwd,
             start: Instant::now(),
         })
@@ -527,6 +530,11 @@ impl Host for NativeHost {
     }
 
     #[cfg(windows)]
+    fn path_on_disk(&self, p: &Path) -> PathBuf {
+        platform::path_on_disk(p)
+    }
+
+    #[cfg(windows)]
     fn registry_host_view(&self) -> Option<crate::RegistryView> {
         Some(platform::registry::host_view(self))
     }
@@ -539,7 +547,39 @@ impl Host for NativeHost {
         name: Option<&[u8]>,
         view: crate::RegistryView,
     ) -> HostResult<Option<BString>> {
-        Ok(platform::registry::value(self, root, subkey, name, view))
+        platform::registry::value(self, root, subkey, name, view)
+    }
+
+    #[cfg(windows)]
+    fn registry_value_with_separator(
+        &self,
+        root: crate::RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: crate::RegistryView,
+        separator: Option<&[u8]>,
+    ) -> HostResult<Option<BString>> {
+        platform::registry::value_with_separator(self, root, subkey, name, view, separator)
+    }
+
+    #[cfg(windows)]
+    fn registry_value_names(
+        &self,
+        root: crate::RegistryRoot,
+        subkey: &[u8],
+        view: crate::RegistryView,
+    ) -> HostResult<Option<Vec<BString>>> {
+        platform::registry::value_names(self, root, subkey, view)
+    }
+
+    #[cfg(windows)]
+    fn registry_subkeys(
+        &self,
+        root: crate::RegistryRoot,
+        subkey: &[u8],
+        view: crate::RegistryView,
+    ) -> HostResult<Option<Vec<BString>>> {
+        platform::registry::subkeys(self, root, subkey, view)
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
@@ -549,6 +589,7 @@ impl Host for NativeHost {
 
     fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
         if let Ok(mut guard) = self.env.write() {
+            self.env_epoch.fetch_add(1, Ordering::AcqRel);
             match value {
                 Some(v) => {
                     guard.insert(env_key(key), BString::from(v));
@@ -565,6 +606,10 @@ impl Host for NativeHost {
             .read()
             .map(|g| g.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default()
+    }
+
+    fn env_epoch(&self) -> Option<u64> {
+        Some(self.env_epoch.load(Ordering::Acquire))
     }
 
     #[cfg(unix)]

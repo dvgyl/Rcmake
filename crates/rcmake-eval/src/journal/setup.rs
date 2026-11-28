@@ -15,20 +15,25 @@
 //! of the configure. Hits before the difference stay valid, because the setup
 //! that changed had not run yet when those listfiles replayed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use rcmake_base::BString;
+use rcmake_diag::{Backtrace, FrameKind};
 use rcmake_host::{FileKind, Follow, Host};
 use rcmake_json::{FieldError, FromJson, Value};
-use rcmake_model::{Cache, CacheEntry, DirId};
+use rcmake_model::{
+    BT, Cache, CacheEntry, DirId, ImportedVisibility, LinkItem, PropertyMap, SourceGroupDef,
+    TargetBinding, TargetKind, TargetOrigin, UsageField, UsageProps, UsageScope,
+};
+use rcmake_syntax::ArgKind;
 
 use super::codec;
 use super::frame::{EncodeError, EncodeJson, JsonSink};
 use super::inputs::ReplaySetupInputs;
 use super::trace::JournalHasher;
 use super::{JournalDigest, file_digest};
-use crate::{Command, Cx, Interp};
+use crate::{Command, Cx, Interp, UserCommandKind};
 
 /// Version of the setup record. A record with another version is not decoded,
 /// so a manifest from an older layout gives no replay hits.
@@ -73,6 +78,7 @@ pub(crate) struct SetupSession {
     host: std::sync::Arc<dyn Host>,
     previous: Option<SetupRecord>,
     record: SetupRecord,
+    recorded_env: BTreeSet<Vec<u8>>,
     loaded: BTreeMap<BString, JournalDigest>,
     depth: u32,
     complete: bool,
@@ -118,14 +124,14 @@ impl SetupSession {
             hash.field(1, path.as_os_str().as_encoded_bytes());
             match host.metadata(path, Follow::No) {
                 Ok(metadata) => {
-                    hash.field(2, format!("{:?}", metadata.kind).as_bytes());
+                    hash.file_kind(2, metadata.kind);
                     if metadata.kind == FileKind::Symlink
                         && let Ok(target) = host.read_link(path)
                     {
                         hash.field(3, target.as_os_str().as_encoded_bytes());
                     }
                 }
-                Err(_) => hash.field(2, b"missing"),
+                Err(_) => hash.u8(2, 0),
             }
             if let Ok(resolved) = host.canonicalize_fresh(path) {
                 hash.field(4, resolved.as_os_str().as_encoded_bytes());
@@ -158,6 +164,7 @@ impl SetupSession {
             host,
             previous: None,
             record,
+            recorded_env: BTreeSet::new(),
             loaded,
             depth: 0,
             complete: false,
@@ -219,13 +226,15 @@ impl SetupSession {
     }
 
     pub(super) fn record_env(&mut self, name: &[u8], digest: Option<JournalDigest>) {
-        if self.depth == 0 || self.record.env.iter().any(|(known, _)| known == name) {
+        if self.depth == 0 || self.recorded_env.contains(name) {
             return;
         }
         if self.record.env.len() >= MAX_LEDGER || name.len() > MAX_ENV_NAME {
             self.env_overflow = true;
         } else {
-            self.record.env.push((name.to_vec(), digest));
+            let owned = name.to_vec();
+            self.recorded_env.insert(owned.clone());
+            self.record.env.push((owned, digest));
         }
     }
 
@@ -404,6 +413,10 @@ impl Interp {
         if !setup.complete {
             return;
         }
+        let skip_hashing = setup.env_overflow && setup.miss.is_some();
+        if skip_hashing || !self.can_replay() {
+            return;
+        }
         let domains = self.setup_domains();
         if let Some(setup) = &mut self.replay.setup {
             setup.checkpoint(domains, &self.project.cache);
@@ -413,7 +426,7 @@ impl Interp {
     /// Digest each domain of the interpreter state that a listfile can observe after
     /// setup. Each domain digest must change when its state changes.
     pub(super) fn setup_domains(&self) -> Vec<Domain> {
-        let mut domains = Vec::new();
+        let mut domains = Vec::with_capacity(8);
         let mut add =
             |name: &str, hash: JournalHasher| domains.push((name.to_owned(), hash.finish()));
 
@@ -440,24 +453,53 @@ impl Interp {
         add("variables", hash);
 
         let mut hash = JournalHasher::new(b"setup-policies");
-        hash.field(1, format!("{:?}", self.policies).as_bytes());
+        hash.layered_policies(1, &self.policies);
         add("policies", hash);
 
         let mut hash = JournalHasher::new(b"setup-diagnostics");
-        hash.field(1, format!("{:?}", self.diags).as_bytes());
-        hash.field(2, &[self.log_level.map_or(255, |level| level as u8)]);
+        hash.layered_diags(1, &self.diags);
+        hash.u8(2, self.log_level.map_or(255, |level| level as u8));
         add("diagnostics", hash);
 
         let mut hash = JournalHasher::new(b"setup-global");
         let global = &self.project.global;
-        for name in global.props.names() {
-            hash.field(1, &name);
-            if let Some(value) = global.props.get(&name) {
-                hash.field(2, value);
+        hash_property_map(&mut hash, 1, &global.props, None);
+        hash.usize(3, global.defined_props.len());
+        for prop in &global.defined_props {
+            hash.field(4, &prop.scope);
+            hash.field(5, &prop.name);
+            hash.bool(6, prop.inherited);
+            hash.field(7, &prop.brief_docs);
+            hash.field(8, &prop.full_docs);
+            hash.opt_bytes(
+                9,
+                prop.initialize_from_variable.as_ref().map(|v| v.as_slice()),
+            );
+        }
+        hash.usize(10, global.instrumentation.len());
+        for req in &global.instrumentation {
+            hash_backtrace(&mut hash, 11, &req.backtrace);
+            hash.field(12, &req.api_version);
+            hash.field(13, &req.data_version);
+            hash.usize(14, req.hooks.len());
+            for item in &req.hooks {
+                hash.field(15, item);
+            }
+            hash.usize(16, req.options.len());
+            for item in &req.options {
+                hash.field(17, item);
+            }
+            hash.usize(18, req.callbacks.len());
+            for item in &req.callbacks {
+                hash.field(19, item);
+            }
+            hash.usize(20, req.custom_content.len());
+            for content in &req.custom_content {
+                hash.field(21, &content.name);
+                hash.field(22, &content.ty);
+                hash.field(23, &content.content);
             }
         }
-        hash.field(3, format!("{:?}", global.defined_props).as_bytes());
-        hash.field(4, format!("{:?}", global.instrumentation).as_bytes());
         add("global", hash);
 
         let mut hash = JournalHasher::new(b"setup-directories");
@@ -465,54 +507,76 @@ impl Interp {
         if self.current_dir_id() != DirId::ROOT {
             dirs.push(self.current_dir_id());
         }
+        hash.usize(0, dirs.len());
         for dir in dirs {
             let directory = self.project.dir(dir);
             hash.field(1, &directory.binary_dir);
-            for name in directory.props.names() {
-                // `MACROS` names each macro definition. The command domain holds
-                // the definitions outside the stock modules, and a cold configure
-                // defines more stock macros than a warm one.
-                if name == "MACROS" {
-                    continue;
-                }
-                hash.field(2, &name);
-                if let Some(value) = directory.props.get(&name) {
-                    hash.field(3, value);
-                }
-            }
-            hash.field(4, format!("{:?}", directory.usage).as_bytes());
+            // `MACROS` names each macro definition. The command domain holds
+            // the definitions outside the stock modules, and a cold configure
+            // defines more stock macros than a warm one.
+            hash_property_map(&mut hash, 2, &directory.props, Some(b"MACROS"));
+            hash_usage_props(&mut hash, 4, &directory.usage);
             hash.field(5, &directory.define_flags);
-            hash.field(6, format!("{:?}", directory.source_groups).as_bytes());
-            hash.field(7, format!("{:?}", directory.source_props).as_bytes());
-            hash.field(8, format!("{:?}", directory.generated_sources).as_bytes());
-            hash.field(9, format!("{:?}", directory.local_targets).as_bytes());
+            hash_source_groups(&mut hash, 6, &directory.source_groups);
+            hash.usize(7, directory.source_props.len());
+            for (path, props) in &directory.source_props {
+                hash.field(8, path);
+                hash_property_map(&mut hash, 9, props, None);
+            }
+            hash.usize(10, directory.generated_sources.len());
+            for path in &directory.generated_sources {
+                hash.field(11, path);
+            }
+            hash.usize(12, directory.local_targets.len());
+            for (name, binding) in &directory.local_targets {
+                hash.field(13, name);
+                hash_target_binding(&mut hash, 14, *binding);
+            }
         }
         add("directories", hash);
 
         let mut hash = JournalHasher::new(b"setup-targets");
-        for (_, target) in self.project.targets() {
-            let fields = (
-                (&target.name, &target.kind, &target.origin, &target.dir),
-                (&target.backtrace, &target.policies, &target.props),
-                (&target.usage, &target.sources, &target.file_sets),
-                (&target.utility_deps, &target.event_commands),
-            );
-            hash.field(1, format!("{fields:?}").as_bytes());
+        let targets: Vec<_> = self.project.targets().collect();
+        hash.usize(0, targets.len());
+        for (_, target) in targets {
+            hash.field(1, &target.name);
+            hash_target_kind(&mut hash, 2, target.kind);
+            hash_target_origin(&mut hash, 3, target.origin);
+            hash.usize(4, target.dir.index());
+            hash_backtrace(&mut hash, 5, &target.backtrace);
+            hash.policy_map(6, &target.policies.policies);
+            hash_property_map(&mut hash, 7, &target.props, None);
+            hash_usage_props(&mut hash, 8, &target.usage);
+            hash_bt_list(&mut hash, 9, &target.sources);
+            hash.usize(10, target.file_sets.len());
+            for id in &target.file_sets {
+                hash.usize(11, id.index());
+            }
+            hash_bt_list(&mut hash, 12, &target.utility_deps);
+            hash.usize(13, target.event_commands.len());
+            for id in &target.event_commands {
+                hash.usize(14, id.index());
+            }
         }
-        for (name, binding) in self.project.global_target_bindings() {
-            hash.field(2, name);
-            hash.field(3, format!("{binding:?}").as_bytes());
+        let bindings: Vec<_> = self.project.global_target_bindings().collect();
+        hash.usize(20, bindings.len());
+        for (name, binding) in bindings {
+            hash.field(21, name);
+            hash_target_binding(&mut hash, 22, binding);
         }
         add("targets", hash);
 
         let mut hash = JournalHasher::new(b"setup-commands");
         let modules = self.config.cmake_root.join("Modules");
         let modules = modules.as_os_str().as_encoded_bytes();
-        for (name, command) in &self.scripted {
+        let mut scripted: Vec<_> = self.scripted.iter().collect();
+        scripted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (name, command) in scripted {
             match command {
                 Command::Builtin(_, flags, raw) => {
                     hash.field(1, name);
-                    hash.field(2, format!("{flags:?} {raw}").as_bytes());
+                    hash.bool(2, flags.scriptable);
+                    hash.bool(3, *raw);
                 }
                 Command::User(user) => {
                     // Listfile replay rejects every call of a scripted command and
@@ -525,23 +589,35 @@ impl Interp {
                     {
                         continue;
                     }
-                    hash.field(3, name);
-                    hash.field(4, format!("{:?}", user.kind).as_bytes());
-                    hash.field(5, &user.name);
+                    hash.field(4, name);
+                    let kind_code = match user.kind {
+                        UserCommandKind::Function => 0,
+                        UserCommandKind::Macro => 1,
+                    };
+                    hash.u8(5, kind_code);
+                    hash.field(6, &user.name);
+                    hash.usize(7, user.params.len());
                     for param in &user.params {
-                        hash.field(6, param);
+                        hash.field(8, param);
                     }
-                    hash.field(7, file);
-                    hash.field(8, &user.line.to_le_bytes());
-                    hash.field(9, format!("{:?}", user.policies).as_bytes());
-                    hash.field(10, format!("{:?}", user.diags).as_bytes());
+                    hash.field(9, file);
+                    hash.u32(10, user.line);
+                    hash.policy_map(11, &user.policies);
+                    hash.diag_state(12, &user.diags);
+                    hash.usize(13, user.body.cmds.len());
                     for cmd in user.body.cmds.iter() {
-                        hash.field(11, &cmd.name);
-                        hash.field(12, &cmd.line.to_le_bytes());
+                        hash.field(14, &cmd.name);
+                        hash.u32(15, cmd.line);
+                        hash.usize(16, cmd.args.len());
                         for arg in &cmd.args {
-                            hash.field(13, format!("{:?}", arg.kind).as_bytes());
-                            hash.field(14, &arg.text);
-                            hash.field(15, &arg.line.to_le_bytes());
+                            let arg_kind = match arg.kind {
+                                ArgKind::Unquoted => 0,
+                                ArgKind::Quoted => 1,
+                                ArgKind::Bracket => 2,
+                            };
+                            hash.u8(17, arg_kind);
+                            hash.field(18, &arg.text);
+                            hash.u32(19, arg.line);
                         }
                     }
                 }
@@ -550,15 +626,183 @@ impl Interp {
         add("commands", hash);
 
         let mut hash = JournalHasher::new(b"setup-hooks");
-        hash.field(1, format!("{:?}", self.hooks.watches).as_bytes());
-        hash.field(2, &self.hooks.next_defer_id.to_le_bytes());
+        hash.usize(1, self.hooks.watches.len());
+        for (name, watches) in &self.hooks.watches {
+            hash.field(2, name);
+            hash.usize(3, watches.len());
+            for watch in watches {
+                hash.debug_stream(4, watch);
+            }
+        }
+        hash.u64(5, self.hooks.next_defer_id);
         for frame in std::iter::once(&self.root_frame).chain(&self.dir_stack) {
-            hash.field(3, format!("{:?}", frame.defer).as_bytes());
+            match &frame.defer {
+                None => hash.u8(6, 0),
+                Some(defer) => {
+                    hash.u8(6, 1);
+                    hash.debug_stream(7, defer);
+                }
+            }
         }
         add("hooks", hash);
 
         domains
     }
+}
+
+fn hash_backtrace(hash: &mut JournalHasher, tag: u8, backtrace: &Backtrace) {
+    let mut count = 0_usize;
+    for frame in backtrace.frames() {
+        count += 1;
+        hash.u8(tag, 1);
+        hash.field(tag, &frame.file);
+        hash.u32(tag, frame.line);
+        hash.opt_bytes(tag, frame.name.as_deref());
+        let kind = match frame.kind {
+            FrameKind::Command => 0,
+            FrameKind::Deferred => 1,
+            FrameKind::ModuleInclude => 2,
+        };
+        hash.u8(tag, kind);
+    }
+    hash.u8(tag, 0);
+    hash.usize(tag, count);
+}
+
+fn hash_bt_list(hash: &mut JournalHasher, tag: u8, items: &[BT<BString>]) {
+    hash.usize(tag, items.len());
+    for item in items {
+        hash.field(tag, &item.value);
+        hash_backtrace(hash, tag, &item.backtrace);
+    }
+}
+
+fn hash_property_map(hash: &mut JournalHasher, tag: u8, props: &PropertyMap, skip: Option<&[u8]>) {
+    let names = props.names();
+    let mut count = 0_usize;
+    for name in names {
+        if skip.is_some_and(|ignored| name.as_slice() == ignored) {
+            continue;
+        }
+        count += 1;
+        hash.field(tag, &name);
+        hash.opt_bytes(tag, props.get(&name).map(|v| v.as_slice()));
+        match props.tracked_entries(&name) {
+            None => hash.u8(tag, 0),
+            Some(entries) => {
+                hash.u8(tag, 1);
+                hash_bt_list(hash, tag, entries);
+            }
+        }
+    }
+    hash.usize(tag, count);
+}
+
+fn hash_usage_scope(hash: &mut JournalHasher, tag: u8, scope: Option<UsageScope>) {
+    let code = match scope {
+        None => 0,
+        Some(UsageScope::Private) => 1,
+        Some(UsageScope::Public) => 2,
+        Some(UsageScope::Interface) => 3,
+    };
+    hash.u8(tag, code);
+}
+
+fn hash_link_items(hash: &mut JournalHasher, tag: u8, items: Option<&[LinkItem]>) {
+    match items {
+        None => hash.u8(tag, 0),
+        Some(items) => {
+            hash.u8(tag, 1);
+            hash.usize(tag, items.len());
+            for item in items {
+                hash.field(tag, &item.text.value);
+                hash_backtrace(hash, tag, &item.text.backtrace);
+                hash.usize(tag, item.lookup_dir.index());
+                hash.bool(tag, item.opens_lookup_scope);
+                hash.bool(tag, item.closes_lookup_scope);
+                hash_usage_scope(hash, tag, item.scope);
+            }
+        }
+    }
+}
+
+fn hash_usage_props(hash: &mut JournalHasher, tag: u8, usage: &UsageProps) {
+    hash.usize(tag, usage.fields.len());
+    for (field, entries) in &usage.fields {
+        let code = match field {
+            UsageField::IncludeDirectories => 0,
+            UsageField::CompileDefinitions => 1,
+            UsageField::CompileOptions => 2,
+            UsageField::CompileFeatures => 3,
+            UsageField::LinkOptions => 4,
+            UsageField::LinkDirectories => 5,
+            UsageField::PrecompileHeaders => 6,
+            UsageField::InterfaceIncludeDirectories => 7,
+            UsageField::InterfaceSystemIncludeDirectories => 8,
+            UsageField::InterfaceCompileDefinitions => 9,
+            UsageField::InterfaceCompileOptions => 10,
+            UsageField::InterfaceCompileFeatures => 11,
+            UsageField::InterfaceLinkOptions => 12,
+            UsageField::InterfaceLinkDirectories => 13,
+            UsageField::InterfaceLinkDepends => 14,
+            UsageField::InterfacePrecompileHeaders => 15,
+            UsageField::InterfaceSources => 16,
+        };
+        hash.u8(tag, code);
+        hash_bt_list(hash, tag, entries);
+    }
+    hash_link_items(hash, tag, usage.link_libraries.as_deref());
+    hash_link_items(hash, tag, usage.interface_link_libraries.as_deref());
+}
+
+fn hash_source_groups(hash: &mut JournalHasher, tag: u8, groups: &[SourceGroupDef]) {
+    hash.usize(tag, groups.len());
+    for group in groups {
+        hash.field(tag, &group.name);
+        hash.opt_bytes(tag, group.regex.as_ref().map(|v| v.as_slice()));
+        hash.usize(tag, group.files.len());
+        for file in &group.files {
+            hash.field(tag, file);
+        }
+        hash_source_groups(hash, tag, &group.children);
+    }
+}
+
+fn hash_target_binding(hash: &mut JournalHasher, tag: u8, binding: TargetBinding) {
+    match binding {
+        TargetBinding::Target(id) => {
+            hash.u8(tag, 0);
+            hash.usize(tag, id.index());
+        }
+        TargetBinding::Alias(id) => {
+            hash.u8(tag, 1);
+            hash.usize(tag, id.index());
+        }
+    }
+}
+
+fn hash_target_kind(hash: &mut JournalHasher, tag: u8, kind: TargetKind) {
+    let code = match kind {
+        TargetKind::Executable => 0,
+        TargetKind::StaticLibrary => 1,
+        TargetKind::SharedLibrary => 2,
+        TargetKind::ModuleLibrary => 3,
+        TargetKind::ObjectLibrary => 4,
+        TargetKind::InterfaceLibrary => 5,
+        TargetKind::UnknownLibrary => 6,
+        TargetKind::Utility => 7,
+        TargetKind::GlobalTarget => 8,
+    };
+    hash.u8(tag, code);
+}
+
+fn hash_target_origin(hash: &mut JournalHasher, tag: u8, origin: TargetOrigin) {
+    let code = match origin {
+        TargetOrigin::Normal => 0,
+        TargetOrigin::Imported(ImportedVisibility::Local) => 1,
+        TargetOrigin::Imported(ImportedVisibility::Global) => 2,
+    };
+    hash.u8(tag, code);
 }
 
 impl Cx<'_> {

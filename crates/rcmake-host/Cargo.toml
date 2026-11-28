@@ -24,8 +24,9 @@ tempfile.workspace = true
 rustix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-process-wrap = { version = "10.0.0", default-features = false, features = ["std", "job-object"] }
+process-wrap = { version = "10.0.0", default-features = false, features = ["std", "job-object", "creation-flags"] }
 winapi-util = "0.1.11"
+windows = { version = "0.62", default-features = false, features = ["Win32_System_Threading"] }
 winreg = { version = "0.56.0", default-features = false }
 
 [[test]]

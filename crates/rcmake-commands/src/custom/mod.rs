@@ -623,7 +623,6 @@ fn check_policy(cx: &mut Cx<'_>, message: impl Into<BString>, advice: &[u8]) -> 
                 message.push(b'.');
             }
             message.extend_from_slice(advice);
-            message.push(b'\n');
             cx.issue_policy_warning(policy, &message, b"");
             true
         }
@@ -664,6 +663,13 @@ fn add_event(
     ) {
         return Ok(Flow::Normal);
     }
+    // CMake accepts and ignores legacy unsupported dependency/output options on target
+    // events when CMP0175 is OLD/WARN; drop them so generators never emit target edges.
+    body.depends.clear();
+    body.implicit_depends.clear();
+    body.main_dependency = None;
+    body.depfile = None;
+    body.job_pool = None;
     let event = options.event.unwrap_or(TargetEvent::PostBuild);
     if options
         .keywords
@@ -977,5 +983,56 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}//$<CONFIG>/same.txt COMMAN
 add_custom_command(OUTPUT sub/../$<CONFIG>/same.txt COMMAND tool_a)
 "#)?;
     assert_eq!(code, 0, "{stderr}");
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn target_event_ignores_legacy_depends_under_cmp0175_warn_and_rejects_under_new()
+-> crate::test_support::TestResult {
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream, path::to_native};
+
+    let run = |version: &str| -> Result<(i32, String, usize), Box<dyn std::error::Error>> {
+        let cwd = to_native(if cfg!(windows) { b"C:/work" } else { b"/work" });
+        let exe = cwd.join("cmake");
+        let src = cwd.join("src");
+        let build = cwd.join("build");
+        let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
+        let script = format!(
+            "cmake_minimum_required(VERSION {version})\n\
+             project(wf NONE)\n\
+             add_custom_target(wf ALL)\n\
+             add_custom_command(TARGET wf POST_BUILD DEPENDS wf COMMAND echo hi)\n"
+        );
+        host.seed_file(&src.join("CMakeLists.txt"), script.as_bytes())?;
+        let mut interp = Interp::new(
+            InterpConfig::new(host.clone(), RunMode::Configure, cwd.join("data"), exe, cwd),
+            crate::register_all,
+        );
+        let code = interp.run_configure(&src, &build, &[]).exit_code;
+        let dep_count = interp
+            .cx()
+            .project()
+            .commands()
+            .map(|(_, cmd)| cmd.depends.len())
+            .sum();
+        Ok((
+            code,
+            host.stream_bytes(Stream::Stderr).to_string(),
+            dep_count,
+        ))
+    };
+
+    let (code, stderr, deps) = run("3.10")?;
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("CMP0175"), "{stderr}");
+    assert_eq!(deps, 0);
+
+    let (code, stderr, _) = run("4.5")?;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("DEPENDS"), "{stderr}");
     Ok(())
 }

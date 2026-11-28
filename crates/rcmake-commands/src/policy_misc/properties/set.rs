@@ -12,11 +12,15 @@ use super::{known_features, quoted, values};
 
 pub(in crate::policy_misc) fn set_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
-    let [b"PROPERTIES", pairs @ ..] = args.as_slice() else {
+    let [b"PROPERTIES" | b"PROPERTY", pairs @ ..] = args.as_slice() else {
         return Err(CmdError::status("Wrong number of arguments"));
     };
+    let (pairs, extra) = pairs.as_chunks::<2>();
+    if !extra.is_empty() {
+        return Err(CmdError::status("Wrong number of arguments"));
+    }
     let dir = PropScope::Directory(cx.current_dir_id());
-    for [name, value] in property_pairs(pairs)? {
+    for [name, value] in pairs {
         update_scoped(cx, &dir, name, Some((*value).into()), Update::Set)?;
     }
     Ok(Flow::Normal)
@@ -585,5 +589,53 @@ set_source_files_properties(input.cpp COMPILE_FLAGS)
         "{diagnostics}"
     );
     assert!(!diagnostics.contains("Unexpected"), "{diagnostics}");
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn set_directory_properties_accepts_singular_property_keyword() -> crate::test_support::TestResult {
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream, path::to_native};
+
+    let cwd = to_native(if cfg!(windows) { b"C:/work" } else { b"/work" });
+    let exe = cwd.join("cmake");
+    let src = cwd.join("src");
+    let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
+    host.seed_file(
+        &src.join("CMakeLists.txt"),
+        br#"
+cmake_minimum_required(VERSION 4.5)
+project(laszip_like NONE)
+set_directory_properties(PROPERTY FOO bar BAZ qux)
+get_directory_property(v1 FOO)
+get_directory_property(v2 BAZ)
+if(NOT v1 STREQUAL "bar" OR NOT v2 STREQUAL "qux")
+  message(FATAL_ERROR "Unexpected values: ${v1} / ${v2}")
+endif()
+set_directory_properties(PROPERTY ODD)
+"#,
+    )?;
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            cwd.join("data"),
+            exe,
+            cwd.clone(),
+        ),
+        crate::register_all,
+    );
+    assert_eq!(
+        interp
+            .run_configure(&src, &cwd.join("build"), &[])
+            .exit_code,
+        1
+    );
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(stderr.contains("Wrong number of arguments"), "{stderr}");
+    assert!(!stderr.contains("Unexpected"), "{stderr}");
     Ok(())
 }

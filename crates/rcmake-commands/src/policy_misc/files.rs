@@ -181,7 +181,7 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
     let options = FileOptions::parse(flags)?;
     if !options.unknown.is_empty() {
         let body = quoted(
-            "configure_file called with unknown argument(s):\n",
+            "configure_file called with unknown argument(s):",
             &options.unknown,
             "\n",
         );
@@ -488,6 +488,16 @@ fn resolve_abs_or_realpath(
         && let Some(home) = cx.host().env_get(b"HOME")
     {
         path::to_native(&home).join(path::to_native(tail))
+    } else if path_input.starts_with(b"/") && cfg!(windows) && !path_input.starts_with(b"//") {
+        let collapsed = collapse_unix_rooted(path_input);
+        let native = path::to_native(&collapsed);
+        if realpath {
+            return cx
+                .host()
+                .canonicalize(&native)
+                .map_or(collapsed, |resolved| path::from_native_cmake(&resolved));
+        }
+        return collapsed;
     } else {
         let native = path::to_native(path_input);
         if native.is_absolute() {
@@ -504,6 +514,25 @@ fn resolve_abs_or_realpath(
         normalized
     };
     path::from_native_cmake(&resolved)
+}
+
+fn collapse_unix_rooted(path: &[u8]) -> BString {
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in path
+        .split(|&byte| byte == b'/' || byte == b'\\')
+        .filter(|p| !p.is_empty())
+    {
+        match part {
+            b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut out = BString::from("/");
+    out.extend_from_slice(&parts.join(&b'/'));
+    out
 }
 
 fn filename_result(cx: &mut Cx<'_>, name: &[u8], value: BString, cache: bool) {
@@ -687,4 +716,27 @@ fn program_path_in(
                 (candidate, spelling)
             })
     })
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::collapse_unix_rooted;
+
+    #[test]
+    fn collapses_synthetic_unix_rooted_paths_without_drive_prefix() {
+        assert_eq!(
+            collapse_unix_rooted(b"/path/to/a/../filename.ext.in"),
+            "/path/to/filename.ext.in"
+        );
+        assert_eq!(
+            collapse_unix_rooted(b"/../path/to/filename.ext.in"),
+            "/path/to/filename.ext.in"
+        );
+        assert_eq!(
+            collapse_unix_rooted(b"/opt/IBM/xlc/13.1.3/include"),
+            "/opt/IBM/xlc/13.1.3/include"
+        );
+        assert_eq!(collapse_unix_rooted(br"/a\b\..\c"), "/a/c");
+        assert_eq!(collapse_unix_rooted(b"/"), "/");
+    }
 }

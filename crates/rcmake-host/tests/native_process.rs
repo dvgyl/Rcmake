@@ -68,6 +68,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         cwd: host.initial_cwd(),
         timeout: Some(Duration::from_secs(10)),
         tee: false,
+        default_error_mode: false,
     };
     let output = host.run(&req, &mut |_, _| {})?;
     let Input::Bytes(bytes) = &req.stdin else {

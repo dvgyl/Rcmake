@@ -33,7 +33,7 @@ pub(super) fn env(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
             let Some(change) = args.next() else {
                 return error(cx, &[b"cmake -E env: --modify missing a parameter\n"]);
             };
-            if let Err(message) = modify(&mut env, &original, change) {
+            if let Err(message) = modify(&mut env, &original, change, cfg!(windows)) {
                 return error(
                     cx,
                     &[
@@ -46,11 +46,11 @@ pub(super) fn env(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
                 );
             }
         } else if let Some(key) = arg.strip_prefix(b"--unset=") {
-            env.remove(key);
+            env_remove(&mut env, key, cfg!(windows));
         } else if arg.starts_with(b"-") {
             return error(cx, &[b"cmake -E env: unknown option '", arg, b"'\n"]);
         } else if let Some((key, value)) = split_once(arg, b'=') {
-            env.insert(BString::from(key), BString::from(value));
+            env_insert(&mut env, key, BString::from(value), cfg!(windows));
         } else {
             return run_child(
                 arg,
@@ -68,7 +68,46 @@ pub(super) fn env(args: &[BString], cx: &ToolCtx<'_>) -> i32 {
     error(cx, &[b"cmake -E env: no command given\n"])
 }
 
-fn modify(env: &mut Environment, original: &Environment, change: &[u8]) -> Result<(), Vec<u8>> {
+fn env_get<'a>(env: &'a Environment, key: &[u8], case_insensitive: bool) -> Option<&'a BString> {
+    if let Some(value) = env.get(key) {
+        return Some(value);
+    }
+    if case_insensitive {
+        env.iter()
+            .find_map(|(existing, value)| existing.eq_ignore_ascii_case(key).then_some(value))
+    } else {
+        None
+    }
+}
+
+fn env_remove(env: &mut Environment, key: &[u8], case_insensitive: bool) {
+    if case_insensitive {
+        let matching: Vec<BString> = env
+            .keys()
+            .filter(|existing| existing.eq_ignore_ascii_case(key))
+            .cloned()
+            .collect();
+        for existing in matching {
+            env.remove(&existing);
+        }
+    } else {
+        env.remove(key);
+    }
+}
+
+fn env_insert(env: &mut Environment, key: &[u8], value: BString, case_insensitive: bool) {
+    if case_insensitive {
+        env_remove(env, key, true);
+    }
+    env.insert(BString::from(key), value);
+}
+
+fn modify(
+    env: &mut Environment,
+    original: &Environment,
+    change: &[u8],
+    windows: bool,
+) -> Result<(), Vec<u8>> {
     let Some((key, rest)) = split_once(change, b'=') else {
         return Err([
             b"Missing `=` after the variable name in: ".as_slice(),
@@ -79,12 +118,10 @@ fn modify(env: &mut Environment, original: &Environment, change: &[u8]) -> Resul
     let Some((operation, value)) = split_once(rest, b':') else {
         return Err([b"Missing `:` after the operation in: ".as_slice(), change].concat());
     };
-    let current = env
-        .get(key)
-        .map_or(b"".as_slice(), |value| value.as_slice());
-    let path_separator = if cfg!(windows) { b';' } else { b':' };
+    let current = env_get(env, key, windows).map_or(b"".as_slice(), |value| value.as_slice());
+    let path_separator = if windows { b';' } else { b':' };
     let new = match operation {
-        b"reset" => original.get(key).cloned(),
+        b"reset" => env_get(original, key, windows).cloned(),
         b"set" => Some(BString::from(value)),
         b"unset" => None,
         b"string_append" => Some(BString::from([current, value].concat())),
@@ -102,9 +139,9 @@ fn modify(env: &mut Environment, original: &Environment, change: &[u8]) -> Resul
         }
     };
     if let Some(new) = new {
-        env.insert(BString::from(key), new);
+        env_insert(env, key, new, windows);
     } else {
-        env.remove(key);
+        env_remove(env, key, windows);
     }
     Ok(())
 }
@@ -203,6 +240,7 @@ fn run_child(
         stderr: Output::Inherit,
         timeout: None,
         tee: false,
+        default_error_mode: false,
     };
     let result = cx.host.run(&request, &mut |_, _| {});
     match result {
@@ -284,4 +322,51 @@ fn hex_seconds(text: &str) -> Option<f64> {
         }
     }
     has_digit.then_some(sign * value * 2.0_f64.powi(exponent))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_env_modify_uses_case_insensitive_keys() {
+        let mut original = Environment::new();
+        original.insert("CONFIGVAR".into(), "con".into());
+        let mut env = original.clone();
+
+        assert!(modify(&mut env, &original, b"ConfigVar=string_append:fig", true).is_ok());
+        assert_eq!(
+            env_get(&env, b"ConfigVar", true),
+            Some(&BString::from("config"))
+        );
+        assert_eq!(env.len(), 1);
+
+        assert!(modify(&mut env, &original, b"configvar=reset:", true).is_ok());
+        assert_eq!(
+            env_get(&env, b"CONFIGVAR", true),
+            Some(&BString::from("con"))
+        );
+        assert_eq!(env.len(), 1);
+
+        env_remove(&mut env, b"ConfigVar", true);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn posix_env_modify_keeps_case_sensitivity() {
+        let mut original = Environment::new();
+        original.insert("CONFIGVAR".into(), "con".into());
+        let mut env = original.clone();
+
+        assert!(modify(&mut env, &original, b"ConfigVar=string_append:fig", false).is_ok());
+        assert_eq!(
+            env_get(&env, b"ConfigVar", false),
+            Some(&BString::from("fig"))
+        );
+        assert_eq!(
+            env_get(&env, b"CONFIGVAR", false),
+            Some(&BString::from("con"))
+        );
+        assert_eq!(env.len(), 2);
+    }
 }

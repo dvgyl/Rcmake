@@ -36,6 +36,7 @@ macro_rules! forward_host {
         $crate::forward_host!(@ $base, read_link);
         $crate::forward_host!(@method $base, canonicalize(p: &::std::path::Path) -> $crate::HostResult<::std::path::PathBuf>);
         $crate::forward_host!(@method $base, canonicalize_fresh(p: &::std::path::Path) -> $crate::HostResult<::std::path::PathBuf>);
+        $crate::forward_host!(@method $base, path_on_disk(p: &::std::path::Path) -> ::std::path::PathBuf);
         $crate::forward_host!(@method $base, set_permissions(p: &::std::path::Path, mode: u32) -> $crate::HostResult<()>);
         $crate::forward_host!(@method $base, set_times(p: &::std::path::Path,
             atime: Option<$crate::FileTime>,
@@ -91,6 +92,20 @@ macro_rules! forward_host {
             name: Option<&[u8]>,
             view: $crate::RegistryView,
         ) -> $crate::HostResult<Option<$crate::BString>>);
+        $crate::forward_host!(@method $base, registry_value_with_separator(root: $crate::RegistryRoot,
+            subkey: &[u8],
+            name: Option<&[u8]>,
+            view: $crate::RegistryView,
+            separator: Option<&[u8]>,
+        ) -> $crate::HostResult<Option<$crate::BString>>);
+        $crate::forward_host!(@method $base, registry_value_names(root: $crate::RegistryRoot,
+            subkey: &[u8],
+            view: $crate::RegistryView,
+        ) -> $crate::HostResult<Option<Vec<$crate::BString>>>);
+        $crate::forward_host!(@method $base, registry_subkeys(root: $crate::RegistryRoot,
+            subkey: &[u8],
+            view: $crate::RegistryView,
+        ) -> $crate::HostResult<Option<Vec<$crate::BString>>>);
         $crate::forward_host!(@method $base, write_out(stream: $crate::Stream, bytes: &[u8]));
         $crate::forward_host!(@method $base, read_stdin(limit: u64) -> $crate::HostResult<Vec<u8>>);
         $crate::forward_host!(@method $base, is_terminal(stream: $crate::Stream) -> bool);

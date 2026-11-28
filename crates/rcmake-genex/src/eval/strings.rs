@@ -409,24 +409,19 @@ impl Evaluator<'_> {
             alphabet = default_alphabet;
         }
         self.flags.context_sensitive |= seed.is_none();
-        let mut state = seed
-            .or_else(|| self.host.random_seed())
-            .ok_or_else(|| call.error("The evaluation context has no random seed."))?
-            as u32;
+        let state = match self.random_state.as_mut() {
+            Some(state) => state,
+            None => {
+                let initial = seed
+                    .or_else(|| self.host.random_seed())
+                    .ok_or_else(|| call.error("The evaluation context has no random seed."))?
+                    as u32;
+                self.random_state.insert(initial)
+            }
+        };
         let mut out = BString::default();
         for _ in 0..count {
-            #[cfg(not(windows))]
-            let (sample, range) = {
-                let previous = if state == 0 { 123_459_876 } else { state };
-                state = ((u64::from(previous) * 16_807) % 2_147_483_647) as u32;
-                (state, 2_147_483_648)
-            };
-            #[cfg(windows)]
-            let (sample, range) = {
-                state = state.wrapping_mul(214_013).wrapping_add(2_531_011);
-                ((state >> 16) & 0x7fff, 32_768)
-            };
-            let index = (u64::from(sample) * alphabet.len() as u64 / range) as usize;
+            let index = next_random_index(state, alphabet.len());
             if let Some(&byte) = alphabet.get(index) {
                 out.push(byte);
             }
@@ -545,4 +540,137 @@ fn uuid_namespace(value: &[u8]) -> Option<BString> {
 
 fn hex_digit(byte: u8) -> Option<u8> {
     (byte as char).to_digit(16).map(|digit| digit as u8)
+}
+
+#[cfg(any(not(windows), test))]
+fn next_unix_random_index(state: &mut u32, alphabet_len: usize) -> usize {
+    let previous = if *state == 0 { 123_459_876 } else { *state };
+    *state = ((u64::from(previous) * 16_807) % 2_147_483_647) as u32;
+    (u64::from(*state) * alphabet_len as u64 / 2_147_483_648) as usize
+}
+
+#[cfg(any(windows, test))]
+fn next_windows_random_index(state: &mut u32, alphabet_len: usize) -> usize {
+    *state = state.wrapping_mul(214_013).wrapping_add(2_531_011);
+    let sample = (*state >> 16) & 0x7fff;
+    (u64::from(sample) * alphabet_len as u64 / 32_768) as usize
+}
+
+fn next_random_index(state: &mut u32, alphabet_len: usize) -> usize {
+    #[cfg(windows)]
+    {
+        next_windows_random_index(state, alphabet_len)
+    }
+    #[cfg(not(windows))]
+    {
+        next_unix_random_index(state, alphabet_len)
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{next_random_index, next_unix_random_index, next_windows_random_index};
+    use crate::{
+        ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError, GenexHost, InterfaceView,
+        TargetHandle, evaluate, parse,
+    };
+    use rcmake_base::BString;
+
+    struct DummyHost;
+
+    impl GenexHost for DummyHost {
+        fn find_target(&self, _name: &[u8]) -> Option<TargetHandle> {
+            None
+        }
+
+        fn target_name(&self, _target: TargetHandle) -> BString {
+            BString::default()
+        }
+
+        fn raw_property(&self, _target: TargetHandle, _name: &[u8]) -> Option<BString> {
+            None
+        }
+
+        fn transitive_property(
+            &mut self,
+            _target: TargetHandle,
+            _name: &[u8],
+            _ctx: &EvalContext,
+        ) -> Result<InterfaceView, GenexError> {
+            Ok(InterfaceView::default())
+        }
+
+        fn artifact(
+            &self,
+            _target: TargetHandle,
+            _kind: ArtifactKind,
+            _part: ArtifactPart,
+            _config: &ConfigId,
+        ) -> Option<BString> {
+            None
+        }
+
+        fn link_closure(
+            &mut self,
+            _target: TargetHandle,
+            _ctx: &EvalContext,
+        ) -> Result<Vec<TargetHandle>, GenexError> {
+            Ok(Vec::new())
+        }
+
+        fn definition(&self, _name: &[u8]) -> Option<BString> {
+            None
+        }
+    }
+
+    #[test]
+    fn seeded_random_matches_unix_and_windows_crt_sequences() {
+        let alphabet = b"qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789";
+        let generate = |step: fn(&mut u32, usize) -> usize,
+                        mut state: u32,
+                        len: usize,
+                        chars: &[u8]|
+         -> String {
+            (0..len)
+                .filter_map(|_| chars.get(step(&mut state, chars.len())))
+                .map(|&b| char::from(b))
+                .collect()
+        };
+        assert_eq!(
+            generate(next_unix_random_index, 1, 16, alphabet),
+            "qoXEIfeJJ5bUMerU"
+        );
+        assert_eq!(generate(next_unix_random_index, 123, 5, alphabet), "qs6mU");
+        assert_eq!(
+            generate(next_windows_random_index, 123, 5, alphabet),
+            "qAKn9"
+        );
+        assert_eq!(
+            generate(next_windows_random_index, 5, 9, b"abcdef123456789").len(),
+            9
+        );
+
+        // Multiple `$<STRING:RANDOM>` expressions in one evaluation seed once and advance
+        // the shared sequence (matching CMake 4.5.1's `CMakeString::Seeded`).
+        let mut expected_state = 123_u32;
+        let first: String = (0..5)
+            .filter_map(|_| alphabet.get(next_random_index(&mut expected_state, alphabet.len())))
+            .map(|&b| char::from(b))
+            .collect();
+        let second: String = (0..9)
+            .filter_map(|_| alphabet.get(next_random_index(&mut expected_state, alphabet.len())))
+            .map(|&b| char::from(b))
+            .collect();
+        let third: String = (0..4)
+            .filter_map(|_| b"abcd".get(next_random_index(&mut expected_state, 4)))
+            .map(|&b| char::from(b))
+            .collect();
+
+        let ast = parse(
+            b"$<STRING:RANDOM,RANDOM_SEED:123>|$<STRING:RANDOM,LENGTH:9,RANDOM_SEED:5>|$<STRING:RANDOM,LENGTH:4,ALPHABET:abcd>",
+        )
+        .unwrap();
+        let (actual, _flags) = evaluate(&ast, &EvalContext::default(), &mut DummyHost).unwrap();
+        assert_eq!(actual, format!("{first}|{second}|{third}"));
+    }
 }

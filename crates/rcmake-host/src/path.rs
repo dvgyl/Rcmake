@@ -115,3 +115,219 @@ pub fn hash_file(
     host.read_chunks(file, &mut |chunk| hash.update(chunk))?;
     Ok(hash.finish_hex())
 }
+
+/// Recover the on-disk spelling (case) of an absolute path without dereferencing symlinks.
+#[must_use]
+pub fn path_on_disk(host: &dyn crate::Host, path: &Path) -> PathBuf {
+    path_on_disk_with(path, |dir| host.read_dir(dir))
+}
+
+/// Split a backslash-form (`\\server\share\...`) or slash-form (`//server/share/...`)
+/// UNC prefix into `(root_prefix, trailing_bytes, component_separator)`.
+fn split_unc_root(raw: &[u8]) -> Option<(BString, &[u8], u8)> {
+    let (prefix, tail, sep_out) = if let Some(tail) = raw.strip_prefix(b"\\\\") {
+        (b"\\\\".as_slice(), tail, b'\\')
+    } else {
+        let tail = raw.strip_prefix(b"//")?;
+        (b"//".as_slice(), tail, b'/')
+    };
+    let sep_pos = tail.iter().position(|&b| b == b'/' || b == b'\\')?;
+    let server = tail.get(..sep_pos)?;
+    if server.is_empty() {
+        return None;
+    }
+    let after_server = tail.get(sep_pos + 1..)?;
+    let (share, rest) = match after_server.iter().position(|&b| b == b'/' || b == b'\\') {
+        Some(pos) => (
+            after_server.get(..pos)?,
+            after_server.get(pos + 1..).unwrap_or_default(),
+        ),
+        None => (after_server, b"".as_slice()),
+    };
+    if share.is_empty() {
+        return None;
+    }
+    let mut root = Vec::with_capacity(prefix.len() + server.len() + 1 + share.len());
+    root.extend_from_slice(prefix);
+    root.extend_from_slice(server);
+    root.push(sep_out);
+    root.extend_from_slice(share);
+    Some((BString::from(root), rest, sep_out))
+}
+
+/// Recover the on-disk spelling (case) of `path` using `read_dir` for directory lookups.
+///
+/// Handles POSIX root paths (`/a/b`), Windows drive-letter paths (`c:/a/b` or `c:\a\b`),
+/// and both backslash-form (`\\server\share\...`) and slash-form (`//server/share/...`) UNC
+/// paths. Uppercases ASCII Windows drive letters (`c:` -> `C:`) and matches each normal
+/// component against directory entries (exact match first, then ASCII case-insensitive match,
+/// falling back to Unicode `to_lowercase()` folding for non-ASCII filenames).
+#[must_use]
+pub fn path_on_disk_with<F>(path: &Path, mut read_dir: F) -> PathBuf
+where
+    F: FnMut(&Path) -> crate::HostResult<Vec<crate::DirEntry>>,
+{
+    let raw = from_native(path);
+    let raw = raw.as_slice();
+    let (mut current, rest, sep_out) = if let Some(unc) = split_unc_root(raw) {
+        unc
+    } else {
+        match raw {
+            [drive, b':', b'/' | b'\\', tail @ ..] if drive.is_ascii_alphabetic() => {
+                let root = [drive.to_ascii_uppercase(), b':', b'/'];
+                (BString::from(root.as_slice()), tail, b'/')
+            }
+            [b'/', tail @ ..] => (BString::from("/"), tail, b'/'),
+            _ => return path.to_path_buf(),
+        }
+    };
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in rest
+        .split(|&byte| byte == b'/' || byte == b'\\')
+        .filter(|part| !part.is_empty())
+    {
+        match part {
+            b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    for part in parts {
+        let dir_path = to_native(&current);
+        let matched = read_dir(&dir_path).ok().and_then(|entries| {
+            let mut folded = None;
+            let mut part_lower: Option<Option<String>> = None;
+            for entry in entries {
+                if entry.name.as_slice() == part {
+                    return Some(entry.name);
+                }
+                if folded.is_none() {
+                    if entry.name.eq_ignore_ascii_case(part) {
+                        folded = Some(entry.name);
+                    } else if (!part.is_ascii() || !entry.name.is_ascii())
+                        && let Some(lower) = part_lower
+                            .get_or_insert_with(|| {
+                                std::str::from_utf8(part).ok().map(str::to_lowercase)
+                            })
+                            .as_deref()
+                        && std::str::from_utf8(entry.name.as_slice())
+                            .is_ok_and(|name| name.to_lowercase() == lower)
+                    {
+                        folded = Some(entry.name);
+                    }
+                }
+            }
+            folded
+        });
+        if !current.ends_with(&[sep_out]) {
+            current.push(sep_out);
+        }
+        match matched {
+            Some(name) => current.extend_from_slice(&name),
+            None => current.extend_from_slice(part),
+        }
+    }
+    to_native(&current)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{from_native, path_on_disk_with};
+    use crate::{DirEntry, FileKind};
+
+    #[test]
+    fn path_on_disk_preserves_backslash_and_slash_unc_prefixes() {
+        let backslash = path_on_disk_with(
+            Path::new(r"\\server\share\sub\..\SubDir\script.cmake"),
+            |dir| {
+                let s = from_native(dir);
+                let name = match s.as_slice() {
+                    br"\\server\share" => "SubDir",
+                    br"\\server\share\SubDir" => "Script.cmake",
+                    _ => return Ok(Vec::new()),
+                };
+                Ok(vec![DirEntry {
+                    name: name.into(),
+                    kind: FileKind::File,
+                }])
+            },
+        );
+        assert_eq!(
+            backslash,
+            PathBuf::from(r"\\server\share\SubDir\Script.cmake")
+        );
+
+        let slash = path_on_disk_with(
+            Path::new("//server/share/a/../subdir/script.cmake"),
+            |dir| {
+                let s = from_native(dir);
+                let name = match s.as_slice() {
+                    b"//server/share" => "SubDir",
+                    b"//server/share/SubDir" => "Script.cmake",
+                    _ => return Ok(Vec::new()),
+                };
+                Ok(vec![DirEntry {
+                    name: name.into(),
+                    kind: FileKind::File,
+                }])
+            },
+        );
+        assert_eq!(slash, PathBuf::from("//server/share/SubDir/Script.cmake"));
+
+        // Bare UNC roots without trailing components are preserved verbatim.
+        assert_eq!(
+            path_on_disk_with(Path::new(r"\\server\share"), |_| Ok(Vec::new())),
+            PathBuf::from(r"\\server\share")
+        );
+        assert_eq!(
+            path_on_disk_with(Path::new("//server/share"), |_| Ok(Vec::new())),
+            PathBuf::from("//server/share")
+        );
+        // `..` cannot pop above the UNC share root.
+        assert_eq!(
+            path_on_disk_with(Path::new("//server/share/../../leaf"), |_| Ok(Vec::new())),
+            PathBuf::from("//server/share/leaf")
+        );
+        // Three leading slashes are POSIX root, not UNC.
+        assert_eq!(
+            path_on_disk_with(Path::new("///foo/bar"), |_| Ok(Vec::new())),
+            PathBuf::from("/foo/bar")
+        );
+    }
+
+    #[test]
+    fn path_on_disk_matches_unicode_case_folded_components() {
+        let resolved = path_on_disk_with(Path::new("c:/work/étage/étage.cmake"), |dir| {
+            let s = from_native(dir);
+            let name = match s.as_slice() {
+                b"C:/" => "Work",
+                b"C:/Work" => "Étage",
+                b"C:/Work/\xc3\x89tage" => "Étage.cmake",
+                _ => return Ok(Vec::new()),
+            };
+            Ok(vec![DirEntry {
+                name: name.into(),
+                kind: FileKind::File,
+            }])
+        });
+        assert_eq!(resolved, PathBuf::from("C:/Work/Étage/Étage.cmake"));
+
+        let upper = path_on_disk_with(Path::new("/work/ÉTAGE.CMAKE"), |dir| {
+            let s = from_native(dir);
+            let name = match s.as_slice() {
+                b"/" => "work",
+                b"/work" => "Étage.cmake",
+                _ => return Ok(Vec::new()),
+            };
+            Ok(vec![DirEntry {
+                name: name.into(),
+                kind: FileKind::File,
+            }])
+        });
+        assert_eq!(upper, PathBuf::from("/work/Étage.cmake"));
+    }
+}

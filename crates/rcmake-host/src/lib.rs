@@ -39,7 +39,26 @@ mod registry;
 pub use no_process::{DeniedCommand, DeniedLog, DeniedMethod, NoProcessHost};
 pub use overlay::{OverlayAudit, OverlayHost, OverlayPathPolicy, OverlayPathStyle};
 pub use pure::PureHost;
-pub use registry::{RegistryRoot, RegistryView};
+pub use registry::{RegistryRoot, RegistryView, decode_multi_sz_utf16le, format_multi_sz};
+
+/// Windows `CreateProcessW` flag that resets the child process error mode to default (`0`).
+pub const WINDOWS_CREATE_DEFAULT_ERROR_MODE: u32 = 0x0400_0000;
+
+/// Compute Windows `CreateProcessW` creation flags for a child process.
+///
+/// When `default_error_mode` is `true` (set per-[`RunRequest`] exclusively by CTest
+/// interactive debug launches), returns [`WINDOWS_CREATE_DEFAULT_ERROR_MODE`] so the
+/// child does not inherit an outer runner's `SEM_NOGPFAULTERRORBOX` suppression bit.
+/// Ordinary `execute_process` and custom-command launches keep `default_error_mode == false`
+/// and inherit the parent error mode.
+#[must_use]
+pub const fn windows_child_creation_flags(default_error_mode: bool) -> u32 {
+    if default_error_mode {
+        WINDOWS_CREATE_DEFAULT_ERROR_MODE
+    } else {
+        0
+    }
+}
 
 /// Whether a metadata query follows symbolic links (`stat` vs `lstat`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,6 +286,10 @@ pub struct RunRequest {
     pub timeout: Option<Duration>,
     /// Whether to stream captured output chunks to `on_output` as they arrive.
     pub tee: bool,
+    /// On Windows, pass `CREATE_DEFAULT_ERROR_MODE` to `CreateProcessW` so the child
+    /// resets its error mode instead of inheriting the parent's (used exclusively by
+    /// CTest interactive debug test launches; defaults to `false`).
+    pub default_error_mode: bool,
 }
 
 /// Completion outcome of one stage in a [`RunRequest`] pipeline.
@@ -501,6 +524,15 @@ pub trait Host: Send + Sync {
         self.canonicalize(p)
     }
 
+    /// Recover the on-disk spelling (case) of an absolute path without dereferencing symlinks.
+    ///
+    /// Hosts on case-sensitive filesystems keep the caller-supplied spelling without issuing
+    /// directory scans; case-insensitive hosts (such as Windows) walk ancestor directories to
+    /// recover on-disk casing.
+    fn path_on_disk(&self, p: &Path) -> PathBuf {
+        p.to_path_buf()
+    }
+
     /// Set POSIX permission bits on `p`.
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()>;
 
@@ -537,6 +569,15 @@ pub trait Host: Send + Sync {
 
     /// Return all active environment variables as sorted `(key, value)` pairs.
     fn env_all(&self) -> Vec<(BString, BString)>;
+
+    /// Monotonically increasing counter that changes on every [`Host::env_set`] mutation.
+    ///
+    /// Returns `None` when the host does not track environment mutations. Callers that
+    /// cache [`Host::env_all`] must read `env_epoch()` before and after `env_all()` and
+    /// only cache the snapshot when both reads return the same `Some(epoch)`.
+    fn env_epoch(&self) -> Option<u64> {
+        None
+    }
 
     /// Open a GNU make jobserver FIFO or pair of inherited pipe descriptors.
     fn open_jobserver(&self, _auth: &[u8]) -> Option<JobServerPipe> {
@@ -602,6 +643,46 @@ pub trait Host: Send + Sync {
         _name: Option<&[u8]>,
         _view: RegistryView,
     ) -> HostResult<Option<BString>> {
+        Ok(None)
+    }
+
+    /// Read a Windows registry value with an optional `REG_MULTI_SZ` separator override.
+    ///
+    /// When `separator` is `None`, matches [`Host::registry_value`]. For `REG_MULTI_SZ`
+    /// values, replaces `separator` (or `\0` when omitted) with `;`.
+    fn registry_value_with_separator(
+        &self,
+        root: RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: RegistryView,
+        _separator: Option<&[u8]>,
+    ) -> HostResult<Option<BString>> {
+        self.registry_value(root, subkey, name, view)
+    }
+
+    /// Enumerate value names defined directly under a Windows registry key in `view`.
+    ///
+    /// Returns `Ok(None)` when the key does not exist or `view` is unavailable.
+    /// A defined default value is represented as `"(default)"`.
+    fn registry_value_names(
+        &self,
+        _root: RegistryRoot,
+        _subkey: &[u8],
+        _view: RegistryView,
+    ) -> HostResult<Option<Vec<BString>>> {
+        Ok(None)
+    }
+
+    /// Enumerate immediate child subkey names under a Windows registry key in `view`.
+    ///
+    /// Returns `Ok(None)` when the key does not exist or `view` is unavailable.
+    fn registry_subkeys(
+        &self,
+        _root: RegistryRoot,
+        _subkey: &[u8],
+        _view: RegistryView,
+    ) -> HostResult<Option<Vec<BString>>> {
         Ok(None)
     }
 

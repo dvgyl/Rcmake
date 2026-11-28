@@ -36,18 +36,18 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
                 b"COMMENT" | b"VERBATIM" | b"COMMAND_EXPAND_LISTS" | b"OUTPUT_FILE_SET" | b"GLOBAL"
             ) {
                 format!(
-                    "\"{}\" property can't be set during generation for rules (\"{}\")",
+                    "\"{}\" property can't be set during generation for rules (\"{}\")\n",
                     BString::from(*name),
                     BString::from(rule)
                 )
             } else {
                 format!(
-                    "rule properties cannot be changed during generation (\"{}\")",
+                    "rule properties cannot be changed during generation (\"{}\")\n",
                     BString::from(rule)
                 )
             };
             cx.issue(MessageKind::Error, Effect::SetError, None, message.into());
-            continue;
+            return Err(CmdError::Reported);
         }
         let project = cx.project();
         let Some(owner) = project.custom_rule_owner(dir, rule) else {

@@ -31,6 +31,114 @@ impl JournalHasher {
         self.0.update(data);
     }
 
+    pub(super) fn u8(&mut self, tag: u8, value: u8) {
+        self.0.update([tag, value]);
+    }
+
+    pub(super) fn bool(&mut self, tag: u8, value: bool) {
+        self.u8(tag, u8::from(value));
+    }
+
+    pub(super) fn u32(&mut self, tag: u8, value: u32) {
+        self.0.update([tag]);
+        self.0.update(value.to_le_bytes());
+    }
+
+    pub(super) fn u64(&mut self, tag: u8, value: u64) {
+        self.0.update([tag]);
+        self.0.update(value.to_le_bytes());
+    }
+
+    pub(super) fn usize(&mut self, tag: u8, value: usize) {
+        self.u64(tag, value as u64);
+    }
+
+    pub(super) fn opt_bytes(&mut self, tag: u8, value: Option<&[u8]>) {
+        match value {
+            None => self.u8(tag, 0),
+            Some(bytes) => {
+                self.0.update([tag, 1]);
+                self.0.update((bytes.len() as u64).to_le_bytes());
+                self.0.update(bytes);
+            }
+        }
+    }
+
+    pub(super) fn file_kind(&mut self, tag: u8, kind: FileKind) {
+        let code = match kind {
+            FileKind::File => 1,
+            FileKind::Dir => 2,
+            FileKind::Symlink => 3,
+            FileKind::Other => 4,
+        };
+        self.u8(tag, code);
+    }
+
+    pub(super) fn policy_map(&mut self, tag: u8, map: &rcmake_diag::PolicyMap) {
+        const MAX_ID: usize = rcmake_diag::generated_policies::MAX_POLICY_ID as usize;
+        const PACKED_LEN: usize = (MAX_ID + 1).div_ceil(4);
+        let mut packed = [0_u8; PACKED_LEN];
+        for id in 0..=MAX_ID {
+            let code = match map.get(rcmake_diag::PolicyId::new(id as u16)) {
+                PolicyStatus::Warn => 0_u8,
+                PolicyStatus::Old => 1_u8,
+                PolicyStatus::New => 2_u8,
+            };
+            if code != 0
+                && let Some(slot) = packed.get_mut(id / 4)
+            {
+                *slot |= code << ((id % 4) * 2);
+            }
+        }
+        self.field(tag, &packed);
+    }
+
+    pub(super) fn diag_state(&mut self, tag: u8, state: &rcmake_diag::DiagState) {
+        let mut packed = [0_u8; rcmake_diag::DiagCategory::ALL.len()];
+        for (slot, category) in packed.iter_mut().zip(rcmake_diag::DiagCategory::ALL) {
+            *slot = state.get(category) as u8;
+        }
+        self.field(tag, &packed);
+    }
+
+    pub(super) fn debug_stream(&mut self, tag: u8, value: &dyn core::fmt::Debug) {
+        struct StreamDigest(Sha256);
+        impl core::fmt::Write for StreamDigest {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                self.0.update(s.as_bytes());
+                Ok(())
+            }
+        }
+        let mut sub = StreamDigest(Sha256::new());
+        let _ = core::fmt::write(&mut sub, format_args!("{value:?}"));
+        let digest: [u8; 32] = sub.0.finalize().into();
+        self.field(tag, &digest);
+    }
+
+    pub(super) fn layered_policies(
+        &mut self,
+        tag: u8,
+        stack: &crate::LayeredStack<rcmake_diag::PolicyMap>,
+    ) {
+        self.usize(tag, stack.len());
+        stack.for_each_entry(|map, weak| {
+            self.bool(tag, weak);
+            self.policy_map(tag, map);
+        });
+    }
+
+    pub(super) fn layered_diags(
+        &mut self,
+        tag: u8,
+        stack: &crate::LayeredStack<rcmake_diag::DiagState>,
+    ) {
+        self.usize(tag, stack.len());
+        stack.for_each_entry(|state, weak| {
+            self.bool(tag, weak);
+            self.diag_state(tag, state);
+        });
+    }
+
     pub(super) fn finish(self) -> JournalDigest {
         JournalDigest::from_bytes(self.0.finalize().into())
     }

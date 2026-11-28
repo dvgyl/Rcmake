@@ -995,3 +995,28 @@ fn icstat_initializes_checks_and_runs_before_the_compiler() -> HostResult<()> {
     assert_eq!(*calls, ["iar/ichecks", "icstat", "iar/icc"]);
     Ok(())
 }
+
+#[test]
+fn copy_and_checksum_normalize_not_found_reason() -> HostResult<()> {
+    let f = Fixture::new();
+    f.seed("present", b"abc")?;
+    f.host.create_dir_all(&f.cwd.join("adir"))?;
+    assert_eq!(f.run(&["copy", "absent", "dst"]), 1);
+    assert_eq!(
+        f.err(),
+        b"Error copying file \"absent\" to \"dst\": No such file or directory\n"
+    );
+    let f = Fixture::new();
+    f.seed("present", b"abc")?;
+    f.host.create_dir_all(&f.cwd.join("adir"))?;
+    assert_eq!(f.run(&["sha256sum", "absent", "present", "adir"]), 2);
+    assert_eq!(
+        f.out(),
+        b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  present\n"
+    );
+    assert_eq!(
+        f.err(),
+        b"absent: No such file or directory\nError: adir is a directory\n"
+    );
+    Ok(())
+}

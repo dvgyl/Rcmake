@@ -8,7 +8,8 @@ use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, IncludeOptions};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{
-    CommandSpec, Input, Output, ProcessResult, ReadRange, RunRequest, SystemInfo, path,
+    CommandSpec, FileKind, Follow, Input, Output, ProcessResult, ReadRange, RegistryRoot,
+    RegistryView, RunRequest, SystemInfo, path,
 };
 use rcmake_model::{CacheEntry, CacheType};
 
@@ -127,12 +128,13 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 }
 
 fn registry(cx: &mut Cx<'_>, out: &[u8], args: &[ExpandedArg]) -> CmdResult {
-    let [_, options @ ..] = args else {
+    let [key, options @ ..] = args else {
         return Err(CmdError::status("missing <key> specification."));
     };
     let parsed = KeywordParser::new()
         .keyword("VALUE", Slot::Single)
         .keyword("VIEW", Slot::Single)
+        .keyword("SEPARATOR", Slot::Single)
         .keyword("ERROR_VARIABLE", Slot::Single)
         .keyword("VALUE_NAMES", Slot::Flag)
         .keyword("SUBKEYS", Slot::Flag)
@@ -159,11 +161,187 @@ fn registry(cx: &mut Cx<'_>, out: &[u8], args: &[ExpandedArg]) -> CmdResult {
             ".",
         )));
     }
-    if let Some(error) = parsed.single("ERROR_VARIABLE") {
-        cx.set_var(error, "No Registry on this platform.".into());
+    let error_var = parsed.single("ERROR_VARIABLE").map(|v| v.as_slice());
+    let Some(host_view) = cx.host().registry_host_view() else {
+        if let Some(error) = error_var {
+            cx.set_var(error, "No Registry on this platform.".into());
+        }
+        cx.set_var(out, BString::default());
+        return Ok(Flow::Normal);
+    };
+    let (root, subkey) = match parse_registry_key(&key.value) {
+        Ok(parsed_key) => parsed_key,
+        Err(message) => {
+            if let Some(error) = error_var {
+                cx.set_var(error, message);
+            }
+            cx.set_var(out, BString::default());
+            return Ok(Flow::Normal);
+        }
+    };
+    let sizeof_void_p = match cx.var_or_empty(b"CMAKE_SIZEOF_VOID_P").as_slice() {
+        b"8" => Some(RegistryView::Bits64),
+        b"4" => Some(RegistryView::Bits32),
+        _ => None,
+    };
+    let views = registry_views(
+        parsed.single("VIEW").map(|v| v.as_slice()),
+        host_view,
+        sizeof_void_p,
+    );
+    let mode_count = usize::from(parsed.seen("VALUE"))
+        + usize::from(parsed.flag("VALUE_NAMES"))
+        + usize::from(parsed.flag("SUBKEYS"));
+    if mode_count > 1 {
+        return Err(CmdError::status(
+            "VALUE, VALUE_NAMES, and SUBKEYS are mutually exclusive.",
+        ));
     }
-    cx.set_var(out, BString::default());
+    if parsed.flag("VALUE_NAMES") || parsed.flag("SUBKEYS") {
+        let value_names = parsed.flag("VALUE_NAMES");
+        let mut items = BTreeSet::new();
+        let mut query_successful = false;
+        let mut last_error = BString::default();
+        for view in views {
+            if view == RegistryView::Bits64 && host_view == RegistryView::Bits32 {
+                last_error = "No 64bit registry on Windows32.".into();
+                continue;
+            }
+            let result = if value_names {
+                cx.host().registry_value_names(root, subkey, view)
+            } else {
+                cx.host().registry_subkeys(root, subkey, view)
+            };
+            match result {
+                Ok(Some(entries)) => {
+                    items.extend(entries);
+                    query_successful = true;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    last_error = err.to_string().into();
+                }
+            }
+        }
+        if query_successful {
+            if let Some(error) = error_var {
+                cx.set_var(error, BString::default());
+            }
+            cx.set_var(out, rcmake_base::list::join(items));
+        } else {
+            if let Some(error) = error_var {
+                cx.set_var(error, last_error);
+            }
+            cx.set_var(out, BString::default());
+        }
+        return Ok(Flow::Normal);
+    }
+    let name = parsed
+        .single("VALUE")
+        .map(|v| v.as_slice())
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case(b"(default)"));
+    let separator = parsed.single("SEPARATOR").map(|v| v.as_slice());
+    let mut found: Option<BString> = None;
+    let mut last_error = BString::default();
+    for view in views {
+        if view == RegistryView::Bits64 && host_view == RegistryView::Bits32 {
+            last_error = "No 64bit registry on Windows32.".into();
+            continue;
+        }
+        match cx
+            .host()
+            .registry_value_with_separator(root, subkey, name, view, separator)
+        {
+            Ok(Some(value)) => {
+                found = Some(value);
+                last_error.clear();
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                last_error = err.to_string().into();
+            }
+        }
+    }
+    if let Some(value) = found {
+        if let Some(error) = error_var {
+            cx.set_var(error, BString::default());
+        }
+        cx.set_var(out, value);
+    } else {
+        if let Some(error) = error_var {
+            cx.set_var(error, last_error);
+        }
+        cx.set_var(out, BString::default());
+    }
     Ok(Flow::Normal)
+}
+
+fn parse_registry_key(key: &[u8]) -> Result<(RegistryRoot, &[u8]), BString> {
+    let (root_bytes, subkey) = match key.iter().position(|&b| b == b'/' || b == b'\\') {
+        Some(pos) => (
+            key.get(..pos).unwrap_or_default(),
+            key.get(pos + 1..).unwrap_or_default(),
+        ),
+        None => (key, b"".as_slice()),
+    };
+    let root = match root_bytes {
+        b"HKLM" | b"HKEY_LOCAL_MACHINE" => RegistryRoot::LocalMachine,
+        b"HKCU" | b"HKEY_CURRENT_USER" => RegistryRoot::CurrentUser,
+        b"HKCR" | b"HKEY_CLASSES_ROOT" => RegistryRoot::ClassesRoot,
+        b"HKCC" | b"HKEY_CURRENT_CONFIG" => RegistryRoot::CurrentConfig,
+        b"HKU" | b"HKEY_USERS" => RegistryRoot::Users,
+        _ => return Err([root_bytes, b": invalid root key."].concat().into()),
+    };
+    Ok((root, subkey))
+}
+
+fn registry_views(
+    view: Option<&[u8]>,
+    host_view: RegistryView,
+    sizeof_void_p: Option<RegistryView>,
+) -> Vec<RegistryView> {
+    let is_64_host = host_view == RegistryView::Bits64;
+    let target_view = sizeof_void_p.unwrap_or(host_view);
+    let both = || match sizeof_void_p {
+        Some(RegistryView::Bits64) => vec![RegistryView::Bits64, RegistryView::Bits32],
+        Some(RegistryView::Bits32) => {
+            if is_64_host {
+                vec![RegistryView::Bits32, RegistryView::Bits64]
+            } else {
+                vec![RegistryView::Bits32]
+            }
+        }
+        None => {
+            if is_64_host {
+                vec![RegistryView::Bits64, RegistryView::Bits32]
+            } else {
+                vec![RegistryView::Bits32]
+            }
+        }
+    };
+    match view {
+        Some(b"32") => vec![RegistryView::Bits32],
+        Some(b"64") => vec![RegistryView::Bits64],
+        Some(b"32_64") => {
+            if is_64_host {
+                vec![RegistryView::Bits32, RegistryView::Bits64]
+            } else {
+                vec![RegistryView::Bits32]
+            }
+        }
+        Some(b"64_32") => {
+            if is_64_host {
+                vec![RegistryView::Bits64, RegistryView::Bits32]
+            } else {
+                vec![RegistryView::Bits32]
+            }
+        }
+        Some(b"HOST") => vec![host_view],
+        Some(b"TARGET") => vec![target_view],
+        Some(b"BOTH") | None => both(),
+        _ => both(),
+    }
 }
 
 fn query_options<'a>(args: &[&'a [u8]]) -> Result<(Option<bool>, Vec<&'a [u8]>), CmdError> {
@@ -243,6 +421,10 @@ impl HostFacts {
             b"MSYSTEM_PREFIX" if host.sysname == b"Windows" => {
                 cx.host().env_get(b"MSYSTEM_PREFIX").unwrap_or_default()
             }
+            b"VS_15_DIR" => vs_install_dir(cx, host, 15),
+            b"VS_16_DIR" => vs_install_dir(cx, host, 16),
+            b"VS_17_DIR" => vs_install_dir(cx, host, 17),
+            b"VS_18_DIR" => vs_install_dir(cx, host, 18),
             b"TOTAL_PHYSICAL_MEMORY"
             | b"AVAILABLE_PHYSICAL_MEMORY"
             | b"TOTAL_VIRTUAL_MEMORY"
@@ -540,7 +722,10 @@ fn distribution_fallback(
             return Err(CmdError::Reported);
         }
         if !fields.is_empty() {
-            fields.insert("USED_FALLBACK_SCRIPT".into(), path::from_native(&script));
+            fields.insert(
+                "USED_FALLBACK_SCRIPT".into(),
+                path::from_native_cmake(&script),
+            );
             return Ok(fields);
         }
     }
@@ -592,8 +777,398 @@ fn run(cx: &Cx<'_>, program: &[u8], args: &[&[u8]]) -> Option<BString> {
         stderr: Output::Null,
         timeout: Some(Duration::from_secs(2)),
         tee: false,
+        default_error_mode: false,
     };
     let result = cx.host().run(&request, &mut |_, _| {}).ok()?;
     matches!(result.results.as_slice(), [ProcessResult::Exited(0)])
         .then(|| result.stdout.trim_ascii().into())
+}
+
+fn vs_install_dir(cx: &Cx<'_>, host_info: &SystemInfo, major: u8) -> BString {
+    if host_info.sysname != b"Windows" && !cfg!(windows) {
+        return BString::default();
+    }
+    let host = cx.host();
+    let expected_prefix = format!("{major}.");
+    if host
+        .env_get(b"VisualStudioVersion")
+        .is_some_and(|version| version.starts_with(expected_prefix.as_bytes()))
+        && let Some(dir) = host.env_get(b"VSINSTALLDIR").filter(|dir| !dir.is_empty())
+        && host
+            .metadata(&path::to_native(&dir), Follow::Yes)
+            .is_ok_and(|meta| meta.kind == FileKind::Dir)
+    {
+        return normalize_vs_dir(&dir);
+    }
+    let locator = [b"ProgramFiles(x86)".as_slice(), b"ProgramFiles"]
+        .into_iter()
+        .filter_map(|var| host.env_get(var).filter(|dir| !dir.is_empty()))
+        .map(|base| path::to_native(&base).join("Microsoft Visual Studio/Installer/vswhere.exe"))
+        .find(|candidate| {
+            host.metadata(candidate, Follow::Yes)
+                .is_ok_and(|meta| meta.kind == FileKind::File)
+        });
+    let Some(locator) = locator else {
+        return BString::default();
+    };
+    let range = format!("[{major}.0,{}.0)", major + 1);
+    let request = RunRequest {
+        pipeline: vec![CommandSpec {
+            program: path::from_native(&locator),
+            args: vec![
+                "-latest".into(),
+                "-products".into(),
+                "*".into(),
+                "-version".into(),
+                range.into(),
+                "-property".into(),
+                "installationPath".into(),
+                "-utf8".into(),
+            ],
+        }],
+        cwd: host.initial_cwd(),
+        env: host.env_all(),
+        stdin: Input::Null,
+        stdout: Output::Capture,
+        stderr: Output::Null,
+        timeout: Some(Duration::from_secs(5)),
+        tee: false,
+        default_error_mode: false,
+    };
+    let Ok(output) = host.run_bounded(&request, 64 * 1024) else {
+        return BString::default();
+    };
+    if output.results != [ProcessResult::Exited(0)] {
+        return BString::default();
+    }
+    output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| {
+            let trimmed = line.trim_ascii();
+            let dir = trimmed.strip_prefix(b"\xef\xbb\xbf").unwrap_or(trimmed);
+            (!dir.is_empty()).then(|| normalize_vs_dir(dir))
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_vs_dir(dir: &[u8]) -> BString {
+    let mut normalized = rcmake_base::path_lex::cmake_style_windows(dir);
+    while normalized.len() > 3 && normalized.ends_with(b"/") {
+        normalized.pop();
+    }
+    normalized
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use rcmake_base::BString;
+    use rcmake_host::{RegistryRoot, RegistryView};
+
+    use super::{normalize_vs_dir, parse_registry_key, registry_views};
+
+    #[test]
+    fn parses_windows_registry_root_keys_at_separator_boundary() {
+        assert_eq!(
+            parse_registry_key(b"HKCU/Software/CMake"),
+            Ok((RegistryRoot::CurrentUser, b"Software/CMake".as_slice()))
+        );
+        assert_eq!(
+            parse_registry_key(br"HKEY_LOCAL_MACHINE\SOFTWARE\Kitware"),
+            Ok((RegistryRoot::LocalMachine, br"SOFTWARE\Kitware".as_slice()))
+        );
+        assert_eq!(
+            parse_registry_key(b"WRONG_ROOT/SUBKEY"),
+            Err(BString::from("WRONG_ROOT: invalid root key."))
+        );
+        assert_eq!(
+            parse_registry_key(b"HKLM-SUBKEY"),
+            Err(BString::from("HKLM-SUBKEY: invalid root key."))
+        );
+    }
+
+    #[test]
+    fn resolves_registry_views_and_vs_dir_paths() {
+        assert_eq!(
+            registry_views(Some(b"64_32"), RegistryView::Bits64, None),
+            vec![RegistryView::Bits64, RegistryView::Bits32]
+        );
+        assert_eq!(
+            registry_views(Some(b"32_64"), RegistryView::Bits64, None),
+            vec![RegistryView::Bits32, RegistryView::Bits64]
+        );
+        // Omitted VIEW defaults to BOTH; CMAKE_SIZEOF_VOID_P selects order.
+        assert_eq!(
+            registry_views(None, RegistryView::Bits64, None),
+            vec![RegistryView::Bits64, RegistryView::Bits32]
+        );
+        assert_eq!(
+            registry_views(None, RegistryView::Bits32, None),
+            vec![RegistryView::Bits32]
+        );
+        assert_eq!(
+            registry_views(
+                Some(b"BOTH"),
+                RegistryView::Bits64,
+                Some(RegistryView::Bits32)
+            ),
+            vec![RegistryView::Bits32, RegistryView::Bits64]
+        );
+        assert_eq!(
+            registry_views(
+                Some(b"TARGET"),
+                RegistryView::Bits64,
+                Some(RegistryView::Bits32)
+            ),
+            vec![RegistryView::Bits32]
+        );
+        assert_eq!(
+            normalize_vs_dir(br"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\"),
+            "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools"
+        );
+    }
+
+    #[test]
+    fn queries_windows_registry_multi_sz_value_names_and_subkeys_across_views()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        use rcmake_eval::{Interp, InterpConfig, RunMode};
+        use rcmake_host::PureHost;
+
+        let host = Arc::new(PureHost::default());
+        host.set_registry_host_view(RegistryView::Bits64)?;
+        let key = b"Software/Classes/CLSID/CMake-Tests/chsi-registry";
+        host.seed_registry_value(
+            RegistryRoot::CurrentUser,
+            key,
+            None,
+            RegistryView::Bits64,
+            b"default 64bit",
+        )?;
+        host.seed_registry_value(
+            RegistryRoot::CurrentUser,
+            key,
+            Some(b"BYTE_SIZE"),
+            RegistryView::Bits64,
+            b"64bit",
+        )?;
+        host.seed_registry_value(
+            RegistryRoot::CurrentUser,
+            key,
+            Some(b"VALUE_SZ"),
+            RegistryView::Bits64,
+            b"data with space",
+        )?;
+        host.seed_registry_multi_sz(
+            RegistryRoot::CurrentUser,
+            key,
+            Some(b"VALUE_MULTI_SZ"),
+            RegistryView::Bits64,
+            b"data1\0data2\0",
+        )?;
+        host.seed_registry_multi_sz(
+            RegistryRoot::CurrentUser,
+            key,
+            Some(b"VALUE2_MULTI_SZ"),
+            RegistryView::Bits64,
+            b"data1|data2\0",
+        )?;
+        host.seed_registry_key(
+            RegistryRoot::CurrentUser,
+            b"Software/Classes/CLSID/CMake-Tests/chsi-registry/subkey1",
+            RegistryView::Bits64,
+        )?;
+        host.seed_registry_key(
+            RegistryRoot::CurrentUser,
+            b"Software/Classes/CLSID/CMake-Tests/chsi-registry/subkey2",
+            RegistryView::Bits64,
+        )?;
+
+        host.seed_registry_value(
+            RegistryRoot::CurrentUser,
+            key,
+            None,
+            RegistryView::Bits32,
+            b"default 32bit",
+        )?;
+        host.seed_registry_value(
+            RegistryRoot::CurrentUser,
+            key,
+            Some(b"BYTE_SIZE"),
+            RegistryView::Bits32,
+            b"32bit",
+        )?;
+        host.seed_registry_value(
+            RegistryRoot::CurrentUser,
+            key,
+            Some(b"VALUE2_SZ"),
+            RegistryView::Bits32,
+            b"data2 with space",
+        )?;
+        host.seed_registry_key(
+            RegistryRoot::CurrentUser,
+            b"Software/Classes/CLSID/CMake-Tests/chsi-registry/subkey1",
+            RegistryView::Bits32,
+        )?;
+        host.seed_registry_key(
+            RegistryRoot::CurrentUser,
+            b"Software/Classes/CLSID/CMake-Tests/chsi-registry/subkey3",
+            RegistryView::Bits32,
+        )?;
+
+        let script = Path::new("/work/reg.cmake");
+        host.seed_file(
+            script,
+            br#"
+set(KEY "HKCU/Software/Classes/CLSID/CMake-Tests/chsi-registry")
+cmake_host_system_information(RESULT multi1 QUERY WINDOWS_REGISTRY "${KEY}" VALUE VALUE_MULTI_SZ ERROR_VARIABLE e1)
+cmake_host_system_information(RESULT multi2 QUERY WINDOWS_REGISTRY "${KEY}" VALUE VALUE2_MULTI_SZ SEPARATOR "|" ERROR_VARIABLE e2)
+cmake_host_system_information(RESULT names_both QUERY WINDOWS_REGISTRY "${KEY}" VALUE_NAMES ERROR_VARIABLE e3)
+cmake_host_system_information(RESULT names_64 QUERY WINDOWS_REGISTRY "${KEY}" VALUE_NAMES VIEW 64 ERROR_VARIABLE e4)
+cmake_host_system_information(RESULT names_32 QUERY WINDOWS_REGISTRY "${KEY}" VALUE_NAMES VIEW 32 ERROR_VARIABLE e5)
+cmake_host_system_information(RESULT subkeys_both QUERY WINDOWS_REGISTRY "${KEY}" SUBKEYS ERROR_VARIABLE e6)
+cmake_host_system_information(RESULT subkeys_64 QUERY WINDOWS_REGISTRY "${KEY}" SUBKEYS VIEW 64 ERROR_VARIABLE e7)
+cmake_host_system_information(RESULT subkeys_32 QUERY WINDOWS_REGISTRY "${KEY}" SUBKEYS VIEW 32 ERROR_VARIABLE e8)
+set(CMAKE_SIZEOF_VOID_P 4)
+cmake_host_system_information(RESULT target32_subkeys QUERY WINDOWS_REGISTRY "${KEY}" SUBKEYS VIEW TARGET ERROR_VARIABLE e9)
+cmake_host_system_information(RESULT both32_default QUERY WINDOWS_REGISTRY "${KEY}" ERROR_VARIABLE e10)
+"#,
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                host: host.clone(),
+                mode: RunMode::Script,
+                cmake_root: "/cmake".into(),
+                cmake_command: "/cmake/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                services: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        assert_eq!(interp.run_script(script).exit_code, 0);
+        for err in ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10"] {
+            assert_eq!(interp.cx().var_or_empty(err.as_bytes()), "");
+        }
+        assert_eq!(interp.cx().var_or_empty(b"multi1"), "data1;data2");
+        assert_eq!(interp.cx().var_or_empty(b"multi2"), "data1;data2");
+        assert_eq!(
+            interp.cx().var_or_empty(b"names_both"),
+            "(default);BYTE_SIZE;VALUE2_MULTI_SZ;VALUE2_SZ;VALUE_MULTI_SZ;VALUE_SZ"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"names_64"),
+            "(default);BYTE_SIZE;VALUE2_MULTI_SZ;VALUE_MULTI_SZ;VALUE_SZ"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"names_32"),
+            "(default);BYTE_SIZE;VALUE2_SZ"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"subkeys_both"),
+            "subkey1;subkey2;subkey3"
+        );
+        assert_eq!(interp.cx().var_or_empty(b"subkeys_64"), "subkey1;subkey2");
+        assert_eq!(interp.cx().var_or_empty(b"subkeys_32"), "subkey1;subkey3");
+        assert_eq!(
+            interp.cx().var_or_empty(b"target32_subkeys"),
+            "subkey1;subkey3"
+        );
+        assert_eq!(interp.cx().var_or_empty(b"both32_default"), "default 32bit");
+        Ok(())
+    }
+
+    #[test]
+    fn windows_registry_case_insensitive_default_32bit_views_and_error_preservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        use rcmake_eval::{Interp, InterpConfig, RunMode};
+        use rcmake_host::PureHost;
+
+        // Case-insensitive VALUE "(DEFAULT)" and 32-bit host view filtering.
+        assert_eq!(
+            super::registry_views(Some(b"32_64"), RegistryView::Bits32, None),
+            vec![RegistryView::Bits32]
+        );
+        assert_eq!(
+            super::registry_views(Some(b"64_32"), RegistryView::Bits32, None),
+            vec![RegistryView::Bits32]
+        );
+        assert_eq!(
+            super::registry_views(
+                Some(b"BOTH"),
+                RegistryView::Bits32,
+                Some(RegistryView::Bits32)
+            ),
+            vec![RegistryView::Bits32]
+        );
+
+        let host = Arc::new(PureHost::default());
+        host.set_registry_host_view(RegistryView::Bits32)?;
+        let key = b"Software/CMakeTest";
+        host.seed_registry_value(
+            RegistryRoot::CurrentUser,
+            key,
+            None,
+            RegistryView::Bits32,
+            b"unnamed-default",
+        )?;
+        let script = Path::new("/work/reg32.cmake");
+        host.seed_file(
+            script,
+            br#"
+set(KEY "HKCU/Software/CMakeTest")
+cmake_host_system_information(RESULT def_upper QUERY WINDOWS_REGISTRY "${KEY}" VALUE "(DEFAULT)" ERROR_VARIABLE e_upper)
+cmake_host_system_information(RESULT def_mixed QUERY WINDOWS_REGISTRY "${KEY}" VALUE "(Default)" ERROR_VARIABLE e_mixed)
+cmake_host_system_information(RESULT only64 QUERY WINDOWS_REGISTRY "${KEY}" VIEW 64 ERROR_VARIABLE e_64)
+cmake_host_system_information(RESULT only64_names QUERY WINDOWS_REGISTRY "${KEY}" VALUE_NAMES VIEW 64 ERROR_VARIABLE e_64_names)
+set(CMAKE_SIZEOF_VOID_P 8)
+cmake_host_system_information(RESULT fallback_to_32 QUERY WINDOWS_REGISTRY "${KEY}" VALUE "(DEFAULT)" VIEW BOTH ERROR_VARIABLE e_both)
+"#,
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                host: host.clone(),
+                mode: RunMode::Script,
+                cmake_root: "/cmake".into(),
+                cmake_command: "/cmake/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                services: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        assert_eq!(interp.run_script(script).exit_code, 0);
+        assert_eq!(interp.cx().var_or_empty(b"def_upper"), "unnamed-default");
+        assert_eq!(interp.cx().var_or_empty(b"e_upper"), "");
+        assert_eq!(interp.cx().var_or_empty(b"def_mixed"), "unnamed-default");
+        assert_eq!(interp.cx().var_or_empty(b"e_mixed"), "");
+        assert_eq!(interp.cx().var_or_empty(b"only64"), "");
+        assert_eq!(
+            interp.cx().var_or_empty(b"e_64"),
+            "No 64bit registry on Windows32."
+        );
+        assert_eq!(interp.cx().var_or_empty(b"only64_names"), "");
+        assert_eq!(
+            interp.cx().var_or_empty(b"e_64_names"),
+            "No 64bit registry on Windows32."
+        );
+        // First view (64) errors on 32-bit host, second view (32) succeeds -> value found, error cleared.
+        assert_eq!(
+            interp.cx().var_or_empty(b"fallback_to_32"),
+            "unnamed-default"
+        );
+        assert_eq!(interp.cx().var_or_empty(b"e_both"), "");
+        Ok(())
+    }
 }

@@ -1,17 +1,18 @@
 //! Record and replay listfiles with fully classified commands.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::ErrorKind;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use rcmake_base::BString;
+use rcmake_base::{BString, Limits};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{Follow, Host, path};
+use rcmake_host::{FileKind, Follow, Host, Metadata, path};
 use rcmake_json::{FieldError, FromJson, Value, opt_or_else, req};
 use rcmake_model::DirId;
 use rcmake_syntax::{ArgKind, Argument};
+use sha2::{Digest as _, Sha256};
 
 use super::codec;
 use super::frame::{EncodeError, EncodeJson, JsonSink, MAX_FRAME_BYTES, encoded_size};
@@ -132,14 +133,200 @@ fn decode_and_digest(
     (executable, executable.and_then(|_| decode()))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartupExeIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mode: u32,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    ctime: Option<(i64, u32)>,
+    owner: Option<u32>,
+}
+
+impl StartupExeIdentity {
+    fn from_metadata(meta: &Metadata) -> Option<Self> {
+        if meta.kind != FileKind::File {
+            return None;
+        }
+        Some(Self {
+            dev: meta.dev,
+            ino: meta.ino,
+            len: meta.len,
+            mode: meta.mode,
+            mtime_secs: meta.mtime.secs,
+            mtime_nanos: meta.mtime.nanos,
+            ctime: meta.ctime.map(|t| (t.secs, t.nanos)),
+            owner: meta.owner,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExeMemoKey {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mode: u32,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    ctime_secs: i64,
+    ctime_nanos: u32,
+    owner: u32,
+}
+
+impl ExeMemoKey {
+    /// Admit an executable into the cross-session digest memo only under the same
+    /// strict immutability rules as `TraceMemo`: regular file, non-zero inode,
+    /// sub-second `ctime` older than one second, non-root caller, and not owned or
+    /// writable by the current user.
+    fn from_immutable(host: &dyn Host, path: &Path, meta: &Metadata) -> Option<Self> {
+        if meta.kind != FileKind::File || meta.ino == 0 {
+            return None;
+        }
+        let ctime = meta.ctime?;
+        if ctime.nanos == 0 {
+            return None;
+        }
+        let now = host.now();
+        if ctime.secs >= now.secs.saturating_sub(1) {
+            return None;
+        }
+        let uid = host.effective_uid()?;
+        if uid == 0 {
+            return None;
+        }
+        let owner = meta.owner?;
+        if owner == uid || (meta.mode & 0o022) != 0 {
+            return None;
+        }
+        Some(Self {
+            path: path.to_path_buf(),
+            dev: meta.dev,
+            ino: meta.ino,
+            len: meta.len,
+            mode: meta.mode,
+            mtime_secs: meta.mtime.secs,
+            mtime_nanos: meta.mtime.nanos,
+            ctime_secs: ctime.secs,
+            ctime_nanos: ctime.nanos,
+            owner,
+        })
+    }
+}
+
+fn exe_digest_cache() -> &'static Mutex<BTreeMap<ExeMemoKey, JournalDigest>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<ExeMemoKey, JournalDigest>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn capture_startup_exe(host: &dyn Host, path: &Path) -> Option<StartupExeIdentity> {
+    let before = host.metadata_fresh(path, Follow::Yes).ok()?;
+    let before_id = StartupExeIdentity::from_metadata(&before)?;
+    match host.open_read_with_metadata(path) {
+        Ok((_, Some(opened))) => {
+            let opened_id = StartupExeIdentity::from_metadata(&opened)?;
+            (opened_id == before_id).then_some(opened_id)
+        }
+        Ok((_, None)) => Some(before_id),
+        Err(error) if error.kind == ErrorKind::Unsupported => Some(before_id),
+        Err(_) => None,
+    }
+}
+
+fn executable_digest(host: &dyn Host, path: &Path) -> Option<JournalDigest> {
+    executable_digest_pinned(host, path, None)
+}
+
+fn executable_digest_pinned(
+    host: &dyn Host,
+    path: &Path,
+    expected: Option<&StartupExeIdentity>,
+) -> Option<JournalDigest> {
+    let before = host.metadata_fresh(path, Follow::Yes).ok()?;
+    let before_id = StartupExeIdentity::from_metadata(&before)?;
+    if expected.is_some_and(|exp| *exp != before_id) {
+        return None;
+    }
+    if before.len > Limits::default().max_file_read {
+        return None;
+    }
+    let (mut reader, opened) = match host.open_read_with_metadata(path) {
+        Ok((reader, Some(opened))) => (reader, opened),
+        Ok((_, None)) => {
+            let digest = file_digest(host, path).ok()?;
+            let after = host.metadata_fresh(path, Follow::Yes).ok()?;
+            return (StartupExeIdentity::from_metadata(&after).as_ref() == Some(&before_id))
+                .then_some(digest);
+        }
+        Err(error) if error.kind == ErrorKind::Unsupported => {
+            let digest = file_digest(host, path).ok()?;
+            let after = host.metadata_fresh(path, Follow::Yes).ok()?;
+            return (StartupExeIdentity::from_metadata(&after).as_ref() == Some(&before_id))
+                .then_some(digest);
+        }
+        Err(_) => return None,
+    };
+    let opened_id = StartupExeIdentity::from_metadata(&opened)?;
+    if opened_id != before_id {
+        return None;
+    }
+    let memo_key = ExeMemoKey::from_immutable(host, path, &opened);
+    if let Some(key) = &memo_key
+        && let Some(cached) = exe_digest_cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .copied()
+    {
+        return Some(cached);
+    }
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let n = reader.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        total = total.checked_add(n as u64)?;
+        if total > opened.len {
+            return None;
+        }
+        hasher.update(buf.get(..n)?);
+    }
+    drop(reader);
+    let after = host.metadata_fresh(path, Follow::Yes).ok()?;
+    if total != opened.len || StartupExeIdentity::from_metadata(&after) != Some(opened_id) {
+        return None;
+    }
+    let digest = JournalDigest::from_bytes(hasher.finalize().into());
+    if let Some(key) = memo_key {
+        let mut cache = exe_digest_cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, digest);
+    }
+    Some(digest)
+}
+
 pub(crate) struct ReplaySession {
     host: Arc<dyn Host>,
-    executable: JournalDigest,
+    program: PathBuf,
+    executable: Option<JournalDigest>,
+    startup_exe: Option<StartupExeIdentity>,
     options: JournalDigest,
     root: RegionKey,
     source: Option<(BString, JournalDigest)>,
     previous: Option<Manifest>,
+    nested_index: HashMap<RegionKey, Vec<usize>, crate::util::FxBuildHasher>,
     variable_indices: Vec<Option<usize>>,
+    variable_input_index: HashMap<Vec<String>, usize, crate::util::FxBuildHasher>,
     pending: Regions,
     receipts: Option<Arc<ReplayReceipts>>,
     root_record: Option<RegionRecord>,
@@ -185,13 +372,14 @@ impl ReplaySession {
             .map_or(&interp.config.host, |h| &h.0)
             .clone();
         let program = host.current_exe().ok()?;
-        let digest = || file_digest(host.as_ref(), &program).ok();
-        let (executable, previous) = if let Some(bytes) = cached {
-            decode_and_digest(bytes, digest)
+        let (executable, startup_exe, previous) = if let Some(bytes) = cached {
+            let (executable, previous) =
+                decode_and_digest(bytes, || executable_digest(host.as_ref(), &program));
+            (Some(executable?), None, previous)
         } else {
-            (digest(), None)
+            let startup = capture_startup_exe(host.as_ref(), &program);
+            (None, startup, None)
         };
-        let executable = executable?;
         let absolute = |p: &Path| {
             path::to_native(&crate::util::collapse_full_path(
                 &path::from_native_cmake(p),
@@ -221,8 +409,26 @@ impl ReplaySession {
             h.field(4, def.ty.map_or("", |ty| ty.as_str()).as_bytes());
             h.field(5, &def.value);
         }
-        h.field(6, format!("{:?}", interp.config.limits).as_bytes());
-        h.field(7, format!("{:?}", interp.config.diag).as_bytes());
+        let limits = &interp.config.limits;
+        h.u32(6, limits.max_recursion);
+        h.u32(7, limits.max_recursion_ceiling);
+        h.usize(8, limits.max_value_bytes);
+        h.u64(9, limits.max_file_read);
+        h.u64(10, limits.regex_steps);
+        match limits.wall_budget {
+            None => h.u8(11, 0),
+            Some(dur) => {
+                h.u8(11, 1);
+                h.u64(12, dur.as_secs());
+                h.u32(13, dur.subsec_nanos());
+            }
+        }
+        h.usize(14, limits.max_command_arguments);
+        h.usize(15, limits.max_command_argument_bytes);
+        h.usize(16, limits.max_cache_bytes);
+        h.usize(17, limits.max_live_variable_bytes);
+        h.diag_state(18, &interp.config.diag.initial_state);
+        h.bool(19, interp.config.diag.sarif);
         let previous = previous.filter(|s| {
             s.region.key == root
                 && s.model.nested.len() <= 4096
@@ -232,9 +438,20 @@ impl ReplaySession {
         if let Some(receipts) = &receipts {
             let recorded = previous
                 .as_ref()
-                .filter(|frame| frame.region.context.rcmake == executable)
+                .filter(|frame| Some(frame.region.context.rcmake) == executable)
                 .map_or(&[][..], |frame| frame.model.receipts.as_slice());
             receipts.restore(recorded);
+        }
+        let mut nested_index: HashMap<RegionKey, Vec<usize>, crate::util::FxBuildHasher> =
+            HashMap::default();
+        if let Some(snapshot) = &previous {
+            nested_index.reserve(snapshot.model.nested.len());
+            for (index, (record, _)) in snapshot.model.nested.iter().enumerate() {
+                nested_index
+                    .entry(record.key.clone())
+                    .or_default()
+                    .push(index);
+            }
         }
         let variable_indices = vec![
             None;
@@ -253,11 +470,15 @@ impl ReplaySession {
         Some((
             Self {
                 host,
+                program,
                 executable,
+                startup_exe,
                 options,
                 root,
                 previous,
+                nested_index,
                 variable_indices,
+                variable_input_index: HashMap::default(),
                 source: None,
                 pending: Regions::default(),
                 receipts,
@@ -284,16 +505,12 @@ impl ReplaySession {
     }
 
     fn intern_variables(&mut self, variables: Vec<String>) -> Option<usize> {
-        if let Some(index) = self
-            .pending
-            .variable_inputs
-            .iter()
-            .position(|set| *set == variables)
-        {
+        if let Some(&index) = self.variable_input_index.get(&variables) {
             return Some(index);
         }
         let size = encoded_size(&variables, self.bytes_left)?;
         let index = self.pending.variable_inputs.len();
+        self.variable_input_index.insert(variables.clone(), index);
         self.pending.variable_inputs.push(variables);
         self.bytes_left = self.bytes_left.saturating_sub(size + 1);
         Some(index)
@@ -333,13 +550,26 @@ impl ReplaySession {
         {
             return None;
         }
+        let executable = match self.executable {
+            Some(digest) => digest,
+            None => {
+                let expected = self.startup_exe.as_ref()?;
+                executable_digest_pinned(self.host.as_ref(), &self.program, Some(expected))?
+            }
+        };
+        if let Some(root) = &mut self.root_record {
+            root.context.rcmake = executable;
+        }
+        for (record, _) in &mut self.pending.nested {
+            record.context.rcmake = executable;
+        }
         let region = self.root_record.unwrap_or_else(|| {
             let mut opaque = RegionState::default();
             opaque.mark_opaque(OpaqueReason::UnclassifiedCommand);
             opaque.finish(
                 self.root,
                 EntryContext {
-                    rcmake: self.executable,
+                    rcmake: executable,
                     policies: self.options,
                     diag: self.options,
                     flags: self.options,
@@ -434,7 +664,7 @@ impl Interp {
             .map(PathBuf::as_path)
     }
 
-    fn can_replay(&self) -> bool {
+    pub(super) fn can_replay(&self) -> bool {
         self.config.mode == RunMode::Configure
             && !self.fatal
             && self.exit_override.is_none()
@@ -617,11 +847,11 @@ impl Interp {
                 checked.region,
             ))
         } else {
-            snapshot
-                .model
-                .nested
+            let candidates = session.nested_index.get(key)?;
+            candidates
                 .iter()
-                .filter(|(r, _)| r.key == *key && r.context == *context && valid_record(r))
+                .filter_map(|&idx| snapshot.model.nested.get(idx))
+                .filter(|(r, _)| r.context == *context && valid_record(r))
                 .find_map(|(r, s)| {
                     match s.variable_inputs {
                         Some((index, digest)) if writes.record_variable_reads => {
@@ -1056,10 +1286,30 @@ impl Interp {
         writes: &Writes,
         source: JournalDigest,
     ) -> Option<EntryContext> {
+        let dir_usage = if writes.directory_usage || !writes.targets.is_empty() {
+            let dir = self.current_dir_id();
+            let binary = self.current_binary_dir();
+            let current = self.project.dir(dir);
+            // Target constructors can read every declared property initializer.
+            // Skip custom initializers and linked directory usage until recorded.
+            if self
+                .project
+                .global
+                .defined_props
+                .iter()
+                .any(|p| p.scope == b"TARGET" && p.initialize_from_variable.is_some())
+                || current.props.get(b"LINK_LIBRARIES").is_some()
+            {
+                return None;
+            }
+            Some((dir, Usage::capture(&current.usage, &binary, dir)?))
+        } else {
+            None
+        };
         let mut h = JournalHasher::new(b"listfile-entry");
         h.field(1, session.options.as_bytes());
         h.field(2, source.as_bytes());
-        h.field(3, &self.depth.to_le_bytes());
+        h.u32(3, self.depth);
         h.field(
             4,
             PropertyOrigin::new(self.current_binary_dir(), &self.bt)
@@ -1067,19 +1317,27 @@ impl Interp {
                 .as_bytes(),
         );
         let scope = self.vars.scope_identity(false);
-        if writes.record_variable_reads {
-            let directory_scope = scope.map(|(depth, _, directory)| (depth, directory));
-            h.field(5, format!("{directory_scope:?}").as_bytes());
-        } else {
-            h.field(5, format!("{scope:?}").as_bytes());
+        match scope {
+            None => h.u8(5, 0),
+            Some((depth, epoch, directory)) => {
+                h.u8(5, 1);
+                h.u32(5, depth);
+                if !writes.record_variable_reads {
+                    h.u64(5, epoch);
+                }
+                match directory {
+                    None => h.u8(5, 0),
+                    Some(dir) => {
+                        h.u8(5, 1);
+                        h.usize(5, dir.index());
+                    }
+                }
+            }
         }
         if !writes.record_variable_reads {
             for (name, state) in &self.variable_access {
                 h.field(6, name);
-                h.field(
-                    7,
-                    &[u8::from(state.load(std::sync::atomic::Ordering::Relaxed))],
-                );
+                h.bool(7, state.load(std::sync::atomic::Ordering::Relaxed));
             }
         }
         // Every command frame checks this environment fallback for the recursion limit.
@@ -1108,23 +1366,8 @@ impl Interp {
                 h.field(13, CacheValue::from(entry).digest().as_bytes());
             }
         }
-        if writes.directory_usage || !writes.targets.is_empty() {
-            let dir = self.current_dir_id();
-            let binary = self.current_binary_dir();
+        if let Some((dir, usage)) = dir_usage {
             let current = self.project.dir(dir);
-            // Target constructors can read every declared property initializer.
-            // Skip custom initializers and linked directory usage until recorded.
-            if self
-                .project
-                .global
-                .defined_props
-                .iter()
-                .any(|p| p.scope == b"TARGET" && p.initialize_from_variable.is_some())
-                || current.props.get(b"LINK_LIBRARIES").is_some()
-            {
-                return None;
-            }
-            let usage = Usage::capture(&current.usage, &binary, dir)?;
             h.field(14, usage.digest().as_bytes());
             h.field(30, &current.define_flags);
             for name in current.props.names() {
@@ -1154,15 +1397,15 @@ impl Interp {
             );
         }
         if writes.links || (!writes.record_variable_reads && !writes.targets.is_empty()) {
-            h.field(22, &self.hooks.next_defer_id.to_le_bytes());
-            h.field(23, &[u8::from(self.root_frame.defer.is_some())]);
+            h.u64(22, self.hooks.next_defer_id);
+            h.bool(23, self.root_frame.defer.is_some());
         }
         if writes.links {
             for (name, binding) in self.project.global_target_bindings() {
                 let target = self.project.target(binding.id())?;
                 h.field(24, name);
                 h.field(25, target.kind.as_str().as_bytes());
-                h.field(26, &[u8::from(target.is_imported())]);
+                h.bool(26, target.is_imported());
                 h.field(
                     27,
                     target
@@ -1180,11 +1423,17 @@ impl Interp {
                 }
             }
         }
+        let mut policy_hasher = JournalHasher::new(b"entry-policies");
+        policy_hasher.layered_policies(1, &self.policies);
+        let mut diag_hasher = JournalHasher::new(b"entry-diags");
+        diag_hasher.layered_diags(1, &self.diags);
         Some(EntryContext {
-            rcmake: session.executable,
+            rcmake: session
+                .executable
+                .unwrap_or_else(|| JournalDigest::from_bytes([0_u8; 32])),
             flags: h.finish(),
-            policies: JournalDigest::hash(format!("{:?}", self.policies).as_bytes()),
-            diag: JournalDigest::hash(format!("{:?}", self.diags).as_bytes()),
+            policies: policy_hasher.finish(),
+            diag: diag_hasher.finish(),
             log_level: self.log_level.map_or(255, |level| level as u8),
         })
     }

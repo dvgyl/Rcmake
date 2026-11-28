@@ -72,6 +72,8 @@ fn add_subdirectory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     run_subdirectory(cx, &source.value, binary, options)
 }
 
+const LEGACY_SUBDIRS_PROP: &[u8] = b"\0rcmake-legacy-subdirs";
+
 fn subdirs(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if args.is_empty() {
         return Err(CmdError::status(
@@ -91,19 +93,54 @@ fn subdirs(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             b"EXCLUDE_FROM_ALL" => options.exclude_from_all = true,
             b"PREORDER" => {}
             _ => {
-                run_subdirectory(cx, name, None, options)?;
+                queue_legacy_subdirectory(cx, name, options)?;
             }
         }
     }
     Ok(Flow::Normal)
 }
 
-fn run_subdirectory(
+fn queue_legacy_subdirectory(
+    cx: &mut Cx<'_>,
+    source: &[u8],
+    options: SubdirOptions,
+) -> Result<(), CmdError> {
+    if cx.running_deferred() {
+        cx.issue(
+            MessageKind::Error,
+            Effect::SetError,
+            None,
+            "Subdirectories may not be created during deferred execution.".into(),
+        );
+        return Err(CmdError::Reported);
+    }
+    let (src, bin) = resolve_subdirectory_paths(cx, source, None)?;
+    let src_bytes = path::from_native_cmake(&src);
+    let bin_bytes = path::from_native_cmake(&bin);
+    check_unique_binary_dir(cx, &src_bytes, &bin_bytes)?;
+    let dir_id = cx.current_dir_id();
+    let install_position = cx.project().installs.len();
+    let mut entry = Vec::with_capacity(src_bytes.len() + bin_bytes.len() + 24);
+    entry.extend_from_slice(&src_bytes);
+    entry.push(0);
+    entry.extend_from_slice(&bin_bytes);
+    entry.push(0);
+    entry.push(if options.exclude_from_all { b'1' } else { b'0' });
+    entry.push(0);
+    entry.extend_from_slice(install_position.to_string().as_bytes());
+    entry.push(0);
+    cx.project()
+        .dir_mut(dir_id)
+        .props
+        .append_string(LEGACY_SUBDIRS_PROP.into(), &entry);
+    Ok(())
+}
+
+fn resolve_subdirectory_paths(
     cx: &mut Cx<'_>,
     source: &[u8],
     binary: Option<&[u8]>,
-    options: SubdirOptions,
-) -> CmdResult {
+) -> Result<(std::path::PathBuf, std::path::PathBuf), CmdError> {
     let src = normalized_path(&cx.resolve_path(source));
     if !cx
         .host()
@@ -136,28 +173,62 @@ fn run_subdirectory(
                     .concat(),
                 )
             })?;
-            base.join(relative)
+            normalized_path(&base.join(relative))
         }
     };
-    let bin_bytes = path::from_native_cmake(&bin);
-    if cx
-        .project()
-        .dirs()
-        .any(|(_, entry)| entry.binary_dir == bin_bytes)
-    {
-        let source_bytes = path::from_native_cmake(&src);
+    Ok((src, bin))
+}
+
+fn check_unique_binary_dir(
+    cx: &mut Cx<'_>,
+    source_bytes: &[u8],
+    bin_bytes: &[u8],
+) -> Result<(), CmdError> {
+    let already_used = cx.project().dirs().any(|(_, entry)| {
+        entry.binary_dir == bin_bytes
+            || entry
+                .props
+                .get(LEGACY_SUBDIRS_PROP)
+                .is_some_and(|raw| legacy_subdirs_reserves(raw.as_slice(), bin_bytes))
+    });
+    if already_used {
         return Err(crate::command_error(
             cx,
             [
                 b"The binary directory\n  ".as_slice(),
-                &bin_bytes,
+                bin_bytes,
                 b"\nis already used to build a source directory.  It cannot be used to build source directory\n  ",
-                &source_bytes,
+                source_bytes,
                 b"\nSpecify a unique binary directory name.",
             ]
             .concat(),
         ));
     }
+    Ok(())
+}
+
+fn legacy_subdirs_reserves(raw: &[u8], bin_bytes: &[u8]) -> bool {
+    let mut fields = raw.split(|&byte| byte == 0);
+    while let (Some(src), Some(bin), Some(_exclude), Some(_install_pos)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    {
+        if !src.is_empty() && bin == bin_bytes {
+            return true;
+        }
+    }
+    false
+}
+
+fn run_subdirectory(
+    cx: &mut Cx<'_>,
+    source: &[u8],
+    binary: Option<&[u8]>,
+    options: SubdirOptions,
+) -> CmdResult {
+    let (src, bin) = resolve_subdirectory_paths(cx, source, binary)?;
+    let bin_bytes = path::from_native_cmake(&bin);
+    let source_bytes = path::from_native_cmake(&src);
+    check_unique_binary_dir(cx, &source_bytes, &bin_bytes)?;
     cx.run_subdirectory(&src, &bin, options)?;
     Ok(Flow::Normal)
 }
@@ -476,4 +547,132 @@ fn link_libraries(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             }));
     }
     Ok(Flow::Normal)
+}
+
+#[cfg(test)]
+mod legacy_subdirs_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream};
+    use rcmake_model::DirId;
+
+    use crate::test_support::TestResult;
+
+    #[test]
+    fn subdirs_evaluates_after_parent_listfile_and_preserves_install_position() -> TestResult {
+        let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+        let source = root.join("src");
+        let binary = root.join("build");
+        let command = root.join("bin/cmake");
+        let host = Arc::new(PureHost::new(source.clone(), command.clone()));
+        host.seed_file(
+            &source.join("CMakeLists.txt"),
+            br#"
+cmake_minimum_required(VERSION 3.19)
+project(bullet_like NONE)
+subdirs(sub)
+set(INCLUDE_INSTALL_DIR include/bullet)
+install(FILES root.h DESTINATION ${INCLUDE_INSTALL_DIR})
+"#,
+        )?;
+        host.seed_file(
+            &source.join("sub/CMakeLists.txt"),
+            br#"
+if(NOT INCLUDE_INSTALL_DIR STREQUAL "include/bullet")
+  message(FATAL_ERROR "Child did not see late INCLUDE_INSTALL_DIR: '${INCLUDE_INSTALL_DIR}'")
+endif()
+install(FILES sub.h DESTINATION ${INCLUDE_INSTALL_DIR})
+"#,
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Configure,
+                root.join("share/cmake-4.5"),
+                command,
+                source.clone(),
+            ),
+            crate::register_all,
+        );
+        let outcome = interp.run_configure(&source, &binary, &[]);
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        let mut cx = interp.cx();
+        let model = cx.project();
+        let [child_id] = model.dir(DirId::ROOT).children.as_slice() else {
+            return Err("Expected one child directory".into());
+        };
+        assert_eq!(model.dir(*child_id).install_position, 0);
+        assert_eq!(model.installs.len(), 2);
+        assert_eq!(
+            model.installs[1].options.destination,
+            Some("include/bullet".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn subdirs_reserves_binary_dir_before_subsequent_add_subdirectory() -> TestResult {
+        let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+        let source = root.join("src");
+        let binary = root.join("build");
+        let command = root.join("bin/cmake");
+        let host = Arc::new(PureHost::new(source.clone(), command.clone()));
+        host.seed_file(
+            &source.join("CMakeLists.txt"),
+            br#"
+cmake_minimum_required(VERSION 3.19)
+project(reserve_like NONE)
+subdirs(child)
+add_subdirectory(other child)
+"#,
+        )?;
+        host.seed_file(
+            &source.join("child/CMakeLists.txt"),
+            b"set(CHILD_RAN TRUE CACHE BOOL \"\")\n",
+        )?;
+        host.seed_file(
+            &source.join("other/CMakeLists.txt"),
+            b"set(OTHER_RAN TRUE CACHE BOOL \"\")\n",
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Configure,
+                root.join("share/cmake-4.5"),
+                command,
+                source.clone(),
+            ),
+            crate::register_all,
+        );
+        let outcome = interp.run_configure(&source, &binary, &[]);
+        assert_ne!(outcome.exit_code, 0);
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(
+            stderr.contains("add_subdirectory"),
+            "expected duplicate error on add_subdirectory, got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("is already used to build a source directory"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("/src/other"),
+            "expected duplicate error to name second source dir, got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("/src/child"),
+            "deferred subdirs(child) should not fail on its own reservation:\n{stderr}"
+        );
+        let mut cx = interp.cx();
+        assert_eq!(cx.var_or_empty(b"OTHER_RAN"), "");
+        assert_eq!(cx.project().dirs().count(), 1);
+        Ok(())
+    }
 }

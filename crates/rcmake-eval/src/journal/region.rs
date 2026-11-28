@@ -19,7 +19,7 @@ pub(super) const MAX_INPUTS: usize = 50_000;
 pub(super) const MAX_EFFECTS: usize = 200_000;
 
 /// An evaluation unit that can have its own journal.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RegionKind {
     /// Whole configure.
     Configure,
@@ -38,7 +38,7 @@ pub enum RegionKind {
 }
 
 /// Stable identity of a region across configure runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RegionKey {
     /// Absolute binary directory of the region.
     pub binary_dir: PathBuf,

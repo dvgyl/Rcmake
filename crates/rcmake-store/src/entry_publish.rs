@@ -58,7 +58,10 @@ impl Store<'_> {
             let previous = self.read_entry::<Entry<P>>(domain, key, &path, false)?;
             let mut config = self.config.clone();
             config.mode = StoreMode::ReadOnly;
-            let mut reader = Self::new(self.host, config)?;
+            let mut reader = match self.session {
+                Some(session) => Self::with_session(self.host, config, session),
+                None => Self::new(self.host, config)?,
+            };
             reader.memo = self.memo;
             if let CacheRead::Found(previous) = &previous
                 && reader.entry_matches(previous, blob_limit(), false)?

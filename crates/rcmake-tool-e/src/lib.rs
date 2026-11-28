@@ -240,7 +240,7 @@ fn checksum(algo: HashAlgo, args: &[BString], cx: &ToolCtx<'_>) -> i32 {
         match result {
             Ok(digest) => write(cx, Stream::Stdout, &[digest.as_bytes(), b"  ", file, b"\n"]),
             Err(err) => {
-                let reason = if file.is_empty() {
+                let reason = if file.is_empty() || err.kind == std::io::ErrorKind::NotFound {
                     "No such file or directory"
                 } else {
                     &err.os_message

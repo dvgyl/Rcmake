@@ -2,7 +2,7 @@ use super::{ROOT, TEST_FRONTEND, new_interp, register_test, run, t_noop, t_set};
 use crate::{CmdFlags, Interp, InterpConfig, RunMode};
 use rcmake_base::BString;
 use rcmake_host::{PureHost, Stream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[test]
@@ -283,4 +283,65 @@ fn registry_add_replaces_earlier_registrations() {
     };
     assert!(!got.scriptable);
     assert!(std::ptr::fn_addr_eq(func, t_set as crate::BuiltinFn));
+}
+
+#[test]
+fn rule_configurator_directory_scope_preserves_command_backtrace() {
+    let (mut interp, host) = new_interp(&[], RunMode::Configure);
+    let root = Path::new(ROOT);
+    host.seed_file(&root.join("CMakeLists.txt"), b"include(defs.cmake)\n")
+        .expect("seed CMakeLists.txt");
+    host.seed_file(
+        &root.join("defs.cmake"),
+        concat!(
+            "function(inner)\n",
+            "  message(SEND_ERROR \"inside inner\")\n",
+            "endfunction()\n",
+            "function(cfg)\n",
+            "  message(SEND_ERROR \"inside cfg\")\n",
+            "  cmake_language(CALL inner)\n",
+            "endfunction()\n",
+            "function(needs_arg required)\n",
+            "endfunction()\n",
+        )
+        .as_bytes(),
+    )
+    .expect("seed defs.cmake");
+    let outcome = interp.run_configure(root, &root.join("build"), &[]);
+    assert_eq!(outcome.exit_code, 0);
+
+    let mut cx = interp.cx();
+    let status = cx.with_directory_scope(rcmake_model::DirId::ROOT, |cx| {
+        cx.global().props.set(
+            b"\0RCMAKE_IN_RULE_CONFIGURATOR".as_slice().into(),
+            "1".into(),
+        );
+        let first = cx.call_command_in_current_frame(b"cfg", Vec::new());
+        let second = cx.call_command_in_current_frame(b"needs_arg", Vec::new());
+        cx.global().props.unset(b"\0RCMAKE_IN_RULE_CONFIGURATOR");
+        (first, second)
+    });
+    assert!(status.0.is_ok());
+    assert!(matches!(status.1, Err(crate::CmdError::Reported)));
+
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains(
+            "CMake Error at defs.cmake:5 (message):\n  inside cfg\nCall Stack (most recent call first):\n  CMakeLists.txt\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "CMake Error at defs.cmake:2 (message):\n  inside inner\nCall Stack (most recent call first):\n  defs.cmake:6 (inner)\n  defs.cmake:6 (cmake_language)\n  CMakeLists.txt\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "CMake Error in CMakeLists.txt:\n  needs_arg Function invoked with incorrect arguments for function named:\n  needs_arg\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("(cfg)"), "{stderr}");
 }

@@ -148,6 +148,7 @@ pub(super) fn edit(
                 stderr: Output::Capture,
                 timeout: Some(Duration::from_secs(60)),
                 tee: false,
+                default_error_mode: false,
             },
             &mut |_, _| {},
         )

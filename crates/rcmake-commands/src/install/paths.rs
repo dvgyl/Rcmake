@@ -6,7 +6,11 @@ use rcmake_host::{
 };
 use rcmake_model::{BT, InstallKind, InstallOptions};
 
-use super::{Args, Result, common, fail, permissions, type_destination, unknown, value, values};
+use super::{Args, Result, common, fail, keyword, permissions, type_destination, unknown, value};
+
+fn read_inputs<'a>(args: &mut Args<'a>, signature: &[u8]) -> Vec<&'a [u8]> {
+    std::iter::from_fn(|| args.next_if(|token| *token != signature && !keyword(token))).collect()
+}
 
 pub(super) fn parse(
     cx: &mut Cx<'_>,
@@ -14,7 +18,7 @@ pub(super) fn parse(
     args: &mut Args<'_>,
     options: &mut InstallOptions,
 ) -> Result<InstallKind> {
-    let inputs = values(args);
+    let mut inputs = read_inputs(args, signature);
     let directory = signature == b"DIRECTORY";
     let mut install_type = None;
     let mut rule = false;
@@ -42,6 +46,13 @@ pub(super) fn parse(
                 ));
             }
             _ if rule => return Err(unknown(key)),
+            key if key == signature => {
+                inputs.extend(read_inputs(args, signature));
+            }
+            b"DESTINATION"
+                if args
+                    .peek()
+                    .is_none_or(|next| *next == signature || keyword(next)) => {}
             b"TYPE" => {
                 let value = value(args, key)?;
                 install_type = if value.is_empty() && !directory {

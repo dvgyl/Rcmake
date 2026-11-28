@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use rcmake_base::Limits;
 use rcmake_host::{
-    FileKind, FileLockGuard, Follow, Host, HostError, HostResult, Metadata, ReadRange, WriteMode,
-    path,
+    FileKind, FileLockGuard, FileTime, Follow, Host, HostError, HostResult, Metadata, ReadRange,
+    WriteMode, path,
 };
 use rcmake_json::{
     FieldError, FromJson, ReadOptions, ToJson, Value, deny_unknown, object, parse, req,
@@ -93,6 +93,8 @@ pub struct StoreConfig {
     pub blob_grace: Duration,
     /// Access mode.
     pub mode: StoreMode,
+    /// Minimum entry age before a cache hit updates its modification time.
+    hit_touch_interval: Duration,
 }
 
 impl StoreConfig {
@@ -103,7 +105,23 @@ impl StoreConfig {
             max_bytes: 2 * 1024 * 1024 * 1024,
             blob_grace: Duration::from_secs(3600),
             mode: StoreMode::ReadWrite,
+            hit_touch_interval: Duration::ZERO,
         }
+    }
+
+    /// Return the minimum entry age before a cache hit updates its modification time.
+    #[must_use]
+    pub const fn hit_touch_interval(&self) -> Duration {
+        self.hit_touch_interval
+    }
+
+    /// Set the minimum entry age before a cache hit updates its modification time.
+    ///
+    /// `Duration::ZERO` updates the modification time on every hit.
+    #[must_use]
+    pub const fn with_hit_touch_interval(mut self, interval: Duration) -> Self {
+        self.hit_touch_interval = interval;
+        self
     }
 
     /// Select the system cache directory or use the RCMAKE_CACHE_DIR override.
@@ -129,7 +147,8 @@ impl StoreConfig {
                     .or_else(|| home().map(|dir| dir.join(".cache")))
                     .map(|dir| dir.join("rcmake")),
             });
-        let mut config = Self::new(root.unwrap_or_default());
+        let mut config =
+            Self::new(root.unwrap_or_default()).with_hit_touch_interval(Duration::from_secs(3600));
         if !config.root.is_absolute() {
             config.mode = StoreMode::Off;
         }
@@ -215,11 +234,54 @@ impl<T: FromJson> FromJson for Record<T> {
     }
 }
 
+/// Session-scoped state shared across repeated [`Store`] opens for the same cache root.
+///
+/// Caches the canonicalized root path, the verified private-directory identity (still
+/// re-checked via [`PrivateDir::recheck`] on every operation), and whether
+/// `rename_noreplace` required fallback.
+#[derive(Debug)]
+pub struct StoreSession {
+    configured_root: PathBuf,
+    root: PathBuf,
+    rename_fallback: AtomicBool,
+    root_dir: Mutex<Option<PrivateDir>>,
+}
+
+impl StoreSession {
+    /// Create a session for `root`, resolving symbolic links once via [`canonical_path`].
+    pub fn new(host: &dyn Host, root: &Path) -> HostResult<Self> {
+        if !root.is_absolute() {
+            return Err(HostError::not_absolute(root.to_path_buf()));
+        }
+        Ok(Self {
+            configured_root: root.to_path_buf(),
+            root: canonical_path(host, root),
+            rename_fallback: AtomicBool::new(false),
+            root_dir: Mutex::new(None),
+        })
+    }
+
+    /// Return the canonicalized cache root directory.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Return `true` when `configured_root` still matches this session's spelling and
+    /// resolves to the same canonical cache directory without symbolic-link drift.
+    #[must_use]
+    pub fn matches_configured_root(&self, host: &dyn Host, configured_root: &Path) -> bool {
+        self.configured_root == configured_root
+            && canonical_path(host, configured_root) == self.root
+    }
+}
+
 /// A cache that uses a host for all file, time, and environment operations.
 pub struct Store<'a> {
     host: &'a dyn Host,
     config: StoreConfig,
     memo: Option<&'a TraceMemo>,
+    session: Option<&'a StoreSession>,
     rename_fallback: AtomicBool,
     /// Identity of the root after it passed the privacy checks. Each use checks it again.
     root_dir: Mutex<Option<PrivateDir>>,
@@ -267,11 +329,37 @@ impl<'a> Store<'a> {
             host,
             config,
             memo: None,
+            session: None,
             rename_fallback: AtomicBool::new(false),
             root_dir: Mutex::new(None),
             #[cfg(test)]
             test_hook: None,
         })
+    }
+
+    /// Open a store reusing session state for the same cache root.
+    ///
+    /// Skips repeated root canonicalization and initial ancestor-chain privacy walks while
+    /// still re-verifying the live root directory identity on every read and write.
+    #[must_use]
+    pub fn with_session(
+        host: &'a dyn Host,
+        mut config: StoreConfig,
+        session: &'a StoreSession,
+    ) -> Self {
+        if config.mode != StoreMode::Off {
+            config.root = session.root.clone();
+        }
+        Self {
+            host,
+            config,
+            memo: None,
+            session: Some(session),
+            rename_fallback: AtomicBool::new(false),
+            root_dir: Mutex::new(None),
+            #[cfg(test)]
+            test_hook: None,
+        }
     }
 
     /// Share file digests with the other trace checks in this session.
@@ -482,8 +570,8 @@ impl<'a> Store<'a> {
             return Ok(None);
         }
         let path = self.entry_path(domain, key);
-        let Some(entry) = self.read_with_cleanup(&path, diagnose, || {
-            self.read_entry::<Entry<T>>(domain, key, &path, diagnose)
+        let Some((entry, mtime)) = self.read_with_cleanup(&path, diagnose, || {
+            self.read_entry_timed::<Entry<T>>(domain, key, &path, diagnose)
         })?
         else {
             return Ok(None);
@@ -499,7 +587,10 @@ impl<'a> Store<'a> {
             return Ok(None);
         }
         if self.writable() {
-            let _ = self.host.set_times(&path, None, Some(self.host.now()));
+            let now = self.host.now();
+            if should_touch_mtime(now, mtime, self.config.hit_touch_interval) {
+                let _ = self.host.set_times(&path, None, Some(now));
+            }
         }
         Ok(Some(entry))
     }
@@ -575,11 +666,18 @@ impl<'a> Store<'a> {
     }
 
     fn admitted_root(&self) -> Option<PrivateDir> {
-        *self.root_dir.lock().unwrap_or_else(PoisonError::into_inner)
+        let lock = self.session.map_or(&self.root_dir, |s| &s.root_dir);
+        *lock.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn admit_root(&self, dir: PrivateDir) {
-        *self.root_dir.lock().unwrap_or_else(PoisonError::into_inner) = Some(dir);
+        let lock = self.session.map_or(&self.root_dir, |s| &s.root_dir);
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(dir);
+    }
+
+    fn rename_fallback_flag(&self) -> &AtomicBool {
+        self.session
+            .map_or(&self.rename_fallback, |s| &s.rename_fallback)
     }
 
     /// Check that only the current user can change or replace the existing cache root.
@@ -589,6 +687,17 @@ impl<'a> Store<'a> {
     /// the root does not exist.
     fn trust_root(&self) -> HostResult<()> {
         let root = &self.config.root;
+        if let Some(session) = self.session
+            && canonical_path(self.host, &session.configured_root) != session.root
+        {
+            return Err(io_at(
+                io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "Refusing cache root because its symbolic link target changed after session start.",
+                ),
+                &session.configured_root,
+            ));
+        }
         match self.admitted_root() {
             Some(dir) => dir.recheck(self.host, root).map(|_| ()),
             None => {
@@ -645,7 +754,21 @@ impl<'a> Store<'a> {
         path: &Path,
         diagnose: bool,
     ) -> HostResult<CacheRead<T>> {
-        self.read_checked(
+        Ok(match self.read_entry_timed(domain, key, path, diagnose)? {
+            CacheRead::Missing => CacheRead::Missing,
+            CacheRead::Invalid => CacheRead::Invalid,
+            CacheRead::Found((entry, _)) => CacheRead::Found(entry),
+        })
+    }
+
+    fn read_entry_timed<T: FromJson>(
+        &self,
+        domain: Domain,
+        key: Digest,
+        path: &Path,
+        diagnose: bool,
+    ) -> HostResult<CacheRead<(T, FileTime)>> {
+        self.read_checked_timed(
             path,
             ENTRY_MAGIC,
             ENTRY_LIMIT,
@@ -666,9 +789,20 @@ impl<'a> Store<'a> {
         limit: usize,
         diagnose: bool,
     ) -> HostResult<CacheRead<Vec<u8>>> {
-        self.read_checked(path, BLOB_MAGIC, limit, blob_limit(), diagnose, |bytes| {
-            (Digest::hash(&bytes) == digest).then_some(bytes)
-        })
+        Ok(
+            match self.read_checked_timed(
+                path,
+                BLOB_MAGIC,
+                limit,
+                blob_limit(),
+                diagnose,
+                |bytes| (Digest::hash(&bytes) == digest).then_some(bytes),
+            )? {
+                CacheRead::Missing => CacheRead::Missing,
+                CacheRead::Invalid => CacheRead::Invalid,
+                CacheRead::Found((bytes, _)) => CacheRead::Found(bytes),
+            },
+        )
     }
 
     fn lookup_metadata(&self, path: &Path, diagnose: bool) -> HostResult<Option<Metadata>> {
@@ -763,7 +897,7 @@ impl<'a> Store<'a> {
         self.host.create_dir_all(path)
     }
 
-    fn read_checked<T>(
+    fn read_checked_timed<T>(
         &self,
         path: &Path,
         magic: &[u8; 8],
@@ -771,7 +905,7 @@ impl<'a> Store<'a> {
         store_limit: usize,
         diagnose: bool,
         validate: impl FnOnce(Vec<u8>) -> Option<T>,
-    ) -> HostResult<CacheRead<T>> {
+    ) -> HostResult<CacheRead<(T, FileTime)>> {
         let Some(stat) = self.lookup_metadata(path, diagnose)? else {
             return Ok(CacheRead::Missing);
         };
@@ -808,7 +942,9 @@ impl<'a> Store<'a> {
         } else {
             None
         };
-        Ok(value.map_or(CacheRead::Invalid, CacheRead::Found))
+        Ok(value.map_or(CacheRead::Invalid, |item| {
+            CacheRead::Found((item, stat.mtime))
+        }))
     }
 
     fn read_with_cleanup<T>(
@@ -961,10 +1097,10 @@ impl LockedStore<'_, '_> {
         no_replace: impl FnOnce() -> HostResult<()>,
     ) -> HostResult<()> {
         let store = self.store;
-        if !store.rename_fallback.load(Ordering::Relaxed) {
+        if !store.rename_fallback_flag().load(Ordering::Relaxed) {
             match no_replace() {
                 Err(error) if error.kind == ErrorKind::Unsupported => {
-                    store.rename_fallback.store(true, Ordering::Relaxed);
+                    store.rename_fallback_flag().store(true, Ordering::Relaxed);
                 }
                 result => return result,
             }
@@ -1042,6 +1178,16 @@ impl Drop for StagingFile<'_> {
             let _ = self.host.remove_file(self.path);
         }
     }
+}
+
+fn should_touch_mtime(now: FileTime, mtime: FileTime, interval: Duration) -> bool {
+    if interval.is_zero() {
+        return true;
+    }
+    let now_ns = i128::from(now.secs) * 1_000_000_000 + i128::from(now.nanos);
+    let mtime_ns = i128::from(mtime.secs) * 1_000_000_000 + i128::from(mtime.nanos);
+    let elapsed_ns = now_ns.saturating_sub(mtime_ns);
+    elapsed_ns >= i128::try_from(interval.as_nanos()).unwrap_or(i128::MAX)
 }
 
 fn blob_limit() -> usize {

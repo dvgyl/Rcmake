@@ -642,6 +642,20 @@ fn checks_targets_and_link_signatures() -> TestResult {
         let words = diagnostic.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(words.contains(expected), "{diagnostic}");
     }
+    let (host, _) = configure(
+        "add_library(t STATIC)\ntarget_link_libraries(t d)\ntarget_link_libraries(t PRIVATE e)",
+        &[],
+        1,
+    )?;
+    let diagnostic = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        diagnostic.contains("The uses of the plain signature are here:\n\n   * CMakeLists.txt:3"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("The uses of the plain signature are here:\n\n\n"),
+        "{diagnostic}"
+    );
     Ok(())
 }
 

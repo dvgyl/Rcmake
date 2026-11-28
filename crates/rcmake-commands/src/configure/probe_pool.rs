@@ -60,6 +60,7 @@ pub(crate) fn physical_memory(host: &dyn Host) -> u64 {
         stderr: Output::Null,
         timeout: Some(Duration::from_secs(1)),
         tee: false,
+        default_error_mode: false,
     };
     host.run_bounded(&request, 64)
         .ok()
@@ -802,6 +803,7 @@ fn prepare(
         stderr: Output::SharedWithStdout,
         timeout: Some(remaining.min(plan.timeout)),
         tee: false,
+        default_error_mode: false,
     })
 }
 

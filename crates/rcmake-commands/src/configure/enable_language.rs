@@ -21,8 +21,11 @@ use rcmake_base::{BString, CMAKE_VERSION_STR};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, IncludeOptions};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{FileKind, Follow, ReadRange, Stream, WriteMode, path};
-use rcmake_model::{CacheEntry, CacheType, GeneratorKind};
+use rcmake_host::{
+    CommandSpec, FileKind, Follow, Input, Output, ProcessResult, ReadRange, RunRequest, Stream,
+    WriteMode, path,
+};
+use rcmake_model::{CacheEntry, CacheType, GeneratorKind, VsVersion};
 
 use crate::policy_misc::properties::known_features;
 
@@ -164,6 +167,10 @@ pub(crate) fn enable_languages(
         .props
         .get(LANGUAGES_IN_PROGRESS)
         .is_some_and(|value| !value.is_empty());
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    if !nested {
+        super::try_compile::begin_probe_prelude(cx);
+    }
     cx.begin_replay_setup();
     let result = if nested {
         setup_languages(cx, languages, optional)
@@ -177,6 +184,13 @@ pub(crate) fn enable_languages(
 fn setup_languages(cx: &mut Cx<'_>, languages: &[BString], optional: bool) -> Result<(), CmdError> {
     let generator = generator(cx);
     super::generator_env::initialize(cx, generator)?;
+    if let GeneratorKind::VisualStudio(version) = generator {
+        init_vs_ide_vars(cx, version);
+    }
+    if generator == GeneratorKind::NMakeMakefiles {
+        cx.set_var(b"CMAKE_GENERATOR_CC", "cl".into());
+        cx.set_var(b"CMAKE_GENERATOR_CXX", "cl".into());
+    }
     cx.set_var(b"CMAKE_CFG_INTDIR", generator.cfg_int_dir().into());
 
     let mut unique: Vec<BString> = Vec::new();
@@ -227,19 +241,34 @@ fn setup_languages(cx: &mut Cx<'_>, languages: &[BString], optional: bool) -> Re
         cx.issue(MessageKind::Error, Effect::Fatal, None, body.into());
         return Err(CmdError::Reported);
     }
-    let active = list::join(in_progress.iter().chain(&unique));
-    cx.global().props.set(LANGUAGES_IN_PROGRESS.into(), active);
-    // RC is enabled after the other languages so that an implicit RC enable does not
-    // look like a recursive enable_language(RC).
+    // Mark all requested languages active before reading the toolchain file so a toolchain
+    // calling `enable_language(RC)` during `project(P C RC)` is caught as recursive.
+    // Once system/toolchain determination completes, `RC` is enabled in a second pass after
+    // non-RC languages so platform modules (e.g. `Windows-MSVC.cmake`) can implicitly call
+    // `enable_language(RC)` cleanly.
     let (rc, other): (Vec<BString>, Vec<BString>) =
         unique.into_iter().partition(|lang| lang == b"RC");
     let mut result = Ok(());
-    for group in [other, rc] {
+    if !other.is_empty() && !rc.is_empty() {
+        let all_active = list::join(in_progress.iter().chain(&other).chain(&rc));
+        let other_active = list::join(in_progress.iter().chain(&other));
+        cx.global()
+            .props
+            .set(LANGUAGES_IN_PROGRESS.into(), all_active);
+        result = Bootstrap::new(cx, generator, optional).run(cx, other, Some(&other_active));
+        if result.is_ok() {
+            let rc_active = list::join(in_progress.iter().chain(&rc));
+            cx.global()
+                .props
+                .set(LANGUAGES_IN_PROGRESS.into(), rc_active);
+            result = Bootstrap::new(cx, generator, optional).run(cx, rc, None);
+        }
+    } else {
+        let group = if !other.is_empty() { other } else { rc };
         if !group.is_empty() {
-            result = Bootstrap::new(cx, generator, optional).run(cx, group);
-            if result.is_err() {
-                break;
-            }
+            let active = list::join(in_progress.iter().chain(&group));
+            cx.global().props.set(LANGUAGES_IN_PROGRESS.into(), active);
+            result = Bootstrap::new(cx, generator, optional).run(cx, group, None);
         }
     }
     cx.global()
@@ -295,7 +324,12 @@ impl Bootstrap {
         }
     }
 
-    fn run(&self, cx: &mut Cx<'_>, mut languages: Vec<BString>) -> Result<(), CmdError> {
+    fn run(
+        &self,
+        cx: &mut Cx<'_>,
+        mut languages: Vec<BString>,
+        post_system_in_progress: Option<&BString>,
+    ) -> Result<(), CmdError> {
         if !self.generator.multi_config()
             && !self.in_try_compile
             && !cx.var_defined(b"CMAKE_BUILD_TYPE")
@@ -339,6 +373,11 @@ impl Bootstrap {
         }
 
         self.determine_system(cx)?;
+        if let Some(active) = post_system_in_progress {
+            cx.global()
+                .props
+                .set(LANGUAGES_IN_PROGRESS.into(), active.clone());
+        }
 
         let mut states = Vec::with_capacity(languages.len());
         for name in languages {
@@ -476,8 +515,66 @@ impl Bootstrap {
         ) {
             let program = cx.var_or_empty(b"CMAKE_MAKE_PROGRAM");
             self.verify_ninja_program(cx, &program)?;
+        } else if self.generator == GeneratorKind::NMakeMakefiles {
+            let program = cx.var_or_empty(b"CMAKE_MAKE_PROGRAM");
+            self.verify_nmake_program(cx, &program)?;
         }
         Ok(())
+    }
+
+    /// `cmGlobalNMakeMakefileGenerator::FindMakeProgram`: verify that the selected
+    /// `nmake` executable runs `-?`.
+    fn verify_nmake_program(&self, cx: &mut Cx<'_>, program: &BString) -> Result<(), CmdError> {
+        if !cx.host().supports_process_execution() {
+            return Ok(());
+        }
+        let request = rcmake_host::RunRequest {
+            pipeline: vec![rcmake_host::CommandSpec {
+                program: program.clone(),
+                args: vec!["-?".into()],
+            }],
+            cwd: cx.current_binary_dir(),
+            env: cx.host().env_all(),
+            stdin: rcmake_host::Input::Null,
+            stdout: rcmake_host::Output::Capture,
+            stderr: rcmake_host::Output::Capture,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            tee: false,
+            default_error_mode: false,
+        };
+        let error = match cx.host().run_bounded(&request, 64 * 1024) {
+            Ok(output) if output.results == [rcmake_host::ProcessResult::Exited(0)] => {
+                return Ok(());
+            }
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stderr);
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    trimmed.to_owned()
+                } else {
+                    let stdout_text = String::from_utf8_lossy(&output.stdout);
+                    let stdout_trimmed = stdout_text.trim();
+                    if !stdout_trimmed.is_empty() {
+                        stdout_trimmed.to_owned()
+                    } else {
+                        match output.results.as_slice() {
+                            [rcmake_host::ProcessResult::SpawnFailed(err)] => err.to_string(),
+                            _ => format!("process exited with {:?}", output.results),
+                        }
+                    }
+                }
+            }
+            Err(err)
+                if err.kind == std::io::ErrorKind::Unsupported
+                    && err.os_message == "No command handler is registered" =>
+            {
+                return Ok(());
+            }
+            Err(err) => err.to_string(),
+        };
+        let body = format!("Running\n '{program}' '-?'\nfailed with:\n {error}");
+        cx.issue(MessageKind::Error, Effect::Fatal, None, body.into());
+        Err(CmdError::Reported)
     }
 
     /// Warm the probe memo in the background while the compilers are identified.
@@ -566,6 +663,7 @@ impl Bootstrap {
             stderr: rcmake_host::Output::Capture,
             timeout: Some(std::time::Duration::from_secs(5)),
             tee: false,
+            default_error_mode: false,
         };
         let error = match cx.host().run_bounded(&request, 4096) {
             Ok(output) if output.results == [rcmake_host::ProcessResult::Exited(0)] => {
@@ -643,6 +741,7 @@ impl Bootstrap {
                      CMake",
                 ));
             }
+            let explicit_compiler = !is_off(&cx.var_or_empty(&lang_var(lang, b"_COMPILER")));
             let determine = cat(&[b"CMakeDetermine", lang, b"Compiler.cmake"]);
             cx.note_replay_determination();
             #[cfg(all(feature = "native", any(unix, windows)))]
@@ -651,6 +750,12 @@ impl Bootstrap {
             self.export_compiler_env(cx, lang);
             if !read_list_file(cx, &compiler_file)? {
                 return Err(missing_module(cx, &compiler_file));
+            }
+            if lang == b"CSharp"
+                && !explicit_compiler
+                && is_off(&cx.var_or_empty(&lang_var(lang, b"_COMPILER")))
+            {
+                discover_csharp_compiler_fallback(cx, &self.root_bin);
             }
             record_identification(cx, &self.root_bin, lang);
             set_language_enabled(cx, lang);
@@ -699,7 +804,11 @@ impl Bootstrap {
                     let env_var = cx.var(&lang_var(&lang, b"_COMPILER_ENV_VAR"));
                     let body = cat(&[
                         &problem,
-                        &compiler_advice(&lang, env_var.as_deref().map(Vec::as_slice)),
+                        &compiler_advice(
+                            self.generator,
+                            &lang,
+                            env_var.as_deref().map(Vec::as_slice),
+                        ),
                     ]);
                     cx.issue(MessageKind::Error, Effect::SetError, None, body);
                     fatal = true;
@@ -747,6 +856,7 @@ impl Bootstrap {
         }
 
         if cx.var_is_on(&works) && cx.var_is_on(&lang_var(&lang, b"_USE_LINKER_INFORMATION")) {
+            ensure_linker_identity(cx, &lang);
             if !cx.var_defined(&lang_var(&lang, b"_LINKER_INFORMATION_LOADED")) {
                 let name = cat(&[b"CMake", &lang, b"LinkerInformation.cmake"]);
                 let file = modules_file(cx, &name)
@@ -1025,12 +1135,22 @@ fn missing_module(cx: &mut Cx<'_>, name: &[u8]) -> CmdError {
     )
 }
 
-/// `cmGlobalGenerator::PrintCompilerAdvice`.
-fn compiler_advice(lang: &[u8], env_var: Option<&[u8]>) -> BString {
+/// `cmGlobalGenerator::PrintCompilerAdvice` (including NMake `cl` advice).
+fn compiler_advice(generator: GeneratorKind, lang: &[u8], env_var: Option<&[u8]>) -> BString {
+    let nmake_prefix: &[u8] =
+        if generator == GeneratorKind::NMakeMakefiles && matches!(lang, b"C" | b"CXX") {
+            b"To use the NMake generator with Visual C++, cmake must be run from a shell that can \
+              use the compiler cl from the command line. This environment is unable to invoke the \
+              cl compiler. To fix this problem, run cmake from the Visual Studio Command Prompt \
+              (vcvarsall.bat).\n"
+        } else {
+            b""
+        };
     let either = env_var.map_or_else(Vec::new, |var| {
         cat(&[b"either the environment variable \"", var, b"\" or "]).to_vec()
     });
     cat(&[
+        nmake_prefix,
         b"Tell CMake where to find the compiler by setting ",
         &either,
         b"the CMake cache entry CMAKE_",
@@ -1141,6 +1261,381 @@ fn cat(parts: &[&[u8]]) -> BString {
     parts.concat().into()
 }
 
+/// Populate Visual Studio IDE generator variables that CMake's `cmGlobalVisualStudio10Generator`
+/// establishes before language determination runs (`CMAKE_MSVCIDE_RUN_PATH`,
+/// `CMAKE_VS_MSBUILD_COMMAND`, and `CMAKE_VS_TARGET_FRAMEWORK_VERSION`).
+fn init_vs_ide_vars(cx: &mut Cx<'_>, version: VsVersion) {
+    if !cx.var_defined(b"CMAKE_MSVCIDE_RUN_PATH")
+        && let Some(run_path) = cx.host().env_get(b"CMAKE_MSVCIDE_RUN_PATH")
+    {
+        add_cache(
+            cx,
+            b"CMAKE_MSVCIDE_RUN_PATH",
+            run_path,
+            CacheType::String,
+            "Saved environment variable CMAKE_MSVCIDE_RUN_PATH",
+        );
+    }
+    if cx.var_or_empty(b"CMAKE_VS_MSBUILD_COMMAND").is_empty()
+        && let Some(make) = cx.var(b"CMAKE_MAKE_PROGRAM").filter(|v| !is_off(v))
+    {
+        cx.set_var(b"CMAKE_VS_MSBUILD_COMMAND", make);
+    }
+    if !cx.var_defined(b"CMAKE_VS_TARGET_FRAMEWORK_VERSION")
+        && matches!(version, VsVersion::Vs17 | VsVersion::Vs18)
+    {
+        cx.set_var(b"CMAKE_VS_TARGET_FRAMEWORK_VERSION", "v4.7.2".into());
+    }
+}
+
+/// Discover `csc.exe` from the selected Visual Studio / MSBuild installation, `.NET Framework`,
+/// or `PATH` when MSBuild's `CompilerIdCSharp.csproj` probe did not populate
+/// `CMAKE_CSharp_COMPILER`, and persist the compiler identification file.
+fn discover_csharp_compiler_fallback(cx: &mut Cx<'_>, root_bin: &[u8]) {
+    let Some(compiler_path) = find_csharp_compiler(cx) else {
+        return;
+    };
+    let compiler = path::from_native_cmake(&compiler_path);
+    add_cache(
+        cx,
+        b"CMAKE_CSharp_COMPILER",
+        compiler.clone(),
+        CacheType::Filepath,
+        "C# compiler",
+    );
+    cx.set_var(b"CMAKE_CSharp_COMPILER", compiler.clone());
+
+    let mut compiler_id = cx.var_or_empty(b"CMAKE_CSharp_COMPILER_ID");
+    if compiler_id.is_empty() {
+        compiler_id = "Microsoft Visual Studio".into();
+        cx.set_var(b"CMAKE_CSharp_COMPILER_ID", compiler_id.clone());
+    }
+    let mut compiler_version = cx.var_or_empty(b"CMAKE_CSharp_COMPILER_VERSION");
+    if compiler_version.is_empty()
+        && let Some(version) = probe_csharp_compiler_version(cx, &compiler)
+    {
+        compiler_version = version;
+        cx.set_var(b"CMAKE_CSharp_COMPILER_VERSION", compiler_version.clone());
+    }
+    cx.set_var(b"CMAKE_CSharp_COMPILER_LOADED", "1".into());
+    cx.set_var(b"CMAKE_CSharp_COMPILER_ID_RUN", "1".into());
+    cx.set_var(b"CMAKE_CSharp_SOURCE_FILE_EXTENSIONS", "cs".into());
+    cx.set_var(
+        b"CMAKE_CSharp_IGNORE_EXTENSIONS",
+        "inl;h;hpp;HPP;H;o;O;obj;OBJ;def;DEF;rc;RC".into(),
+    );
+
+    let compiler_file = path::to_native(&cat(&[root_bin, b"/CMakeCSharpCompiler.cmake"]));
+    let works = cx.var_or_empty(b"CMAKE_CSharp_COMPILER_WORKS");
+    let content = format!(
+        "set(CMAKE_CSharp_COMPILER \"{compiler}\")\n\
+         set(CMAKE_CSharp_COMPILER_ID \"{compiler_id}\")\n\
+         set(CMAKE_CSharp_COMPILER_VERSION \"{compiler_version}\")\n\n\
+         set(CMAKE_CSharp_COMPILER_LOADED 1)\n\
+         set(CMAKE_CSharp_COMPILER_WORKS \"{works}\")\n\n\
+         set(CMAKE_CSharp_COMPILER_ID_RUN \"1\")\n\
+         set(CMAKE_CSharp_IGNORE_EXTENSIONS \"inl;h;hpp;HPP;H;o;O;obj;OBJ;def;DEF;rc;RC\")\n\
+         set(CMAKE_CSharp_SOURCE_FILE_EXTENSIONS \"cs\")\n"
+    );
+    let _ = cx
+        .host()
+        .write(&compiler_file, content.as_bytes(), WriteMode::Truncate);
+}
+
+fn find_csharp_compiler(cx: &mut Cx<'_>) -> Option<PathBuf> {
+    let host = cx.host();
+    let is_file = |candidate: &Path| {
+        host.metadata(candidate, Follow::Yes)
+            .is_ok_and(|meta| meta.kind == FileKind::File)
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for var in [
+        b"CMAKE_VS_MSBUILD_COMMAND".as_slice(),
+        b"CMAKE_MAKE_PROGRAM",
+    ] {
+        let msbuild = cx.var_or_empty(var);
+        if msbuild.is_empty() || is_off(&msbuild) {
+            continue;
+        }
+        let native = path::to_native(&msbuild);
+        if let Some(dir) = native.parent() {
+            candidates.push(dir.join("Roslyn/csc.exe"));
+            if let Some(parent) = dir.parent() {
+                candidates.push(parent.join("Roslyn/csc.exe"));
+            }
+            candidates.push(dir.join("csc.exe"));
+        }
+    }
+    let instance = cx.var_or_empty(b"CMAKE_GENERATOR_INSTANCE");
+    if let Some(dir) = instance
+        .split(|&byte| byte == b',')
+        .next()
+        .filter(|dir| !dir.is_empty() && !dir.contains(&b'='))
+    {
+        let base = path::to_native(dir);
+        candidates.push(base.join("MSBuild/Current/Bin/Roslyn/csc.exe"));
+        candidates.push(base.join("MSBuild/Current/Bin/amd64/Roslyn/csc.exe"));
+        candidates.push(base.join("MSBuild/15.0/Bin/Roslyn/csc.exe"));
+    }
+    if let Some(vs_dir) = host.env_get(b"VSINSTALLDIR").filter(|dir| !dir.is_empty()) {
+        let base = path::to_native(&vs_dir);
+        candidates.push(base.join("MSBuild/Current/Bin/Roslyn/csc.exe"));
+        candidates.push(base.join("MSBuild/Current/Bin/amd64/Roslyn/csc.exe"));
+        candidates.push(base.join("MSBuild/15.0/Bin/Roslyn/csc.exe"));
+    }
+    for env_var in [b"WINDIR".as_slice(), b"SystemRoot"] {
+        if let Some(windir) = host.env_get(env_var).filter(|dir| !dir.is_empty()) {
+            let base = path::to_native(&windir);
+            candidates.push(base.join("Microsoft.NET/Framework64/v4.0.30319/csc.exe"));
+            candidates.push(base.join("Microsoft.NET/Framework/v4.0.30319/csc.exe"));
+        }
+    }
+    if let Some(found) = candidates.into_iter().find(|path| is_file(path)) {
+        return Some(found);
+    }
+    let windows = host.system().sysname.starts_with(b"Windows");
+    if let Some(paths) = host.env_get(b"PATH") {
+        let delimiter = if windows { b';' } else { b':' };
+        for dir in paths
+            .split(|&byte| byte == delimiter)
+            .filter(|dir| !dir.is_empty())
+        {
+            let base = host.initial_cwd().join(path::to_native(dir));
+            for name in ["csc.exe", "csc"] {
+                let candidate = base.join(name);
+                if is_file(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn probe_csharp_compiler_version(cx: &Cx<'_>, compiler: &BString) -> Option<BString> {
+    if !cx.host().supports_process_execution() {
+        return None;
+    }
+    let request = RunRequest {
+        pipeline: vec![CommandSpec {
+            program: compiler.clone(),
+            args: vec!["/help /preferreduilang:en-US".into()],
+        }],
+        cwd: cx.host().initial_cwd(),
+        env: cx.host().env_all(),
+        stdin: Input::Null,
+        stdout: Output::Capture,
+        stderr: Output::Capture,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        tee: false,
+        default_error_mode: false,
+    };
+    let output = cx.host().run_bounded(&request, 64 * 1024).ok()?;
+    parse_csharp_version(&output.stdout).or_else(|| parse_csharp_version(&output.stderr))
+}
+
+fn parse_csharp_version(output: &[u8]) -> Option<BString> {
+    for line in output.split(|&byte| byte == b'\n') {
+        let upper = line.to_ascii_uppercase();
+        let Some(compiler_pos) = upper.windows(8).position(|window| window == b"COMPILER") else {
+            continue;
+        };
+        let after_compiler = upper.get(compiler_pos + 8..)?;
+        let Some(version_pos) = after_compiler
+            .windows(7)
+            .position(|window| window == b"VERSION")
+        else {
+            continue;
+        };
+        let rest = after_compiler.get(version_pos + 7..)?;
+        let start = rest
+            .iter()
+            .position(|&byte| byte.is_ascii_digit() || byte == b'.')?;
+        let digits = rest.get(start..)?;
+        let end = digits
+            .iter()
+            .position(|&byte| !byte.is_ascii_digit() && byte != b'.')
+            .unwrap_or(digits.len());
+        let token = digits.get(..end)?;
+        if token.iter().any(u8::is_ascii_digit) {
+            return Some(BString::from(token));
+        }
+    }
+    None
+}
+
+/// Ensure `CMAKE_<LANG>_COMPILER_LINKER` and `CMAKE_<LANG>_COMPILER_LINKER_ID` are populated
+/// for MSVC toolchains before `Internal/CMake<LANG>LinkerInformation.cmake` runs so platform
+/// linker modules (`Linker/MSVC-*.cmake` and `Platform/Linker/Windows-MSVC-*.cmake`) load cleanly.
+fn ensure_linker_identity(cx: &mut Cx<'_>, lang: &[u8]) {
+    let id_var = lang_var(lang, b"_COMPILER_LINKER_ID");
+    if !cx.var_or_empty(&id_var).is_empty() {
+        return;
+    }
+    let is_msvc = cx.var_or_empty(&lang_var(lang, b"_COMPILER_ID")) == b"MSVC"
+        || cx.var_or_empty(&lang_var(lang, b"_SIMULATE_ID")) == b"MSVC";
+    if !is_msvc {
+        return;
+    }
+    let linker_var = lang_var(lang, b"_COMPILER_LINKER");
+    let current_linker = cx.var_or_empty(&linker_var);
+    let linker_missing = current_linker.is_empty() || current_linker.ends_with(b"NOTFOUND");
+    let candidate = if !linker_missing {
+        Some(current_linker)
+    } else {
+        cx.var(b"CMAKE_LINKER")
+            .filter(|value| !value.is_empty() && !value.ends_with(b"NOTFOUND"))
+    };
+    let Some(linker) = candidate else {
+        return;
+    };
+    let win32 = cx.var_is_on(b"WIN32") || cx.var_or_empty(b"CMAKE_SYSTEM_NAME") == b"Windows";
+    let mut identified = probe_linker_identity(cx, &linker, win32);
+    if identified.is_none() {
+        let leaf = linker
+            .rsplit(|&byte| byte == b'/' || byte == b'\\')
+            .next()
+            .unwrap_or(linker.as_slice());
+        if leaf.eq_ignore_ascii_case(b"link.exe") || leaf.eq_ignore_ascii_case(b"link") {
+            identified = Some(("MSVC", Some("MSVC"), None));
+        } else if leaf.eq_ignore_ascii_case(b"lld-link.exe")
+            || leaf.eq_ignore_ascii_case(b"lld-link")
+        {
+            identified = Some(("LLD", Some("MSVC"), None));
+        }
+    }
+    if let Some((id, frontend, version)) = identified {
+        if linker_missing {
+            cx.set_var(&linker_var, linker);
+        }
+        cx.set_var(&id_var, id.into());
+        if let Some(frontend) = frontend {
+            cx.set_var(
+                &lang_var(lang, b"_COMPILER_LINKER_FRONTEND_VARIANT"),
+                frontend.into(),
+            );
+        }
+        if let Some(version) = version {
+            cx.set_var(&lang_var(lang, b"_COMPILER_LINKER_VERSION"), version);
+        }
+    }
+}
+
+fn probe_linker_identity(
+    cx: &Cx<'_>,
+    linker: &BString,
+    win32: bool,
+) -> Option<(&'static str, Option<&'static str>, Option<BString>)> {
+    if !cx.host().supports_process_execution() {
+        return None;
+    }
+    let cwd = cx.host().initial_cwd();
+    let env = cx.host().env_all();
+    for flag in ["-v", "--version"] {
+        let request = RunRequest {
+            pipeline: vec![CommandSpec {
+                program: linker.clone(),
+                args: vec![flag.into()],
+            }],
+            cwd: cwd.clone(),
+            env: env.clone(),
+            stdin: Input::Null,
+            stdout: Output::Capture,
+            stderr: Output::Capture,
+            timeout: Some(std::time::Duration::from_secs(5)),
+            tee: false,
+            default_error_mode: false,
+        };
+        let Ok(output) = cx.host().run_bounded(&request, 64 * 1024) else {
+            return None;
+        };
+        if matches!(output.results.first(), Some(ProcessResult::SpawnFailed(_))) {
+            return None;
+        }
+        let mut combined = output.stdout;
+        if !output.stderr.is_empty() {
+            if !combined.is_empty() {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&output.stderr);
+        }
+        if let Some(parsed) = parse_linker_identity(&combined, win32) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn parse_linker_identity(
+    output: &[u8],
+    win32: bool,
+) -> Option<(&'static str, Option<&'static str>, Option<BString>)> {
+    let text = std::str::from_utf8(output).ok()?;
+    let version_at = |rest: &str| -> Option<BString> {
+        let token: String = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+            .collect();
+        token
+            .chars()
+            .any(|ch| ch.is_ascii_digit())
+            .then(|| token.into())
+    };
+    if let Some(pos) = text.find("Microsoft (R) Incremental Linker Version ") {
+        let version = text
+            .get(pos + "Microsoft (R) Incremental Linker Version ".len()..)
+            .and_then(version_at);
+        return Some(("MSVC", Some("MSVC"), version));
+    }
+    if let Some(pos) = text.find("LLD ")
+        && let Some(version) = text.get(pos + "LLD ".len()..).and_then(version_at)
+    {
+        let frontend = if win32 && !text.contains("compatible with GNU") {
+            "MSVC"
+        } else {
+            "GNU"
+        };
+        return Some(("LLD", Some(frontend), Some(version)));
+    }
+    if let Some(pos) = text.find("GNU gold ")
+        && let Some(after) = text.get(pos..)
+        && let Some(after_paren) = after.find(") ")
+        && let Some(version) = after.get(after_paren + 2..).and_then(version_at)
+    {
+        return Some(("GNUgold", Some("GNU"), Some(version)));
+    }
+    if let Some(pos) = text.find("GNU ld ")
+        && let Some(tail) = text.get(pos + "GNU ld ".len()..)
+    {
+        let version_start = if let Some(rest) = tail.strip_prefix("version ") {
+            Some(rest)
+        } else if let Some(close) = tail.find(") ") {
+            tail.get(close + 2..)
+        } else {
+            None
+        };
+        if let Some(version) = version_start.and_then(version_at) {
+            return Some(("GNU", Some("GNU"), Some(version)));
+        }
+    }
+    if let Some(pos) = text.find("mold (sold) ")
+        && let Some(version) = text.get(pos + "mold (sold) ".len()..).and_then(version_at)
+    {
+        return Some(("MOLD", Some("GNU"), Some(version)));
+    }
+    if let Some(pos) = text.find("mold ")
+        && let Some(version) = text.get(pos + "mold ".len()..).and_then(version_at)
+    {
+        return Some(("MOLD", Some("GNU"), Some(version)));
+    }
+    if let Some(pos) = text.find("Wild version ")
+        && let Some(version) = text.get(pos + "Wild version ".len()..).and_then(version_at)
+    {
+        return Some(("WILD", Some("GNU"), Some(version)));
+    }
+    None
+}
+
 #[cfg(test)]
 mod identification_tests {
     use std::path::{Path, PathBuf};
@@ -1249,6 +1744,605 @@ mod identification_tests {
         // A new identification writes the same bytes for the same compiler file.
         configure(&host, Vec::new(), true)?;
         assert_eq!(read(&host, RECORD), Some(record));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_c_and_rc_allows_implicit_rc_enable_during_c_info() -> TestResult {
+        let host = Arc::new(PureHost::new("/work".into(), "/bin/cmake".into()));
+        let module = |name: &str, body: &str| {
+            host.seed_file(&Path::new(MODULES).join(name), body.as_bytes())
+        };
+        module(
+            "CMakeDetermineSystem.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake \"set(CMAKE_SYSTEM_NAME Windows)\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeUnixFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM /bin/make CACHE FILEPATH \"\")\n",
+        )?;
+        module("CMakeSystemSpecificInitialize.cmake", "")?;
+        module("CMakeSystemSpecificInformation.cmake", "")?;
+        module(
+            "CMakeDetermineCCompiler.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeCCompiler.cmake \"set(CMAKE_C_COMPILER /bin/cl)\\nset(CMAKE_C_COMPILER_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeCInformation.cmake",
+            "enable_language(RC)\nset(CMAKE_C_INFORMATION_LOADED 1)\n",
+        )?;
+        module(
+            "CMakeTestCCompiler.cmake",
+            "set(CMAKE_C_COMPILER_WORKS TRUE)\n",
+        )?;
+        module(
+            "CMakeDetermineRCCompiler.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeRCCompiler.cmake \"set(CMAKE_RC_COMPILER /bin/rc)\\nset(CMAKE_RC_COMPILER_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeRCInformation.cmake",
+            "set(CMAKE_RC_INFORMATION_LOADED 1)\n",
+        )?;
+        module(
+            "CMakeTestRCCompiler.cmake",
+            "set(CMAKE_RC_COMPILER_WORKS TRUE)\n",
+        )?;
+        host.seed_file(Path::new("/bin/cl"), b"")?;
+        host.seed_file(Path::new("/bin/rc"), b"")?;
+        host.seed_file(
+            Path::new("/work/src/CMakeLists.txt"),
+            b"project(ExplicitRC C RC)\n",
+        )?;
+        configure(&host, Vec::new(), false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vs_csharp_discovers_csc_target_framework_and_msvcide_run_path() -> TestResult {
+        let host = Arc::new(PureHost::new("/work".into(), "/bin/cmake".into()));
+        host.env_set(b"CMAKE_MSVCIDE_RUN_PATH", Some(b"C:/tools;C:/bin"));
+        host.env_set(b"ProgramFiles(x86)", Some(b"/pf86"));
+        host.seed_file(
+            Path::new(
+                "/pf86/Reference Assemblies/Microsoft/Framework/.NETFramework/v4.7.2/mscorlib.dll",
+            ),
+            b"",
+        )?;
+        host.seed_file(
+            Path::new(
+                "/pf86/Reference Assemblies/Microsoft/Framework/.NETFramework/v4.8/mscorlib.dll",
+            ),
+            b"",
+        )?;
+        host.seed_file(
+            Path::new("/vs2022/MSBuild/Current/Bin/amd64/MSBuild.exe"),
+            b"",
+        )?;
+        host.seed_file(Path::new("/vs2022/MSBuild/Current/Bin/Roslyn/csc.exe"), b"")?;
+        host.set_command_handler(|_, req, _| {
+            let cmd = req.pipeline.first().map(|s| s.program.as_slice());
+            if cmd == Some(b"/vs2022/MSBuild/Current/Bin/Roslyn/csc.exe".as_slice()) {
+                return Ok(rcmake_host::RunOutput {
+                    results: vec![rcmake_host::ProcessResult::Exited(0)],
+                    stdout: b"Microsoft (R) Visual C# Compiler version 4.14.0-3.25279.5\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(rcmake_host::RunOutput {
+                results: vec![rcmake_host::ProcessResult::Exited(0)],
+                ..Default::default()
+            })
+        })?;
+        let module = |name: &str, body: &str| {
+            host.seed_file(&Path::new(MODULES).join(name), body.as_bytes())
+        };
+        module(
+            "CMakeDetermineSystem.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake \"set(CMAKE_SYSTEM_NAME Windows)\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")\n",
+        )?;
+        module("CMakeSystemSpecificInitialize.cmake", "")?;
+        module("CMakeSystemSpecificInformation.cmake", "")?;
+        module(
+            "CMakeDetermineCSharpCompiler.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeCSharpCompiler.cmake \"set(CMAKE_CSharp_COMPILER CMAKE_CSharp_COMPILER-NOTFOUND)\\nset(CMAKE_CSharp_COMPILER_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeCSharpInformation.cmake",
+            "set(CMAKE_CSharp_INFORMATION_LOADED 1)\n",
+        )?;
+        module(
+            "CMakeTestCSharpCompiler.cmake",
+            "set(CMAKE_CSharp_COMPILER_WORKS TRUE)\n",
+        )?;
+        host.seed_file(
+            Path::new("/work/src/CMakeLists.txt"),
+            b"set(CMAKE_DOTNET_TARGET_FRAMEWORK_VERSION net8.0)\nproject(App NONE)\nenable_language(CSharp)\n",
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: "/share/cmake-4.5".into(),
+                cmake_command: "/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: vec![
+                    CacheDefine {
+                        name: "CMAKE_GENERATOR".into(),
+                        ty: Some(CacheType::Internal),
+                        value: "Visual Studio 17 2022".into(),
+                    },
+                    CacheDefine {
+                        name: "CMAKE_GENERATOR_INSTANCE".into(),
+                        ty: Some(CacheType::Internal),
+                        value: "/vs2022".into(),
+                    },
+                ],
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        interp.cx().project().generator = Some(rcmake_model::GeneratorKind::VisualStudio(
+            rcmake_model::VsVersion::Vs17,
+        ));
+        interp.cx().project().generator_spec.toolset = "VCTargetsPath=C:/custom/vctargets".into();
+        let outcome = interp.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            interp.cx().var_or_empty(b"CMAKE_MSVCIDE_RUN_PATH"),
+            "C:/tools;C:/bin"
+        );
+        // CMake 4.5.1 defaults VS 17+ to v4.7.2 and never auto-picks v4.8 or copies SDK net8.0.
+        assert_eq!(
+            interp
+                .cx()
+                .var_or_empty(b"CMAKE_VS_TARGET_FRAMEWORK_VERSION"),
+            "v4.7.2"
+        );
+        assert_eq!(
+            interp
+                .cx()
+                .var_or_empty(b"CMAKE_VS_PLATFORM_TOOLSET_VCTARGETS_CUSTOM_DIR"),
+            r"C:\custom\vctargets"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"CMAKE_CSharp_COMPILER"),
+            "/vs2022/MSBuild/Current/Bin/Roslyn/csc.exe"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"CMAKE_CSharp_COMPILER_ID"),
+            "Microsoft Visual Studio"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"CMAKE_CSharp_COMPILER_VERSION"),
+            "4.14.0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identifies_msvc_linker_and_loads_linker_modules() -> TestResult {
+        let host = Arc::new(PureHost::new("/work".into(), "/bin/cmake".into()));
+        host.seed_file(Path::new("/bin/cl.exe"), b"")?;
+        host.seed_file(Path::new("/bin/link.exe"), b"")?;
+        host.set_command_handler(|_, req, _| {
+            let cmd = req.pipeline.first().map(|s| s.program.as_slice());
+            if cmd == Some(b"/bin/link.exe".as_slice()) {
+                return Ok(rcmake_host::RunOutput {
+                    results: vec![rcmake_host::ProcessResult::Exited(0)],
+                    stdout: b"Microsoft (R) Incremental Linker Version 14.44.35207.0\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(rcmake_host::RunOutput {
+                results: vec![rcmake_host::ProcessResult::Exited(0)],
+                ..Default::default()
+            })
+        })?;
+        let module = |name: &str, body: &str| {
+            host.seed_file(&Path::new(MODULES).join(name), body.as_bytes())
+        };
+        module(
+            "CMakeDetermineSystem.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake \"set(CMAKE_SYSTEM_NAME Windows)\\nset(WIN32 1)\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeUnixFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM /bin/make CACHE FILEPATH \"\")\n",
+        )?;
+        module("CMakeSystemSpecificInitialize.cmake", "")?;
+        module("CMakeSystemSpecificInformation.cmake", "")?;
+        module(
+            "CMakeDetermineCCompiler.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeCCompiler.cmake \"set(CMAKE_C_COMPILER /bin/cl.exe)\\nset(CMAKE_C_COMPILER_ID MSVC)\\nset(CMAKE_LINKER /bin/link.exe)\\nset(CMAKE_C_COMPILER_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeCInformation.cmake",
+            "set(CMAKE_C_USE_LINKER_INFORMATION TRUE)\nset(CMAKE_C_INFORMATION_LOADED 1)\n",
+        )?;
+        module(
+            "CMakeTestCCompiler.cmake",
+            "set(CMAKE_C_COMPILER_WORKS TRUE)\n",
+        )?;
+        module(
+            "Internal/CMakeCLinkerInformation.cmake",
+            "if(CMAKE_C_COMPILER_LINKER_ID STREQUAL \"MSVC\")\n  set(CMAKE_C_LINK_OPTIONS_WARNING_AS_ERROR \"LINKER:-WX\")\n  set(CMAKE_C_LINK_LIBRARY_USING_WHOLE_ARCHIVE \"LINKER:/WHOLEARCHIVE:<LIBRARY>\")\nendif()\nset(CMAKE_C_LINKER_INFORMATION_LOADED 1)\n",
+        )?;
+        module("Internal/CMakeInspectCLinker.cmake", "")?;
+        host.seed_file(Path::new("/work/src/CMakeLists.txt"), b"project(P C)\n")?;
+
+        let mut interp = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: "/share/cmake-4.5".into(),
+                cmake_command: "/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        let outcome = interp.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            interp.cx().var_or_empty(b"CMAKE_C_COMPILER_LINKER"),
+            "/bin/link.exe"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"CMAKE_C_COMPILER_LINKER_ID"),
+            "MSVC"
+        );
+        assert_eq!(
+            interp.cx().var_or_empty(b"CMAKE_C_COMPILER_LINKER_VERSION"),
+            "14.44.35207.0"
+        );
+        assert_eq!(
+            interp
+                .cx()
+                .var_or_empty(b"CMAKE_C_LINK_OPTIONS_WARNING_AS_ERROR"),
+            "LINKER:-WX"
+        );
+        assert_eq!(
+            interp
+                .cx()
+                .var_or_empty(b"CMAKE_C_LINK_LIBRARY_USING_WHOLE_ARCHIVE"),
+            "LINKER:/WHOLEARCHIVE:<LIBRARY>"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn toolchain_recursive_enable_language_rc_is_rejected() -> TestResult {
+        let host = Arc::new(PureHost::new("/work".into(), "/bin/cmake".into()));
+        let module = |name: &str, body: &str| {
+            host.seed_file(&Path::new(MODULES).join(name), body.as_bytes())
+        };
+        module(
+            "CMakeDetermineSystem.cmake",
+            "enable_language(RC)\nfile(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake \"set(CMAKE_SYSTEM_NAME Windows)\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")\n",
+        )?;
+        module("CMakeSystemSpecificInitialize.cmake", "")?;
+        module("CMakeSystemSpecificInformation.cmake", "")?;
+        host.seed_file(
+            Path::new("/work/src/CMakeLists.txt"),
+            b"project(ToolchainRC C RC)\n",
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: "/share/cmake-4.5".into(),
+                cmake_command: "/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        let outcome = interp.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        assert_ne!(outcome.exit_code, 0);
+        let stderr =
+            String::from_utf8_lossy(host.stream_bytes(rcmake_host::Stream::Stderr).as_slice())
+                .into_owned();
+        assert!(
+            stderr
+                .contains("Language 'RC' is currently being enabled.  Recursive call not allowed."),
+            "expected recursive RC error in stderr:\n{stderr}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_missing_csharp_compiler_is_not_overwritten_by_fallback() -> TestResult {
+        let host = Arc::new(PureHost::new("/work".into(), "/bin/cmake".into()));
+        host.seed_file(
+            Path::new("/vs2022/MSBuild/Current/Bin/amd64/MSBuild.exe"),
+            b"",
+        )?;
+        host.seed_file(Path::new("/vs2022/MSBuild/Current/Bin/Roslyn/csc.exe"), b"")?;
+        let module = |name: &str, body: &str| {
+            host.seed_file(&Path::new(MODULES).join(name), body.as_bytes())
+        };
+        module(
+            "CMakeDetermineSystem.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake \"set(CMAKE_SYSTEM_NAME Windows)\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")\n",
+        )?;
+        module("CMakeSystemSpecificInitialize.cmake", "")?;
+        module("CMakeSystemSpecificInformation.cmake", "")?;
+        module(
+            "CMakeDetermineCSharpCompiler.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeCSharpCompiler.cmake \"set(CMAKE_CSharp_COMPILER \\\"${CMAKE_CSharp_COMPILER}\\\")\\nset(CMAKE_CSharp_COMPILER_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeCSharpInformation.cmake",
+            "set(CMAKE_CSharp_INFORMATION_LOADED 1)\n",
+        )?;
+        module(
+            "CMakeTestCSharpCompiler.cmake",
+            "set(CMAKE_CSharp_COMPILER_WORKS TRUE)\n",
+        )?;
+        host.seed_file(
+            Path::new("/work/src/CMakeLists.txt"),
+            b"project(App NONE)\nenable_language(CSharp)\n",
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: "/share/cmake-4.5".into(),
+                cmake_command: "/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: vec![
+                    CacheDefine {
+                        name: "CMAKE_GENERATOR".into(),
+                        ty: Some(CacheType::Internal),
+                        value: "Visual Studio 17 2022".into(),
+                    },
+                    CacheDefine {
+                        name: "CMAKE_GENERATOR_INSTANCE".into(),
+                        ty: Some(CacheType::Internal),
+                        value: "/vs2022".into(),
+                    },
+                    CacheDefine {
+                        name: "CMAKE_CSharp_COMPILER".into(),
+                        ty: Some(CacheType::Filepath),
+                        value: "/explicit/missing/csc.exe".into(),
+                    },
+                ],
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        interp.cx().project().generator = Some(rcmake_model::GeneratorKind::VisualStudio(
+            rcmake_model::VsVersion::Vs17,
+        ));
+        let outcome = interp.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        assert_ne!(outcome.exit_code, 0);
+        assert_eq!(
+            interp.cx().var_or_empty(b"CMAKE_CSharp_COMPILER"),
+            "/explicit/missing/csc.exe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_msvc_toolchain_does_not_publish_global_cmake_linker() -> TestResult {
+        let host = Arc::new(PureHost::new("/work".into(), "/bin/cmake".into()));
+        host.seed_file(Path::new("/bin/clang"), b"")?;
+        host.seed_file(Path::new("/bin/ld"), b"")?;
+        let module = |name: &str, body: &str| {
+            host.seed_file(&Path::new(MODULES).join(name), body.as_bytes())
+        };
+        module(
+            "CMakeDetermineSystem.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake \"set(CMAKE_SYSTEM_NAME Linux)\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeUnixFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM /bin/make CACHE FILEPATH \"\")\n",
+        )?;
+        module("CMakeSystemSpecificInitialize.cmake", "")?;
+        module("CMakeSystemSpecificInformation.cmake", "")?;
+        module(
+            "CMakeDetermineCCompiler.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeCCompiler.cmake \"set(CMAKE_C_COMPILER /bin/clang)\\nset(CMAKE_C_COMPILER_ID Clang)\\nset(CMAKE_LINKER /bin/ld)\\nset(CMAKE_C_COMPILER_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeCInformation.cmake",
+            "set(CMAKE_C_USE_LINKER_INFORMATION TRUE)\nset(CMAKE_C_INFORMATION_LOADED 1)\n",
+        )?;
+        module(
+            "CMakeTestCCompiler.cmake",
+            "set(CMAKE_C_COMPILER_WORKS TRUE)\n",
+        )?;
+        module(
+            "Internal/CMakeCLinkerInformation.cmake",
+            "set(CMAKE_C_LINKER_INFORMATION_LOADED 1)\n",
+        )?;
+        module("Internal/CMakeInspectCLinker.cmake", "")?;
+        host.seed_file(Path::new("/work/src/CMakeLists.txt"), b"project(P C)\n")?;
+
+        let mut interp = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: "/share/cmake-4.5".into(),
+                cmake_command: "/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        let outcome = interp.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(interp.cx().var_or_empty(b"CMAKE_C_COMPILER_LINKER"), "");
+        assert_eq!(interp.cx().var_or_empty(b"CMAKE_C_COMPILER_LINKER_ID"), "");
+        Ok(())
+    }
+
+    #[test]
+    fn nmake_probes_nmake_help_and_prefers_cl_default_compiler() -> TestResult {
+        use std::sync::Mutex;
+
+        type RecordedCalls = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+        let setup_host = |nmake_exit: i32| -> Result<(Arc<PureHost>, RecordedCalls), Box<dyn std::error::Error>> {
+            let host = Arc::new(PureHost::new("/work".into(), "/bin/cmake".into()));
+            let calls: RecordedCalls = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&calls);
+            host.set_command_handler(move |_host, req, _out| {
+                let spec = req.pipeline.first().unwrap();
+                let prog = spec.program.to_string();
+                let args: Vec<String> = spec.args.iter().map(ToString::to_string).collect();
+                recorded.lock().unwrap().push((prog, args));
+                Ok(rcmake_host::RunOutput {
+                    results: vec![rcmake_host::ProcessResult::Exited(nmake_exit)],
+                    stdout: Vec::new(),
+                    stderr: if nmake_exit == 0 {
+                        b"Microsoft (R) Program Maintenance Utility Version 14.40.33811.0\n"
+                            .to_vec()
+                    } else {
+                        b"nmake not executable\n".to_vec()
+                    },
+                })
+            })?;
+            let module = |name: &str, body: &str| {
+                host.seed_file(&Path::new(MODULES).join(name), body.as_bytes())
+            };
+            host.seed_file(Path::new("/bin/cl"), b"")?;
+            module(
+                "CMakeDetermineSystem.cmake",
+                "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake \"set(CMAKE_SYSTEM_NAME Windows)\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")\n",
+            )?;
+            module(
+                "CMakeNMakeFindMake.cmake",
+                "set(CMAKE_MAKE_PROGRAM nmake CACHE FILEPATH \"\")\n",
+            )?;
+            module("CMakeSystemSpecificInitialize.cmake", "")?;
+            module("CMakeSystemSpecificInformation.cmake", "")?;
+            module(
+                "CMakeDetermineCCompiler.cmake",
+                "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeCCompiler.cmake \"set(CMAKE_C_COMPILER /bin/${CMAKE_GENERATOR_CC})\\nset(CMAKE_C_COMPILER_ID MSVC)\\nset(CMAKE_C_COMPILER_LOADED 1)\\n\")\n",
+            )?;
+            module(
+                "CMakeDetermineCXXCompiler.cmake",
+                "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeCXXCompiler.cmake \"set(CMAKE_CXX_COMPILER /bin/${CMAKE_GENERATOR_CXX})\\nset(CMAKE_CXX_COMPILER_ID MSVC)\\nset(CMAKE_CXX_COMPILER_LOADED 1)\\n\")\n",
+            )?;
+            module(
+                "CMakeCInformation.cmake",
+                "set(CMAKE_C_INFORMATION_LOADED 1)\n",
+            )?;
+            module(
+                "CMakeCXXInformation.cmake",
+                "set(CMAKE_CXX_INFORMATION_LOADED 1)\n",
+            )?;
+            module(
+                "CMakeTestCCompiler.cmake",
+                "set(CMAKE_C_COMPILER_WORKS TRUE)\n",
+            )?;
+            module(
+                "CMakeTestCXXCompiler.cmake",
+                "set(CMAKE_CXX_COMPILER_WORKS TRUE)\n",
+            )?;
+            host.seed_file(Path::new("/work/src/CMakeLists.txt"), b"project(P C CXX)\n")?;
+            Ok((host, calls))
+        };
+
+        // Failing `nmake -?` aborts configure with CMake's exact diagnostic.
+        let (fail_host, fail_calls) = setup_host(1)?;
+        let mut fail_interp = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: fail_host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: "/share/cmake-4.5".into(),
+                cmake_command: "/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        fail_interp.cx().project().generator = Some(rcmake_model::GeneratorKind::NMakeMakefiles);
+        let fail_outcome =
+            fail_interp.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        assert_ne!(fail_outcome.exit_code, 0);
+        assert!(
+            fail_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(prog, args)| prog == "nmake" && args == &["-?"]),
+            "expected nmake -? probe: {:?}",
+            fail_calls.lock().unwrap()
+        );
+        let stderr = String::from_utf8_lossy(&fail_host.stream_bytes(rcmake_host::Stream::Stderr))
+            .into_owned();
+        assert!(
+            stderr.contains("'nmake' '-?'") && stderr.contains("nmake not executable"),
+            "stderr={stderr}"
+        );
+
+        // Passing `nmake -?` succeeds and preserves CMAKE_GENERATOR_CC/CXX = "cl".
+        let (ok_host, ok_calls) = setup_host(0)?;
+        let mut ok_interp = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: ok_host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: "/share/cmake-4.5".into(),
+                cmake_command: "/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        ok_interp.cx().project().generator = Some(rcmake_model::GeneratorKind::NMakeMakefiles);
+        let ok_outcome =
+            ok_interp.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        assert_eq!(
+            ok_outcome.exit_code,
+            0,
+            "stderr={}",
+            String::from_utf8_lossy(&ok_host.stream_bytes(rcmake_host::Stream::Stderr))
+        );
+        assert!(
+            ok_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(prog, args)| prog == "nmake" && args == &["-?"]),
+            "expected nmake -? probe: {:?}",
+            ok_calls.lock().unwrap()
+        );
+        assert_eq!(ok_interp.cx().var_or_empty(b"CMAKE_GENERATOR_CC"), "cl");
+        assert_eq!(ok_interp.cx().var_or_empty(b"CMAKE_GENERATOR_CXX"), "cl");
+        assert_eq!(ok_interp.cx().var_or_empty(b"CMAKE_C_COMPILER"), "/bin/cl");
+        assert_eq!(
+            ok_interp.cx().var_or_empty(b"CMAKE_CXX_COMPILER"),
+            "/bin/cl"
+        );
         Ok(())
     }
 }

@@ -80,6 +80,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             .or(cx.limits().wall_budget)
             .or(Some(Duration::from_secs(600))),
         tee: upload.progress,
+        default_error_mode: false,
     };
     let result = host
         .run(&request, &mut |stream, bytes| host.write_out(stream, bytes))

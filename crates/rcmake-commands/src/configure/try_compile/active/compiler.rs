@@ -12,7 +12,7 @@ use crate::configure::build_tool_facts::{BuildToolFacts, VerifiedNinja};
 use crate::configure::platform_queries::{PlatformQueries, RecordedQueries};
 
 use super::super::journal::{DependencyClosure, ProcessVerifier, SearchObservation, depfile};
-use super::super::plan::{process_environment, process_environment_fingerprint};
+use super::super::plan::{CachedEnv, process_environment, process_environment_fingerprint};
 
 mod flags;
 mod hazards;
@@ -69,6 +69,7 @@ fn ninja_snapshot(
     cx: &mut Cx<'_>,
     memo: &TraceMemo,
     probe_cwd: &Path,
+    env: &CachedEnv,
 ) -> NinjaEvidence {
     if !matches!(
         cx.project().generator,
@@ -80,8 +81,7 @@ fn ninja_snapshot(
     if !program.is_absolute() {
         return NinjaEvidence::Uncertified;
     }
-    let env = host.env_all();
-    let native = admit_environment(&env)
+    let native = env.admitted
         && host
             .canonicalize(&program)
             .ok()
@@ -93,15 +93,16 @@ fn ninja_snapshot(
         return NinjaEvidence::Uncertified;
     };
     let cwd = probe_cwd.to_path_buf();
+    let raw_env = env.raw.to_vec();
     let verified = if let Some(facts) = cx.session_data::<Arc<BuildToolFacts>>() {
-        facts.sample_screened_ninja(host, Some(memo), &program, digest, env, cwd)
+        facts.sample_screened_ninja(host, Some(memo), &program, digest, raw_env, cwd)
     } else {
         BuildToolFacts::default().sample_screened_ninja(
             host,
             Some(memo),
             &program,
             digest,
-            env,
+            raw_env,
             cwd,
         )
     };
@@ -112,8 +113,8 @@ fn ninja_snapshot(
 }
 
 /// Copy the platform queries that a try-compile child can reuse.
-fn platform_snapshot(host: &dyn Host, cx: &Cx<'_>) -> RecordedQueries {
-    let mut environment = host.env_all();
+fn platform_snapshot(host: &dyn Host, cx: &Cx<'_>, env: &CachedEnv) -> RecordedQueries {
+    let mut environment = env.raw.to_vec();
     process_environment(&mut environment);
     cx.session_data::<Arc<PlatformQueries>>()
         .and_then(|memo| {
@@ -228,25 +229,6 @@ type ToolKey = (PathBuf, PathBuf, BString, bool, Digest);
 type SearchKey = (PathBuf, Vec<BString>, Digest);
 type SearchMemo = Mutex<BTreeMap<SearchKey, (Vec<PathBuf>, Vec<bool>)>>;
 
-/// Hash environment variables that affect toolchain discovery, ignoring
-/// locale variables (`LC_ALL`, `LC_MESSAGES`, `LANG`, `LC_CTYPE`, `LANGUAGE`)
-/// that `CMakeDetermineCompilerABI` toggles around ABI probes. Probe recipes
-/// still hash the full process environment so cached probe outputs preserve
-/// locale-sensitive compiler diagnostics.
-fn tool_environment_fingerprint(environment: &[(BString, BString)]) -> Digest {
-    let filtered: Vec<_> = environment
-        .iter()
-        .filter(|(name, _)| {
-            !matches!(
-                name.as_slice(),
-                b"LC_ALL" | b"LC_MESSAGES" | b"LANG" | b"LC_CTYPE" | b"LANGUAGE"
-            )
-        })
-        .cloned()
-        .collect();
-    process_environment_fingerprint(&filtered)
-}
-
 #[derive(Default)]
 pub(super) struct SessionEvidence {
     tools: Mutex<BTreeMap<ToolKey, Arc<ToolchainEvidence>>>,
@@ -268,6 +250,7 @@ pub(super) struct CompilerEvidence {
 }
 
 impl CompilerEvidence {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         host: Arc<dyn Host>,
         cx: &mut Cx<'_>,
@@ -276,6 +259,7 @@ impl CompilerEvidence {
         memo: &Arc<TraceMemo>,
         external_source: Option<(PathBuf, Digest)>,
         probe_cwd: &Path,
+        env: &CachedEnv,
     ) -> Option<Self> {
         let cxx = flags::source_language(name)?;
         let language: &[u8] = if cxx { b"CXX" } else { b"C" };
@@ -295,13 +279,7 @@ impl CompilerEvidence {
         } else {
             path::to_native(&cx.var_or_empty(b"CMAKE_OSX_SYSROOT"))
         };
-        let key = (
-            program.clone(),
-            sdk.clone(),
-            id,
-            cxx,
-            tool_environment_fingerprint(&host.env_all()),
-        );
+        let key = (program.clone(), sdk.clone(), id, cxx, env.tool_fingerprint);
         let mut tools = session.tools.lock().ok()?;
         if tools.get(&key).is_some_and(|toolchain| {
             memo.verify(host.as_ref(), &toolchain.tools) != VerifyOutcome::Hit
@@ -333,7 +311,7 @@ impl CompilerEvidence {
                         previous,
                     )
                 },
-                || platform_snapshot(host.as_ref(), cx),
+                || platform_snapshot(host.as_ref(), cx, env),
             );
             let toolchain = Arc::new(toolchain.flatten()?);
             if tools.len() < 32 {
@@ -361,8 +339,8 @@ impl CompilerEvidence {
                 );
             }
         }
-        let platform = platform.unwrap_or_else(|| platform_snapshot(host.as_ref(), cx));
-        let ninja = match ninja_snapshot(host.as_ref(), cx, memo, probe_cwd) {
+        let platform = platform.unwrap_or_else(|| platform_snapshot(host.as_ref(), cx, env));
+        let ninja = match ninja_snapshot(host.as_ref(), cx, memo, probe_cwd, env) {
             NinjaEvidence::NotRequired => None,
             NinjaEvidence::Certified(verified) => Some(*verified),
             NinjaEvidence::Uncertified => return None,
@@ -424,6 +402,7 @@ impl CompilerEvidence {
         name: &[u8],
         memo: &Arc<TraceMemo>,
         reference: &Self,
+        env: &CachedEnv,
     ) -> Option<Self> {
         let cxx = flags::source_language(name)?;
         let language: &[u8] = if cxx { b"CXX" } else { b"C" };
@@ -447,13 +426,7 @@ impl CompilerEvidence {
         } else {
             path::to_native(peek_var(b"CMAKE_OSX_SYSROOT"))
         };
-        let key = (
-            program.clone(),
-            sdk.clone(),
-            id,
-            cxx,
-            tool_environment_fingerprint(&host.env_all()),
-        );
+        let key = (program.clone(), sdk.clone(), id, cxx, env.tool_fingerprint);
         // Require already-verified cached toolchain evidence; defer discovery to foreground.
         let toolchain = {
             let tools = session.tools.lock().ok()?;

@@ -318,6 +318,7 @@ fn execute(
         stderr,
         timeout: Some(Duration::from_secs(30 * 60)),
         tee: false,
+        default_error_mode: false,
     };
     let failure = match cx.host.run_bounded(&request, 64 * 1024 * 1024) {
         Ok(output) => match output.results.first() {

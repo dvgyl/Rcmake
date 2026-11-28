@@ -33,6 +33,7 @@ fn run(
         stderr: Output::Capture,
         timeout: Some(Duration::from_secs(15)),
         tee: false,
+        default_error_mode: false,
     };
     let result = host.run(&request, &mut |_, _| {})?;
     assert_eq!(

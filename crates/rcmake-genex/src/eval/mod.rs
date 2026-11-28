@@ -181,6 +181,7 @@ struct Evaluator<'a> {
     in_target_expression: bool,
     emitted_link_feature: bool,
     active_rules: Vec<(BString, BString)>,
+    random_state: Option<u32>,
 }
 
 thread_local! {
@@ -258,6 +259,7 @@ impl<'a> Evaluator<'a> {
             in_target_expression: false,
             emitted_link_feature: false,
             active_rules: Vec::new(),
+            random_state: None,
         }
     }
 

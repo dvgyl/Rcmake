@@ -20,6 +20,16 @@ macro_rules! choices {
             $($(#[$variant_doc])* $variant),+
         }
 
+        impl $name {
+            /// Canonical JSON string value for this choice.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+        }
+
         impl Decode for $name {
             fn decode(field: &Field, _: &mut Expand<'_>) -> Result<Self, PresetsError> {
                 schema::choice(field, &[$(($value, Self::$variant)),+])

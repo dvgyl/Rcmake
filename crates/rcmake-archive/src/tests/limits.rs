@@ -631,3 +631,75 @@ fn grzip_external_filter_respects_output_limit() -> TestResult {
     );
     Ok(())
 }
+
+fn ustar_magic_gnu_longname_tar(
+    long_path: &[u8],
+    corrupt_checksum: bool,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut payload = long_path.to_vec();
+    payload.push(0);
+    let mut long_hdr = Header::new_old();
+    long_hdr.set_path("././@LongLink")?;
+    long_hdr.set_mode(0o644);
+    long_hdr.set_size(payload.len() as u64);
+    long_hdr.set_entry_type(EntryType::GNULongName);
+    if let Some(slot) = long_hdr.as_mut_bytes().get_mut(257..265) {
+        // Apache Ant / Commons Compress ustar-magic GNU long-name header (`ustar\0\0\0`).
+        slot.copy_from_slice(b"ustar\0\0\0");
+    }
+    long_hdr.set_cksum();
+    if corrupt_checksum {
+        long_hdr.as_mut_bytes()[0] ^= 0x01;
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(long_hdr.as_bytes());
+    out.extend_from_slice(&payload);
+    let pad = (512 - (payload.len() % 512)) % 512;
+    out.resize(out.len() + pad, 0);
+
+    let mut file_hdr = Header::new_ustar();
+    file_hdr.set_path("truncated-name")?;
+    file_hdr.set_mode(0o644);
+    file_hdr.set_size(4);
+    file_hdr.set_mtime(0);
+    file_hdr.set_entry_type(EntryType::Regular);
+    file_hdr.set_cksum();
+    out.extend_from_slice(file_hdr.as_bytes());
+    out.extend_from_slice(b"body");
+    out.resize(out.len() + 508, 0);
+    out.resize(out.len() + 1024, 0);
+    Ok(out)
+}
+
+#[test]
+fn accepts_gnu_longname_with_ustar_magic_while_enforcing_checksum_and_traversal() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/long.tar");
+    let long_name = format!(
+        "activemq-cpp-library-3.9.5/{}/header.h",
+        "nested/".repeat(20)
+    );
+    let tar_bytes = ustar_magic_gnu_longname_tar(long_name.as_bytes(), false)?;
+    host.seed_file(archive, &tar_bytes)?;
+    let extracted = extract_archive(&host, archive, &extract_options())?;
+    assert_eq!(extracted, vec![BString::from(long_name.as_str())]);
+    assert_eq!(
+        read_bytes(&host, &Path::new("/extract").join(&long_name), 16)?,
+        b"body"
+    );
+
+    let bad_cksum = ustar_magic_gnu_longname_tar(long_name.as_bytes(), true)?;
+    let corrupt_archive = Path::new("/corrupt.tar");
+    host.seed_file(corrupt_archive, &bad_cksum)?;
+    assert!(extract_archive(&host, corrupt_archive, &extract_options()).is_err());
+
+    let traversal = ustar_magic_gnu_longname_tar(
+        format!("{}/../escape.txt", "a".repeat(120)).as_bytes(),
+        false,
+    )?;
+    let traversal_archive = Path::new("/traversal.tar");
+    host.seed_file(traversal_archive, &traversal)?;
+    assert!(extract_archive(&host, traversal_archive, &extract_options()).is_err());
+    Ok(())
+}

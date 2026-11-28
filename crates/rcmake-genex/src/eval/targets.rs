@@ -353,6 +353,20 @@ impl Evaluator<'_> {
                 ));
             }
         };
+        if kind == ArtifactKind::PdbFile && postfix.is_some() {
+            let cmp0202 = rcmake_diag::PolicyId::new(202);
+            let status = self
+                .host
+                .target_policy_status(target, cmp0202)
+                .or_else(|| self.host.directory_policy_status(cmp0202, call.ctx));
+            if status == Some(rcmake_diag::PolicyStatus::Warn) {
+                self.host.policy_warning(
+                    cmp0202,
+                    b"\n\"POSTFIX\" option is recognized only when the policy is set to NEW.  Since the policy is not set, the OLD behavior will be used.",
+                    call.ctx,
+                );
+            }
+        }
         let config = &call.ctx.config;
         let read_part = |kind| {
             if exclude_postfix {
@@ -807,3 +821,127 @@ const TARGET_POLICIES: &[&[u8]] = &[
     b"CMP0182", b"CMP0195", b"CMP0199", b"CMP0200", b"CMP0202", b"CMP0203", b"CMP0204", b"CMP0209",
     b"CMP0210", b"CMP0211", b"CMP0214", b"CMP0215", b"CMP0216", b"CMP0226",
 ];
+
+#[cfg(test)]
+mod cmp0202_tests {
+    use rcmake_base::BString;
+    use rcmake_diag::{PolicyId, PolicyStatus};
+
+    use crate::{
+        ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError, GenexHost, InterfaceView,
+        TargetHandle, evaluate, parse,
+    };
+
+    struct PdbWarnHost {
+        cmp0202: PolicyStatus,
+        warnings: Vec<(PolicyId, BString)>,
+    }
+
+    impl GenexHost for PdbWarnHost {
+        fn find_target(&self, name: &[u8]) -> Option<TargetHandle> {
+            (name == b"app").then_some(TargetHandle(1))
+        }
+        fn target_name(&self, _target: TargetHandle) -> BString {
+            "app".into()
+        }
+        fn raw_property(&self, _target: TargetHandle, name: &[u8]) -> Option<BString> {
+            match name {
+                b"TYPE" => Some("EXECUTABLE".into()),
+                b"LINKER_LANGUAGE" => Some("C".into()),
+                _ => None,
+            }
+        }
+        fn transitive_property(
+            &mut self,
+            _target: TargetHandle,
+            _name: &[u8],
+            _ctx: &EvalContext,
+        ) -> Result<InterfaceView, GenexError> {
+            Ok(InterfaceView::default())
+        }
+        fn artifact(
+            &self,
+            _target: TargetHandle,
+            kind: ArtifactKind,
+            part: ArtifactPart,
+            _config: &ConfigId,
+        ) -> Option<BString> {
+            (kind == ArtifactKind::PdbFile && part == ArtifactPart::BaseName)
+                .then(|| "app_pdb".into())
+        }
+        fn link_closure(
+            &mut self,
+            _target: TargetHandle,
+            _ctx: &EvalContext,
+        ) -> Result<Vec<TargetHandle>, GenexError> {
+            Ok(Vec::new())
+        }
+        fn definition(&self, name: &[u8]) -> Option<BString> {
+            (name == b"CMAKE_C_LINKER_SUPPORTS_PDB").then(|| "1".into())
+        }
+        fn target_policy(&self, _target: TargetHandle, policy: &[u8]) -> Option<bool> {
+            (policy == b"CMP0202").then_some(self.cmp0202 == PolicyStatus::New)
+        }
+        fn directory_policy_status(
+            &self,
+            policy: PolicyId,
+            _ctx: &EvalContext,
+        ) -> Option<PolicyStatus> {
+            (policy == PolicyId::new(202)).then_some(self.cmp0202)
+        }
+        fn policy_warning(&mut self, policy: PolicyId, detail: &[u8], _ctx: &EvalContext) {
+            self.warnings.push((policy, detail.into()));
+        }
+    }
+
+    #[test]
+    fn target_pdb_file_base_name_warns_under_cmp0202_warn_when_postfix_given() {
+        let ctx = EvalContext {
+            config: ConfigId("Debug".into()),
+            ..EvalContext::default()
+        };
+
+        // Explicit POSTFIX:INCLUDE or POSTFIX:EXCLUDE under CMP0202 WARN emits warning.
+        for expr in [
+            b"$<TARGET_PDB_FILE_BASE_NAME:app,POSTFIX:INCLUDE>".as_slice(),
+            b"$<TARGET_PDB_FILE_BASE_NAME:app,POSTFIX:EXCLUDE>",
+        ] {
+            let mut host = PdbWarnHost {
+                cmp0202: PolicyStatus::Warn,
+                warnings: Vec::new(),
+            };
+            let (out, _) = evaluate(&parse(expr).unwrap(), &ctx, &mut host).unwrap();
+            assert_eq!(out, "app_pdb");
+            assert_eq!(host.warnings.len(), 1);
+            assert_eq!(host.warnings[0].0, PolicyId::new(202));
+            assert!(
+                host.warnings[0].1.to_string().contains(
+                    "\"POSTFIX\" option is recognized only when the policy is set to NEW."
+                )
+            );
+        }
+
+        // No warning when POSTFIX is omitted, or when CMP0202 is OLD or NEW.
+        for (status, expr) in [
+            (
+                PolicyStatus::Warn,
+                b"$<TARGET_PDB_FILE_BASE_NAME:app>".as_slice(),
+            ),
+            (
+                PolicyStatus::Old,
+                b"$<TARGET_PDB_FILE_BASE_NAME:app,POSTFIX:EXCLUDE>",
+            ),
+            (
+                PolicyStatus::New,
+                b"$<TARGET_PDB_FILE_BASE_NAME:app,POSTFIX:EXCLUDE>",
+            ),
+        ] {
+            let mut host = PdbWarnHost {
+                cmp0202: status,
+                warnings: Vec::new(),
+            };
+            let _ = evaluate(&parse(expr).unwrap(), &ctx, &mut host).unwrap();
+            assert!(host.warnings.is_empty(), "{status:?}");
+        }
+    }
+}

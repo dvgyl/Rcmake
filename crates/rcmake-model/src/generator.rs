@@ -77,6 +77,8 @@ pub enum GeneratorKind {
     NinjaMultiConfig,
     /// `Unix Makefiles`.
     UnixMakefiles,
+    /// `NMake Makefiles`.
+    NMakeMakefiles,
     /// `Xcode`.
     Xcode,
     /// `Visual Studio <N> <YYYY>`.
@@ -86,8 +88,9 @@ pub enum GeneratorKind {
 impl GeneratorKind {
     /// All generators, in `cmake --help` order. Use this list to parse names.
     /// Use [`GeneratorKind::available`] to list the generators of this host.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::UnixMakefiles,
+        Self::NMakeMakefiles,
         Self::Ninja,
         Self::NinjaMultiConfig,
         Self::Xcode,
@@ -102,6 +105,7 @@ impl GeneratorKind {
             Self::Ninja => "Ninja",
             Self::NinjaMultiConfig => "Ninja Multi-Config",
             Self::UnixMakefiles => "Unix Makefiles",
+            Self::NMakeMakefiles => "NMake Makefiles",
             Self::Xcode => "Xcode",
             Self::VisualStudio(version) => version.generator_name(),
         }
@@ -114,6 +118,7 @@ impl GeneratorKind {
             Self::Ninja => "Generates build.ninja files.",
             Self::NinjaMultiConfig => "Generates build-<Config>.ninja files.",
             Self::UnixMakefiles => "Generates standard UNIX makefiles.",
+            Self::NMakeMakefiles => "Generates NMake makefiles.",
             Self::Xcode => "Generate Xcode project files.",
             Self::VisualStudio(VsVersion::Vs17) => "Generates Visual Studio 2022 project files.",
             Self::VisualStudio(VsVersion::Vs18) => "Generates Visual Studio 2026 project files.",
@@ -123,7 +128,10 @@ impl GeneratorKind {
     /// `true` for a multi-configuration generator (`GENERATOR_IS_MULTI_CONFIG`).
     #[must_use]
     pub const fn multi_config(self) -> bool {
-        !matches!(self, Self::Ninja | Self::UnixMakefiles)
+        !matches!(
+            self,
+            Self::Ninja | Self::UnixMakefiles | Self::NMakeMakefiles
+        )
     }
 
     /// Return true for either Ninja generator.
@@ -132,10 +140,10 @@ impl GeneratorKind {
         matches!(self, Self::Ninja | Self::NinjaMultiConfig)
     }
 
-    /// Return true for Unix Makefiles or either Ninja generator.
+    /// Return true for Unix Makefiles, NMake Makefiles, or either Ninja generator.
     #[must_use]
     pub const fn is_make_or_ninja(self) -> bool {
-        matches!(self, Self::UnixMakefiles) || self.is_ninja()
+        matches!(self, Self::UnixMakefiles | Self::NMakeMakefiles) || self.is_ninja()
     }
 
     /// `true` for a generator that writes IDE project files (Xcode, Visual Studio).
@@ -152,6 +160,7 @@ impl GeneratorKind {
         match self {
             Self::Ninja | Self::NinjaMultiConfig => Some("CMakeNinjaFindMake"),
             Self::UnixMakefiles => Some("CMakeUnixFindMake"),
+            Self::NMakeMakefiles => Some("CMakeNMakeFindMake"),
             Self::Xcode => Some("CMakeFindXCode"),
             Self::VisualStudio(_) => None,
         }
@@ -162,7 +171,7 @@ impl GeneratorKind {
     #[must_use]
     pub const fn default_configuration_types(self) -> &'static [&'static str] {
         match self {
-            Self::Ninja | Self::UnixMakefiles => &[],
+            Self::Ninja | Self::UnixMakefiles | Self::NMakeMakefiles => &[],
             Self::NinjaMultiConfig => &["Debug", "Release", "RelWithDebInfo"],
             Self::Xcode | Self::VisualStudio(_) => {
                 &["Debug", "Release", "MinSizeRel", "RelWithDebInfo"]
@@ -174,7 +183,7 @@ impl GeneratorKind {
     #[must_use]
     pub const fn cfg_int_dir(self) -> &'static str {
         match self {
-            Self::Ninja | Self::UnixMakefiles => ".",
+            Self::Ninja | Self::UnixMakefiles | Self::NMakeMakefiles => ".",
             Self::NinjaMultiConfig => "${CONFIGURATION}",
             Self::Xcode => "$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)",
             Self::VisualStudio(_) => "$(Configuration)",
@@ -185,7 +194,9 @@ impl GeneratorKind {
     #[must_use]
     pub const fn toolset_support(self) -> ToolsetSupport {
         match self {
-            Self::Ninja | Self::NinjaMultiConfig | Self::UnixMakefiles => ToolsetSupport::None,
+            Self::Ninja | Self::NinjaMultiConfig | Self::UnixMakefiles | Self::NMakeMakefiles => {
+                ToolsetSupport::None
+            }
             Self::Xcode => ToolsetSupport::Xcode,
             Self::VisualStudio(_) => ToolsetSupport::VisualStudio,
         }
@@ -205,12 +216,14 @@ impl GeneratorKind {
 
     /// `true` if the generator can be created on this host.
     ///
-    /// Xcode needs macOS. Visual Studio needs Windows, or the `vs-cross` Cargo feature
-    /// of this crate (structural tests only, never in a release binary).
+    /// Xcode needs macOS. NMake Makefiles needs Windows. Visual Studio needs Windows,
+    /// or the `vs-cross` Cargo feature of this crate (structural tests only, never in a
+    /// release binary).
     #[must_use]
     pub const fn host_available(self) -> bool {
         match self {
             Self::Ninja | Self::NinjaMultiConfig | Self::UnixMakefiles => true,
+            Self::NMakeMakefiles => cfg!(windows),
             Self::Xcode => cfg!(target_os = "macos"),
             Self::VisualStudio(_) => cfg!(any(windows, feature = "vs-cross")),
         }

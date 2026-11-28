@@ -1,5 +1,5 @@
 use rcmake_base::{
-    BString,
+    BString, ByteSlice as _,
     limits::Limits,
     list::{self, Empty},
 };
@@ -37,24 +37,55 @@ fn expand_into(
     out: &mut Vec<ExpandedArg>,
     budget: &mut ArgumentBudget,
 ) -> Result<(), ExpandError> {
+    let max_value = Limits::default().max_value_bytes;
     for arg in args {
-        let value = if arg.kind == ArgKind::Bracket {
-            arg.text.clone()
-        } else if let Some(value) = try_expand_simple_var(&arg.text, env) {
-            value?
-        } else {
-            expand(&arg.text, arg.line, env, Mode::ListfileArgument)?
-        };
         let expanded = |value| ExpandedArg {
             value,
             kind: arg.kind,
             line: arg.line,
         };
+        if arg.kind == ArgKind::Bracket {
+            budget.take(arg.text.len())?;
+            out.push(expanded(arg.text.clone()));
+            continue;
+        }
+        if arg.kind == ArgKind::Unquoted
+            && let Some(name) = simple_var_name(&arg.text)
+            && let Some(remaining) = max_value.checked_sub(name.len())
+        {
+            if let Some(value) = env.var_ref(name) {
+                if value.len() > remaining {
+                    return Err(ExpandError::resource_limit(
+                        "Variable expansion exceeded the value size limit.",
+                    ));
+                }
+                if value.is_empty() {
+                    continue;
+                }
+                if value.find_byte(b';').is_none() {
+                    budget.take(value.len())?;
+                    out.push(expanded(BString::from(value.into_owned())));
+                } else {
+                    for element in list::iter(&value, Empty::Drop) {
+                        budget.take(element.len())?;
+                        out.push(expanded(BString::from(element.into_owned())));
+                    }
+                }
+            } else {
+                env.missing_reference(name);
+            }
+            continue;
+        }
+        let value = if let Some(value) = try_expand_simple_var(&arg.text, env) {
+            value?
+        } else {
+            expand(&arg.text, arg.line, env, Mode::ListfileArgument)?
+        };
         if arg.kind == ArgKind::Unquoted {
             if value.is_empty() {
                 continue;
             }
-            if !value.contains(&b';') {
+            if value.find_byte(b';').is_none() {
                 budget.take(value.len())?;
                 out.push(expanded(value));
             } else {
@@ -71,26 +102,33 @@ fn expand_into(
     Ok(())
 }
 
+fn simple_var_name(src: &[u8]) -> Option<&[u8]> {
+    let name = src.strip_prefix(b"${")?.strip_suffix(b"}")?;
+    if name.is_empty() || name == LINE_VAR || !name.iter().all(|&byte| name_byte(byte)) {
+        return None;
+    }
+    Some(name)
+}
+
 /// Fast path for an exact `${NAME}` reference in argument expansion.
 fn try_expand_simple_var(
     src: &[u8],
     env: &mut dyn ExpandEnv,
 ) -> Option<Result<BString, ExpandError>> {
-    let name = src.strip_prefix(b"${")?.strip_suffix(b"}")?;
-    if name.is_empty() || name == LINE_VAR || !name.iter().all(|&byte| name_byte(byte)) {
-        return None;
-    }
+    let name = simple_var_name(src)?;
     let max = Limits::default().max_value_bytes;
     let remaining = max.checked_sub(name.len())?;
-    let value = env.var(name).unwrap_or_else(|| {
+    let value = if let Some(value) = env.var_ref(name) {
+        if value.len() > remaining {
+            return Some(Err(ExpandError::resource_limit(
+                "Variable expansion exceeded the value size limit.",
+            )));
+        }
+        BString::from(value.into_owned())
+    } else {
         env.missing_reference(name);
         BString::default()
-    });
-    if value.len() > remaining {
-        return Some(Err(ExpandError::resource_limit(
-            "Variable expansion exceeded the value size limit.",
-        )));
-    }
+    };
     Some(Ok(value))
 }
 
@@ -128,9 +166,9 @@ pub(crate) fn expand(
 ) -> Result<BString, ExpandError> {
     let max_bytes = Limits::default().max_value_bytes;
     let is_plain = match mode {
-        Mode::Argument | Mode::ListfileArgument => !src.iter().any(|&b| b == b'$' || b == b'\\'),
-        Mode::Template { at_only: true, .. } => !src.contains(&b'@'),
-        Mode::Template { at_only: false, .. } => !src.iter().any(|&b| b == b'$' || b == b'@'),
+        Mode::Argument | Mode::ListfileArgument => src.find_byteset(b"$\\").is_none(),
+        Mode::Template { at_only: true, .. } => src.find_byte(b'@').is_none(),
+        Mode::Template { at_only: false, .. } => src.find_byteset(b"$@").is_none(),
     };
     if is_plain && src.len() <= max_bytes {
         return Ok(BString::from(src));
@@ -168,7 +206,35 @@ impl<'a> Scanner<'a, '_> {
         } else {
             Vec::new()
         };
-        while let Some((&byte, rest)) = self.remaining.split_first() {
+        let outer_specials: Option<&[u8]> = if reference.is_none() {
+            Some(match self.mode {
+                Mode::Argument | Mode::ListfileArgument => b"$\\\n",
+                Mode::Template { at_only: true, .. } => b"@\n",
+                Mode::Template { at_only: false, .. } => b"$@\n",
+            })
+        } else {
+            None
+        };
+        while !self.remaining.is_empty() {
+            if let Some(specials) = outer_specials {
+                match self.remaining.find_byteset(specials) {
+                    Some(0) => {}
+                    Some(pos) => {
+                        let (plain, rest) = self.remaining.split_at(pos);
+                        self.remaining = rest;
+                        self.append(&mut output, plain)?;
+                    }
+                    None => {
+                        let plain = self.remaining;
+                        self.remaining = b"";
+                        self.append(&mut output, plain)?;
+                        break;
+                    }
+                }
+            }
+            let Some((&byte, rest)) = self.remaining.split_first() else {
+                break;
+            };
             self.remaining = rest;
             match byte {
                 b'}' if reference.is_some() => return Ok(output),
@@ -180,8 +246,7 @@ impl<'a> Scanner<'a, '_> {
                 b'@' if matches!(self.mode, Mode::Template { .. }) => {
                     if let Some((name, rest)) = delimited_name(rest, b'@') {
                         self.remaining = rest;
-                        let value = self.lookup(Reference::Normal, name, self.line);
-                        self.append_value(&mut output, &value)?;
+                        self.append_lookup(&mut output, Reference::Normal, name, self.line)?;
                     } else {
                         self.literal(&mut output, byte, reference.is_some())?;
                     }
@@ -190,18 +255,17 @@ impl<'a> Scanner<'a, '_> {
                     if let Some((reference, rest)) = self.reference_start(rest)? {
                         self.remaining = rest;
                         let line = self.line;
-                        let value = if depth < MAX_DEPTH
+                        if depth < MAX_DEPTH
                             && let Some((name, rest)) = delimited_name(rest, b'}')
                             && name.len() <= self.remaining_bytes
                         {
                             self.remaining = rest;
                             self.remaining_bytes -= name.len();
-                            self.lookup(reference, name, line)
+                            self.append_lookup(&mut output, reference, name, line)?;
                         } else {
                             let name = self.scan(Some(reference), depth + 1)?;
-                            self.lookup(reference, &name, line)
-                        };
-                        self.append_value(&mut output, &value)?;
+                            self.append_lookup(&mut output, reference, &name, line)?;
+                        }
                     } else {
                         self.append(&mut output, b"$")?;
                     }
@@ -303,56 +367,90 @@ impl<'a> Scanner<'a, '_> {
         error(message)
     }
 
-    fn lookup(&mut self, reference: Reference, name: &[u8], line: u32) -> BString {
-        let value = match reference {
+    fn append_lookup(
+        &mut self,
+        output: &mut Vec<u8>,
+        reference: Reference,
+        name: &[u8],
+        line: u32,
+    ) -> Result<(), ExpandError> {
+        let mode = self.mode;
+        match reference {
             Reference::Normal if name == LINE_VAR => {
-                return self
-                    .env
-                    .var(name)
-                    .unwrap_or_else(|| line.to_string().into());
+                if let Some(value) = self.env.var_ref(name) {
+                    return append_value_bytes(output, &value, mode, &mut self.remaining_bytes);
+                }
+                let text = line.to_string();
+                return append_value_bytes(
+                    output,
+                    text.as_bytes(),
+                    mode,
+                    &mut self.remaining_bytes,
+                );
             }
-            Reference::Normal => self.env.var(name),
-            Reference::Cache => self.env.cache_var(name),
-            Reference::Environment => self.env.env_var(name),
-        };
-        value.unwrap_or_else(|| {
-            self.env.missing_reference(name);
-            BString::default()
-        })
-    }
-
-    fn append_value(&mut self, output: &mut Vec<u8>, value: &[u8]) -> Result<(), ExpandError> {
-        if matches!(
-            self.mode,
-            Mode::Template {
-                escape_quotes: true,
-                ..
-            }
-        ) {
-            for part in value.split_inclusive(|&byte| byte == b'"') {
-                if let Some(prefix) = part.strip_suffix(b"\"") {
-                    self.append(output, prefix)?;
-                    self.append(output, b"\\\"")?;
-                } else {
-                    self.append(output, part)?;
+            Reference::Normal => {
+                if let Some(value) = self.env.var_ref(name) {
+                    return append_value_bytes(output, &value, mode, &mut self.remaining_bytes);
                 }
             }
-            Ok(())
-        } else {
-            self.append(output, value)
+            Reference::Cache => {
+                if let Some(value) = self.env.cache_var_ref(name) {
+                    return append_value_bytes(output, &value, mode, &mut self.remaining_bytes);
+                }
+            }
+            Reference::Environment => {
+                if let Some(value) = self.env.env_var(name) {
+                    return append_value_bytes(output, &value, mode, &mut self.remaining_bytes);
+                }
+            }
         }
+        self.env.missing_reference(name);
+        Ok(())
     }
 
     fn append(&mut self, output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ExpandError> {
-        self.remaining_bytes = self
-            .remaining_bytes
-            .checked_sub(bytes.len())
-            .ok_or_else(|| {
-                ExpandError::resource_limit("Variable expansion exceeded the value size limit.")
-            })?;
-        output.extend_from_slice(bytes);
-        Ok(())
+        append_bytes(output, bytes, &mut self.remaining_bytes)
     }
+}
+
+fn append_value_bytes(
+    output: &mut Vec<u8>,
+    value: &[u8],
+    mode: Mode,
+    remaining_bytes: &mut usize,
+) -> Result<(), ExpandError> {
+    if matches!(
+        mode,
+        Mode::Template {
+            escape_quotes: true,
+            ..
+        }
+    ) && value.find_byte(b'"').is_some()
+    {
+        for part in value.split_inclusive(|&byte| byte == b'"') {
+            if let Some(prefix) = part.strip_suffix(b"\"") {
+                append_bytes(output, prefix, remaining_bytes)?;
+                append_bytes(output, b"\\\"", remaining_bytes)?;
+            } else {
+                append_bytes(output, part, remaining_bytes)?;
+            }
+        }
+        Ok(())
+    } else {
+        append_bytes(output, value, remaining_bytes)
+    }
+}
+
+fn append_bytes(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    remaining_bytes: &mut usize,
+) -> Result<(), ExpandError> {
+    *remaining_bytes = remaining_bytes.checked_sub(bytes.len()).ok_or_else(|| {
+        ExpandError::resource_limit("Variable expansion exceeded the value size limit.")
+    })?;
+    output.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn name_byte(byte: u8) -> bool {
@@ -370,4 +468,77 @@ fn delimited_name(src: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
 
 pub(crate) fn error(message: impl Into<BString>) -> ExpandError {
     ExpandError::syntax(message)
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use std::borrow::Cow;
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::ExpandEnv;
+
+    struct BorrowEnv {
+        vars: BTreeMap<BString, BString>,
+        var_clones: usize,
+        var_borrows: usize,
+    }
+
+    impl ExpandEnv for BorrowEnv {
+        fn var(&mut self, name: &[u8]) -> Option<BString> {
+            self.var_clones += 1;
+            self.vars.get(name).cloned()
+        }
+
+        fn var_ref(&mut self, name: &[u8]) -> Option<Cow<'_, [u8]>> {
+            self.var_borrows += 1;
+            self.vars.get(name).map(|v| Cow::Borrowed(v.as_slice()))
+        }
+
+        fn cache_var(&mut self, _name: &[u8]) -> Option<BString> {
+            None
+        }
+
+        fn env_var(&mut self, _name: &[u8]) -> Option<BString> {
+            None
+        }
+
+        fn current_line(&self) -> u32 {
+            10
+        }
+    }
+
+    #[test]
+    fn expand_uses_borrowed_lookups_and_bulk_literal_scanning() {
+        let mut env = BorrowEnv {
+            vars: BTreeMap::from([
+                ("A".into(), "alpha".into()),
+                ("B".into(), "beta".into()),
+                ("LIST".into(), "one;two;three".into()),
+            ]),
+            var_clones: 0,
+            var_borrows: 0,
+        };
+        let result = expand_string(
+            b"prefix_${A}_middle\nline_${CMAKE_CURRENT_LIST_LINE}_${B}_\\t_suffix",
+            &mut env,
+        );
+        assert_eq!(
+            result.ok(),
+            Some(BString::from("prefix_alpha_middle\nline_11_beta_\t_suffix"))
+        );
+        assert_eq!(env.var_clones, 0);
+        assert_eq!(env.var_borrows, 3);
+
+        let mut out = Vec::new();
+        let arg = Argument {
+            kind: ArgKind::Unquoted,
+            text: "${LIST}".into(),
+            line: 1,
+            span: 0..7,
+        };
+        assert!(expand_args(&[arg], &mut env, &mut out).is_ok());
+        assert_eq!(out.len(), 3);
+        assert_eq!(env.var_clones, 0);
+    }
 }

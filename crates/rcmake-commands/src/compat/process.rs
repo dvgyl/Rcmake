@@ -81,7 +81,7 @@ pub(super) fn exec_program(cx: &mut Cx<'_>, _: &[ExpandedArg]) -> CmdResult {
             return Err(CmdError::Reported);
         }
         PolicyStatus::Warn => {
-            crate::policy_misc::issue_warning(cx, policy, b"", b"\nUse execute_process() instead.");
+            crate::policy_misc::issue_warning(cx, policy, b"", b"Use execute_process() instead.");
         }
         PolicyStatus::Old => {}
     }
@@ -141,6 +141,7 @@ pub(super) fn exec_program(cx: &mut Cx<'_>, _: &[ExpandedArg]) -> CmdResult {
         stderr: Output::SharedWithStdout,
         timeout: Some(Duration::from_secs(120)),
         tee: print,
+        default_error_mode: false,
     };
     let outcome = cx.host().run(&request, &mut |_, bytes| {
         cx.host().write_out(Stream::Stdout, bytes);

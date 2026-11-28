@@ -37,6 +37,82 @@ impl Presets {
             .map(|record| &record.summary)
     }
 
+    /// List all presets in declaration order, including hidden presets.
+    pub fn list_all(&self, kind: PresetKind) -> impl Iterator<Item = &PresetSummary> {
+        self.records
+            .get(&kind)
+            .into_iter()
+            .flat_map(|records| records.values())
+            .map(|record| &record.summary)
+    }
+
+    /// Inspect a preset without rejecting hidden or disabled presets.
+    ///
+    /// Returns `Ok(None)` if no preset of `kind` with `name` exists.
+    /// Evaluates inheritance, macros, environment variables, and conditions against `env`.
+    pub fn inspect(
+        &self,
+        kind: PresetKind,
+        name: &[u8],
+        env: &EnvSnapshot,
+    ) -> Result<Option<crate::PresetInspection>, PresetsError> {
+        let Some(record) = self.get(kind, name) else {
+            return Ok(None);
+        };
+        let (mut preset, mut enabled) = self.expand_for_inspect(record, env)?;
+        if let Some(associated) = preset
+            .configure_preset
+            .as_ref()
+            .filter(|name| !name.is_empty())
+            && let Some(cfg_record) = self.get(PresetKind::Configure, associated.as_slice())
+        {
+            let (cfg_resolved, cfg_enabled) = self.expand_for_inspect(cfg_record, env)?;
+            preset.binary_dir = cfg_resolved.binary_dir;
+            if !cfg_enabled {
+                enabled = false;
+            }
+        }
+        if let PresetSettings::Workflow(workflow) = &preset.settings {
+            for step in &workflow.steps {
+                if let Some(step_record) = self.get(step.kind, step.name.as_slice()) {
+                    let (_, step_enabled) = self.expand_for_inspect(step_record, env)?;
+                    if !step_enabled {
+                        enabled = false;
+                    }
+                }
+            }
+        }
+        Ok(Some(crate::PresetInspection {
+            preset,
+            hidden: record.hidden,
+            enabled,
+            condition: record
+                .condition
+                .as_ref()
+                .map(|cond| cond.1.as_ref().clone()),
+            inherits: record.inherits.clone(),
+            source_file: record.source.path.clone(),
+        }))
+    }
+
+    fn expand_for_inspect(
+        &self,
+        record: &Record,
+        env: &EnvSnapshot,
+    ) -> Result<(ResolvedPreset, bool), PresetsError> {
+        self.expand_record(record, env).map_err(|error| {
+            if expand::is_vendor_error(&error) {
+                PresetsError::new(format!(
+                    "Could not evaluate {} preset \"{}\": Invalid macro expansion",
+                    record.summary.kind.label(),
+                    record.summary.name
+                ))
+            } else {
+                error
+            }
+        })
+    }
+
     /// Get the JSON condition of a preset, including a condition it inherits.
     #[must_use]
     pub fn preset_condition(&self, kind: PresetKind, name: &[u8]) -> Option<&rcmake_json::Value> {
@@ -410,9 +486,13 @@ impl Presets {
         if let Some(text) = value
             && !text.is_empty()
         {
-            *text = path::from_native_cmake(&graph::normalize(
-                &self.source_dir.join(path::to_native(text.as_slice())),
-            ));
+            let native = path::to_native(text.as_slice());
+            let resolved = if native.has_root() {
+                graph::normalize(&native)
+            } else {
+                graph::normalize(&self.source_dir.join(native))
+            };
+            *text = path::from_native_cmake(&resolved);
         }
     }
 }

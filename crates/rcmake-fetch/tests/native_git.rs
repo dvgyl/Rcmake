@@ -42,6 +42,7 @@ fn git(host: &dyn Host, cwd: &Path, args: &[&str]) -> Result<String, Box<dyn std
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(10)),
             tee: false,
+            default_error_mode: false,
         },
         1024 * 1024,
     )?;

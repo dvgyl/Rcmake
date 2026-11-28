@@ -35,6 +35,14 @@ impl<T: Copy> LayeredStack<T> {
         self.above.len() + 1
     }
 
+    /// Visit every entry from the strong root up to the top with its weak write-through flag.
+    pub(crate) fn for_each_entry(&self, mut visit: impl FnMut(&T, bool)) {
+        visit(&self.root, false);
+        for entry in &self.above {
+            visit(&entry.state, entry.weak);
+        }
+    }
+
     /// Effective state (top entry).
     pub(crate) fn top(&self) -> &T {
         self.above.last().map_or(&self.root, |e| &e.state)

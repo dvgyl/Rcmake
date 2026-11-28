@@ -369,6 +369,7 @@ fn run_tool(
         stderr: Output::SharedWithStdout,
         timeout: Some(std::time::Duration::from_secs(1800)),
         tee: false,
+        default_error_mode: false,
     };
     match cx.host.run(&request, &mut |_, _| {}) {
         Ok(result) => {

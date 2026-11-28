@@ -30,8 +30,22 @@ impl ExpandEnv for CxEnv<'_, '_> {
         self.cx.var(name)
     }
 
+    fn var_ref(&mut self, name: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        self.cx.interp.observe_replay_variable_access(name);
+        self.cx.interp.read_var_ref(name)
+    }
+
     fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
         self.cx.cache().get(name).map(|entry| entry.value.clone())
+    }
+
+    fn cache_var_ref(&mut self, name: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        self.cx
+            .interp
+            .project
+            .cache
+            .get(name)
+            .map(|entry| std::borrow::Cow::Borrowed(entry.value.as_slice()))
     }
 
     fn env_var(&mut self, name: &[u8]) -> Option<BString> {
@@ -66,8 +80,32 @@ impl ExpandEnv for Interp {
         self.read_var(name)
     }
 
+    fn var_ref(&mut self, name: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        if name == b"CMAKE_CURRENT_LIST_LINE" {
+            if self.trace_expanding {
+                return Some(
+                    self.read_var_ref(name)
+                        .unwrap_or(std::borrow::Cow::Borrowed(b"")),
+                );
+            }
+            if let Some(id) = &self.hooks.top_defer_id {
+                let mut line = b"DEFERRED:".to_vec();
+                line.extend_from_slice(id);
+                return Some(std::borrow::Cow::Owned(line));
+            }
+        }
+        self.read_var_ref(name)
+    }
+
     fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
         self.project.cache.get(name).map(|e| e.value.clone())
+    }
+
+    fn cache_var_ref(&mut self, name: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        self.project
+            .cache
+            .get(name)
+            .map(|e| std::borrow::Cow::Borrowed(e.value.as_slice()))
     }
 
     fn env_var(&mut self, name: &[u8]) -> Option<BString> {

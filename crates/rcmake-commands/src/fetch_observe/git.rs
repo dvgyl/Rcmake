@@ -797,6 +797,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         // A bare repository (`core.bare=true`) and a checkout below another work
         // tree (`core.worktree`) give other `rev-parse` answers.
@@ -877,6 +878,7 @@ mod tests {
             stderr: Output::Capture,
             timeout: None,
             tee: false,
+            default_error_mode: false,
         };
         assert!(no_gitlinks(&host, &request(Vec::new()), &command, pin));
         assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 2);

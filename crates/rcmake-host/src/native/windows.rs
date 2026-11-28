@@ -42,14 +42,46 @@ pub(super) fn open_input(path: &Path) -> io::Result<File> {
 }
 
 pub(super) fn logical_cwd(physical: &Path, pwd: Option<&Path>) -> PathBuf {
+    let Some(pwd) = pwd.filter(|path| path.is_absolute()) else {
+        return physical.to_path_buf();
+    };
     let same_directory = |candidate: &Path| -> io::Result<bool> {
         let a = open_attributes(physical, FILE_READ_ATTRIBUTES, Follow::Yes)?;
         let b = open_attributes(candidate, FILE_READ_ATTRIBUTES, Follow::Yes)?;
         same_file(&a, &b)
     };
-    pwd.filter(|path| path.is_absolute() && same_directory(path).unwrap_or(false))
-        .unwrap_or(physical)
-        .to_path_buf()
+    if !same_directory(pwd).unwrap_or(false) {
+        return physical.to_path_buf();
+    }
+    let normalized = path_on_disk(pwd);
+    if normalized != pwd && !same_directory(&normalized).unwrap_or(false) {
+        return physical.to_path_buf();
+    }
+    if crate::path::from_native_cmake(&normalized)
+        .eq_ignore_ascii_case(&crate::path::from_native_cmake(physical))
+    {
+        return physical.to_path_buf();
+    }
+    normalized
+}
+
+/// Recover the on-disk case spelling of `path` on Windows without dereferencing symlinks.
+pub(super) fn path_on_disk(path: &Path) -> PathBuf {
+    crate::path::path_on_disk_with(path, |dir| {
+        let entries = fs::read_dir(dir).map_err(|err| HostError::from_io(err, Some(dir.into())))?;
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let kind = entry
+                .file_type()
+                .map(file_kind)
+                .unwrap_or(crate::FileKind::Other);
+            out.push(crate::DirEntry {
+                name: crate::path::from_native(Path::new(&entry.file_name())),
+                kind,
+            });
+        }
+        Ok(out)
+    })
 }
 
 pub(super) fn same_file(a: &File, b: &File) -> io::Result<bool> {

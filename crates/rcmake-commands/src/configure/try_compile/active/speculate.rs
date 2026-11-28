@@ -307,22 +307,23 @@ impl PreparedProbe {
             return;
         }
 
-        // 3. Stock `check_c_compiler_flag` / `check_cxx_compiler_flag`
-        //    (straight-line or active `foreach()`): source (`src.c` / `src.cxx`) is
-        //    constant; only `target_compile_definitions` / `target_compile_options` in
-        //    `CMakeLists.txt` change per flag.
+        // 3. Stock `check_c_compiler_flag` / `check_cxx_compiler_flag` and
+        //    `check_c_source_compiles` / `check_cxx_source_compiles`
+        //    (straight-line or active `foreach()`): check `CheckCompilerFlag` (`skip_calls = 3`)
+        //    before `CheckSourceCompiles` (`skip_calls = 2`) since both use `src.c`/`src.cxx`
+        //    with `_source`.
         if let [Source::Variable(source_name, var_name)] = sources.as_slice()
             && matches!(*source_name, b"src.c" | b"src.cxx")
             && *var_name == b"_source"
         {
-            let kind = if *source_name == b"src.cxx" {
+            let flag_kind = if *source_name == b"src.cxx" {
                 ProbeKind::CxxCompilerFlag
             } else {
                 ProbeKind::CCompilerFlag
             };
-            if let Some((caller_depth, upcoming)) = collect_caller_candidates(cx, 3, kind)
+            if let Some((caller_depth, upcoming)) = collect_caller_candidates(cx, 3, flag_kind)
                 && !upcoming.is_empty()
-                && is_stock_check_compiler_flag_call(cx, caller_depth, kind)
+                && is_stock_check_compiler_flag_call(cx, caller_depth, flag_kind)
             {
                 self.submit_check_compiler_flag_candidates(
                     cx,
@@ -331,11 +332,59 @@ impl PreparedProbe {
                     child,
                     directory,
                     caller_depth,
-                    kind,
+                    flag_kind,
                     upcoming,
                 );
                 return;
             }
+            let src_kind = if *source_name == b"src.cxx" {
+                ProbeKind::CxxSourceCompiles
+            } else {
+                ProbeKind::CSourceCompiles
+            };
+            if let Some((caller_depth, upcoming)) = collect_caller_candidates(cx, 2, src_kind)
+                && !upcoming.is_empty()
+                && is_stock_check_source_compiles_call(cx, caller_depth, src_kind)
+            {
+                self.submit_check_source_compiles_candidates(
+                    cx,
+                    &queue,
+                    target,
+                    child,
+                    directory,
+                    caller_depth,
+                    source_name,
+                    src_kind,
+                    upcoming,
+                );
+                return;
+            }
+        }
+
+        // 3b. Stock `check_function_exists` (straight-line or active `foreach()`):
+        //     `CheckFunctionExists.c` / `.cxx` is constant; only
+        //     `CHECK_FUNCTION_EXISTS=<fn>` in `target_compile_definitions` changes.
+        if let [Source::Copy(source_name, _)] = sources.as_slice()
+            && matches!(
+                *source_name,
+                b"CheckFunctionExists.c" | b"CheckFunctionExists.cxx"
+            )
+            && let Some((caller_depth, upcoming)) =
+                collect_caller_candidates(cx, 1, ProbeKind::FunctionExists)
+            && !upcoming.is_empty()
+            && is_stock_check_function_exists_call(cx, caller_depth)
+        {
+            self.submit_check_function_exists_candidates(
+                cx,
+                &queue,
+                target,
+                child,
+                directory,
+                caller_depth,
+                source_name,
+                upcoming,
+            );
+            return;
         }
 
         // 4. Direct `try_compile` (`SOURCE_FROM_CONTENT` or `SOURCE_FROM_VAR`): straight-line
@@ -390,12 +439,15 @@ impl PreparedProbe {
         directory: &Path,
         candidates: Vec<(BString, BString)>,
     ) {
-        let environment = self.runtime.host.env_all();
+        let max_fanout = speculation_fanout_limit(cx);
+        let mut submitted = 0usize;
+        let env_snapshot = self.runtime.env_snapshot();
+        let environment = env_snapshot.raw.to_vec();
         let template = super::TemplateCapture::new(&self.recipe.bindings);
         // `self.recipe` does not change in this loop, so hash it at most once.
         let mut current_key = None;
         for (name, content) in candidates {
-            if !queue.has_capacity() {
+            if submitted >= max_fanout || !queue.has_capacity() {
                 break;
             }
             let Some((project, language)) = super::super::project::render_literal_probe(
@@ -437,6 +489,7 @@ impl PreparedProbe {
                     &name,
                     &self.runtime.cache.memo,
                     &self.compiler,
+                    &env_snapshot,
                 ) else {
                     continue;
                 };
@@ -465,6 +518,7 @@ impl PreparedProbe {
                 false,
                 directory.as_os_str().len(),
             );
+            submitted += 1;
         }
     }
 
@@ -520,10 +574,13 @@ impl PreparedProbe {
         {
             return;
         }
-        let environment = self.runtime.host.env_all();
+        let max_fanout = speculation_fanout_limit(cx);
+        let mut submitted = 0usize;
+        let env_snapshot = self.runtime.env_snapshot();
+        let environment = env_snapshot.raw.to_vec();
         let current = compute_probe_key(&self.recipe);
         for candidate in upcoming {
-            if !queue.has_capacity() {
+            if submitted >= max_fanout || !queue.has_capacity() {
                 break;
             }
             let ExpandedProbeSpec::IncludeFile { header } = candidate.spec else {
@@ -572,6 +629,7 @@ impl PreparedProbe {
                 true,
                 directory.as_os_str().len(),
             );
+            submitted += 1;
         }
     }
 
@@ -594,10 +652,13 @@ impl PreparedProbe {
         {
             return;
         }
-        let environment = self.runtime.host.env_all();
+        let max_fanout = speculation_fanout_limit(cx);
+        let mut submitted = 0usize;
+        let env_snapshot = self.runtime.env_snapshot();
+        let environment = env_snapshot.raw.to_vec();
         let current = compute_probe_key(&self.recipe);
         for candidate in upcoming {
-            if !queue.has_capacity() {
+            if submitted >= max_fanout || !queue.has_capacity() {
                 break;
             }
             let ExpandedProbeSpec::SymbolExists { symbol, headers } = candidate.spec else {
@@ -637,6 +698,7 @@ impl PreparedProbe {
                 true,
                 directory.as_os_str().len(),
             );
+            submitted += 1;
         }
     }
 
@@ -680,10 +742,13 @@ impl PreparedProbe {
         };
 
         let template = super::TemplateCapture::new(&self.recipe.bindings);
-        let environment = self.runtime.host.env_all();
+        let max_fanout = speculation_fanout_limit(cx);
+        let mut submitted = 0usize;
+        let env_snapshot = self.runtime.env_snapshot();
+        let environment = env_snapshot.raw.to_vec();
         let current = compute_probe_key(&self.recipe);
         for candidate in upcoming {
-            if !queue.has_capacity() {
+            if submitted >= max_fanout || !queue.has_capacity() {
                 break;
             }
             let flag = match (&candidate.spec, kind) {
@@ -732,6 +797,212 @@ impl PreparedProbe {
                 true,
                 directory.as_os_str().len(),
             );
+            submitted += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_check_source_compiles_candidates(
+        &self,
+        cx: &Cx<'_>,
+        queue: &ProbeQueue,
+        target: &str,
+        child: &ChildConfig,
+        directory: &Path,
+        caller_depth: usize,
+        source_name: &[u8],
+        kind: ProbeKind,
+        upcoming: Vec<ExpandedProbeCandidate>,
+    ) {
+        let expect_cxx = kind == ProbeKind::CxxSourceCompiles;
+        if self.compiler.cxx() != expect_cxx
+            || self.compiler.has_external_source()
+            || !self.compiler.confines_speculative_writes()
+        {
+            return;
+        }
+        let Some(current_var) = cx.peek_var(b"_var") else {
+            return;
+        };
+        let Some(current_lists) = self
+            .recipe
+            .files
+            .get(b"CMakeLists.txt".as_slice())
+            .and_then(|template| template.render_bounded(&self.recipe.bindings, 1 << 20))
+        else {
+            return;
+        };
+        let Some((prefix, suffix)) = split_first_compile_def(&current_lists, target, current_var)
+        else {
+            return;
+        };
+
+        let template = super::TemplateCapture::new(&self.recipe.bindings);
+        let max_fanout = speculation_fanout_limit(cx);
+        let mut submitted = 0usize;
+        let env_snapshot = self.runtime.env_snapshot();
+        let environment = env_snapshot.raw.to_vec();
+        let current = compute_probe_key(&self.recipe);
+        for candidate in upcoming {
+            if submitted >= max_fanout || !queue.has_capacity() {
+                break;
+            }
+            let source_body = match (&candidate.spec, kind) {
+                (ExpandedProbeSpec::CSourceCompiles { source }, ProbeKind::CSourceCompiles)
+                | (ExpandedProbeSpec::CxxSourceCompiles { source }, ProbeKind::CxxSourceCompiles) => {
+                    source
+                }
+                _ => continue,
+            };
+            if cx
+                .peek_var_at_depth(caller_depth, &candidate.result)
+                .is_some()
+            {
+                continue;
+            }
+            if !valid_compile_def_ident(&candidate.result) {
+                continue;
+            }
+            let mut def_arg = Vec::with_capacity(2 + candidate.result.len());
+            def_arg.extend_from_slice(b"-D");
+            def_arg.extend_from_slice(&candidate.result);
+            if !compiler::admit_definition(&def_arg) {
+                continue;
+            }
+            let mut content = Vec::with_capacity(source_body.len().saturating_add(1));
+            content.extend_from_slice(source_body);
+            content.push(b'\n');
+            if !compiler::admit_source(source_name, &content) {
+                continue;
+            }
+            let Some(source) = Templated::literal(&content) else {
+                continue;
+            };
+            let mut next_lists = BString::default();
+            next_lists.extend_from_slice(prefix);
+            write_bracket_arg(&mut next_lists, &candidate.result);
+            next_lists.extend_from_slice(suffix);
+            let Some(project) = template.capture(&next_lists) else {
+                continue;
+            };
+            let mut recipe = self.recipe.clone();
+            recipe
+                .files
+                .insert(BString::from("CMakeLists.txt"), project);
+            recipe.files.insert(BString::from(source_name), source);
+            let key = compute_probe_key(&recipe);
+            if key == current {
+                continue;
+            }
+            self.enqueue_recipe(
+                cx,
+                queue,
+                recipe,
+                environment.clone(),
+                Arc::clone(&self.compiler),
+                target,
+                child,
+                self.bound.clone(),
+                true,
+                directory.as_os_str().len(),
+            );
+            submitted += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_check_function_exists_candidates(
+        &self,
+        cx: &Cx<'_>,
+        queue: &ProbeQueue,
+        target: &str,
+        child: &ChildConfig,
+        directory: &Path,
+        caller_depth: usize,
+        source_name: &[u8],
+        upcoming: Vec<ExpandedProbeCandidate>,
+    ) {
+        let expect_cxx = source_name == b"CheckFunctionExists.cxx";
+        if self.compiler.cxx() != expect_cxx
+            || self.compiler.has_external_source()
+            || !self.compiler.confines_speculative_writes()
+        {
+            return;
+        }
+        let Some(current_lists) = self
+            .recipe
+            .files
+            .get(b"CMakeLists.txt".as_slice())
+            .and_then(|template| template.render_bounded(&self.recipe.bindings, 1 << 20))
+        else {
+            return;
+        };
+        let Some((prefix, suffix)) =
+            split_first_compile_def_prefix(&current_lists, target, b"CHECK_FUNCTION_EXISTS=")
+        else {
+            return;
+        };
+
+        let template = super::TemplateCapture::new(&self.recipe.bindings);
+        let max_fanout = speculation_fanout_limit(cx);
+        let mut submitted = 0usize;
+        let env_snapshot = self.runtime.env_snapshot();
+        let environment = env_snapshot.raw.to_vec();
+        let current = compute_probe_key(&self.recipe);
+        for candidate in upcoming {
+            if submitted >= max_fanout || !queue.has_capacity() {
+                break;
+            }
+            let ExpandedProbeSpec::FunctionExists { function } = candidate.spec else {
+                continue;
+            };
+            if cx
+                .peek_var_at_depth(caller_depth, &candidate.result)
+                .is_some_and(|value| value.as_slice() != candidate.result.as_slice())
+            {
+                continue;
+            }
+            if !safe_c_function_name(&function) {
+                continue;
+            }
+            let mut def_value =
+                Vec::with_capacity(b"CHECK_FUNCTION_EXISTS=".len() + function.len());
+            def_value.extend_from_slice(b"CHECK_FUNCTION_EXISTS=");
+            def_value.extend_from_slice(&function);
+            let mut def_arg = Vec::with_capacity(2 + def_value.len());
+            def_arg.extend_from_slice(b"-D");
+            def_arg.extend_from_slice(&def_value);
+            if !compiler::admit_definition(&def_arg) {
+                continue;
+            }
+            let mut next_lists = BString::default();
+            next_lists.extend_from_slice(prefix);
+            write_bracket_arg(&mut next_lists, &def_value);
+            next_lists.extend_from_slice(suffix);
+            let Some(project) = template.capture(&next_lists) else {
+                continue;
+            };
+            let mut recipe = self.recipe.clone();
+            recipe
+                .files
+                .insert(BString::from("CMakeLists.txt"), project);
+            let key = compute_probe_key(&recipe);
+            if key == current {
+                continue;
+            }
+            self.enqueue_recipe(
+                cx,
+                queue,
+                recipe,
+                environment.clone(),
+                Arc::clone(&self.compiler),
+                target,
+                child,
+                self.bound.clone(),
+                true,
+                directory.as_os_str().len(),
+            );
+            submitted += 1;
         }
     }
 
@@ -782,6 +1053,184 @@ impl PreparedProbe {
             child_bytes,
         );
     }
+}
+
+fn speculation_fanout_limit(cx: &Cx<'_>) -> usize {
+    (cx.host().system().cpu_count as usize)
+        .saturating_sub(1)
+        .max(1)
+}
+
+fn valid_compile_def_ident(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn safe_c_function_name(value: &[u8]) -> bool {
+    let Some((&first, rest)) = value.split_first() else {
+        return false;
+    };
+    value.len() <= 256
+        && (first.is_ascii_alphabetic() || first == b'_')
+        && rest
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn is_stock_check_source_compiles_call(cx: &Cx<'_>, caller_depth: usize, kind: ProbeKind) -> bool {
+    if !is_stock_check_common(cx, caller_depth) {
+        return false;
+    }
+    let (wrapper_mod, wrapper_cmd) = match kind {
+        ProbeKind::CSourceCompiles => (
+            "CheckCSourceCompiles.cmake",
+            b"check_c_source_compiles".as_slice(),
+        ),
+        ProbeKind::CxxSourceCompiles => (
+            "CheckCXXSourceCompiles.cmake",
+            b"check_cxx_source_compiles".as_slice(),
+        ),
+        _ => return false,
+    };
+    let (Some(wrapper_canon), Some(compiles_canon)) = (
+        canonical_module(cx, wrapper_mod),
+        canonical_module(cx, "Internal/CheckSourceCompiles.cmake"),
+    ) else {
+        return false;
+    };
+    let backtrace = cx.backtrace();
+    let mut frames = backtrace.frames();
+    let (Some(f0), Some(f1)) = (frames.next(), frames.next()) else {
+        return false;
+    };
+    let host = cx.host();
+    if !host
+        .canonicalize(&path::to_native(&f0.file))
+        .is_ok_and(|canon| canon == compiles_canon)
+        || !host
+            .canonicalize(&path::to_native(&f1.file))
+            .is_ok_and(|canon| canon == wrapper_canon)
+    {
+        return false;
+    }
+    command_defined_in(cx, wrapper_cmd, &wrapper_canon)
+        && command_defined_in(cx, b"cmake_check_source_compiles", &compiles_canon)
+}
+
+fn is_stock_check_function_exists_call(cx: &Cx<'_>, caller_depth: usize) -> bool {
+    if !is_stock_check_common(cx, caller_depth) {
+        return false;
+    }
+    let Some(expected_canon) = canonical_module(cx, "CheckFunctionExists.cmake") else {
+        return false;
+    };
+    let backtrace = cx.backtrace();
+    let Some(frame) = backtrace.top() else {
+        return false;
+    };
+    cx.host()
+        .canonicalize(&path::to_native(&frame.file))
+        .is_ok_and(|canon| canon == expected_canon)
+        && command_defined_in(cx, b"check_function_exists", &expected_canon)
+}
+
+/// Split `lists` around the exact bracket-quoted `expected_value` appearing as the first
+/// argument of `target_compile_definitions(<target> PRIVATE ...)`.
+fn split_first_compile_def<'a>(
+    lists: &'a [u8],
+    target: &str,
+    expected_value: &[u8],
+) -> Option<(&'a [u8], &'a [u8])> {
+    let header = format!("target_compile_definitions({target} PRIVATE ");
+    let mut expected_arg = BString::default();
+    write_bracket_arg(&mut expected_arg, expected_value);
+    let mut needle = Vec::with_capacity(header.len() + expected_arg.len());
+    needle.extend_from_slice(header.as_bytes());
+    needle.extend_from_slice(&expected_arg);
+    let mut match_pos = None;
+    let mut offset = 0usize;
+    while let Some(rel) = lists
+        .get(offset..)?
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())
+    {
+        let pos = offset.saturating_add(rel);
+        let at_line_start = pos == 0 || lists.get(pos - 1) == Some(&b'\n');
+        let after = lists.get(pos + needle.len()).copied();
+        if at_line_start && matches!(after, Some(b' ' | b')')) {
+            if match_pos.is_some() {
+                return None;
+            }
+            match_pos = Some(pos);
+        }
+        offset = pos.saturating_add(1);
+    }
+    let start = match_pos?;
+    let arg_start = start.checked_add(header.len())?;
+    let arg_end = start.checked_add(needle.len())?;
+    Some((lists.get(..arg_start)?, lists.get(arg_end..)?))
+}
+
+/// Split `lists` around the first bracket-quoted argument of
+/// `target_compile_definitions(<target> PRIVATE ...)` whose decoded value starts with `prefix`.
+fn split_first_compile_def_prefix<'a>(
+    lists: &'a [u8],
+    target: &str,
+    prefix: &[u8],
+) -> Option<(&'a [u8], &'a [u8])> {
+    let header = format!("target_compile_definitions({target} PRIVATE ");
+    let header_bytes = header.as_bytes();
+    let mut found = None;
+    let mut offset = 0usize;
+    while let Some(rel) = lists
+        .get(offset..)?
+        .windows(header_bytes.len())
+        .position(|window| window == header_bytes)
+    {
+        let pos = offset.saturating_add(rel);
+        if pos == 0 || lists.get(pos - 1) == Some(&b'\n') {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(pos);
+        }
+        offset = pos.saturating_add(1);
+    }
+    let arg_start = found?.checked_add(header_bytes.len())?;
+    let rest = lists.get(arg_start..)?;
+    if rest.first() != Some(&b'[') {
+        return None;
+    }
+    let eq_count = rest
+        .get(1..)?
+        .iter()
+        .take_while(|&&byte| byte == b'=')
+        .count();
+    let open_len = 1 + eq_count + 1;
+    if rest.get(open_len - 1) != Some(&b'[') {
+        return None;
+    }
+    let mut close = Vec::with_capacity(open_len);
+    close.push(b']');
+    close.extend(std::iter::repeat_n(b'=', eq_count));
+    close.push(b']');
+    let body = rest.get(open_len..)?;
+    let close_rel = body
+        .windows(close.len())
+        .position(|window| window == close.as_slice())?;
+    let value = body.get(..close_rel)?;
+    if !value.starts_with(prefix) {
+        return None;
+    }
+    let arg_end = arg_start.checked_add(open_len + close_rel + close.len())?;
+    let after = lists.get(arg_end).copied();
+    if !matches!(after, Some(b' ' | b')')) {
+        return None;
+    }
+    Some((lists.get(..arg_start)?, lists.get(arg_end..)?))
 }
 
 fn canonical_module(cx: &Cx<'_>, rel: &str) -> Option<PathBuf> {
@@ -1223,6 +1672,7 @@ impl SpeculativeExecution {
                 }),
                 prewarm: None,
                 prelude: super::super::prelude::PreludePlan::Bypass,
+                journal: None,
             },
             |_, _| {},
         );

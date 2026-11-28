@@ -1,4 +1,5 @@
 use std::io::ErrorKind;
+use std::path::Path;
 
 use jiff::Timestamp;
 use rcmake_archive::{
@@ -7,7 +8,10 @@ use rcmake_archive::{
     parse_archive_mtime,
 };
 use rcmake_base::BString;
-use rcmake_host::{Follow, Stream, path::to_native};
+use rcmake_host::{
+    FileKind, Follow, Host, Stream,
+    path::{from_native_cmake, to_native},
+};
 
 use super::{ToolCtx, error, is_dir, path, read_all, usage, write};
 
@@ -289,8 +293,7 @@ fn create(archive: &[u8], opts: TarOptions<'_>, verbose: bool, cx: &ToolCtx<'_>)
         error(cx, &[b"tar: No files or directories specified\n"]);
     }
     if let Some(encoding) = opts.encoding
-        && !(encoding.eq_ignore_ascii_case(b"UTF-8")
-            || (encoding == b"OEM" && (!cfg!(windows) || opts.format == Some(b"7zip"))))
+        && !(encoding.eq_ignore_ascii_case(b"UTF-8") || encoding.eq_ignore_ascii_case(b"OEM"))
     {
         return creation_error(
             cx,
@@ -299,6 +302,19 @@ fn create(archive: &[u8], opts: TarOptions<'_>, verbose: bool, cx: &ToolCtx<'_>)
                 b"CMake Error: Archive pathname encoding is not supported: ",
                 encoding,
                 b"\n",
+            ],
+        );
+    }
+    if oem_restricts_pathnames(opts.format, opts.encoding, cfg!(windows))
+        && let Some(bad) = first_non_oem_input(cx.host, cx.cwd, &opts.inputs)
+    {
+        return creation_error(
+            cx,
+            archive,
+            &[
+                b"CMake Error: archive_write_header: Can't translate pathname '",
+                &bad,
+                b"' to OEM\n",
             ],
         );
     }
@@ -451,6 +467,88 @@ fn creation_error(cx: &ToolCtx<'_>, archive: &[u8], message: &[&[u8]]) -> i32 {
         &[b"CMake Error: Problem creating tar:\n  ", archive, b"\n"],
     )
 }
+
+fn oem_restricts_pathnames(format: Option<&[u8]>, encoding: Option<&[u8]>, windows: bool) -> bool {
+    windows
+        && encoding.is_some_and(|enc| enc.eq_ignore_ascii_case(b"OEM"))
+        && matches!(format.unwrap_or(b"paxr"), b"gnutar" | b"zip")
+}
+
+fn first_non_oem_input(host: &dyn Host, cwd: &Path, inputs: &[BString]) -> Option<BString> {
+    let mut visited = 0usize;
+    for input in inputs {
+        let full = cwd.join(to_native(input));
+        let display = from_native_cmake(&to_native(input));
+        if let Some(found) = scan_non_oem(host, &full, &display, 0, &mut visited) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn scan_non_oem(
+    host: &dyn Host,
+    path: &Path,
+    display: &[u8],
+    depth: usize,
+    visited: &mut usize,
+) -> Option<BString> {
+    if depth > 64 || *visited >= 100_000 {
+        return None;
+    }
+    *visited += 1;
+    if !is_oem_cp437_representable(display) {
+        return Some(BString::from(display));
+    }
+    let meta = host.metadata(path, Follow::No).ok()?;
+    if meta.kind != FileKind::Dir {
+        return None;
+    }
+    let mut entries = host.read_dir(path).ok()?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for entry in entries {
+        let child_path = path.join(to_native(&entry.name));
+        let child_display = if display.is_empty() {
+            entry.name.clone()
+        } else {
+            BString::from([display, b"/", entry.name.as_slice()].concat())
+        };
+        if let Some(found) = scan_non_oem(host, &child_path, &child_display, depth + 1, visited) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn is_oem_cp437_representable(bytes: &[u8]) -> bool {
+    if bytes.is_ascii() {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.chars()
+        .all(|ch| ch.is_ascii() || CP437_HIGH.contains(&ch))
+}
+
+const CP437_HIGH: [char; 128] = [
+    '\u{00C7}', '\u{00FC}', '\u{00E9}', '\u{00E2}', '\u{00E4}', '\u{00E0}', '\u{00E5}', '\u{00E7}',
+    '\u{00EA}', '\u{00EB}', '\u{00E8}', '\u{00EF}', '\u{00EE}', '\u{00EC}', '\u{00C4}', '\u{00C5}',
+    '\u{00C9}', '\u{00E6}', '\u{00C6}', '\u{00F4}', '\u{00F6}', '\u{00F2}', '\u{00FB}', '\u{00F9}',
+    '\u{00FF}', '\u{00D6}', '\u{00DC}', '\u{00A2}', '\u{00A3}', '\u{00A5}', '\u{20A7}', '\u{0192}',
+    '\u{00E1}', '\u{00ED}', '\u{00F3}', '\u{00FA}', '\u{00F1}', '\u{00D1}', '\u{00AA}', '\u{00BA}',
+    '\u{00BF}', '\u{2310}', '\u{00AC}', '\u{00BD}', '\u{00BC}', '\u{00A1}', '\u{00AB}', '\u{00BB}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255D}', '\u{255C}', '\u{255B}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252C}', '\u{251C}', '\u{2500}', '\u{253C}', '\u{255E}', '\u{255F}',
+    '\u{255A}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256C}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256B}',
+    '\u{256A}', '\u{2518}', '\u{250C}', '\u{2588}', '\u{2584}', '\u{258C}', '\u{2590}', '\u{2580}',
+    '\u{03B1}', '\u{00DF}', '\u{0393}', '\u{03C0}', '\u{03A3}', '\u{03C3}', '\u{00B5}', '\u{03C4}',
+    '\u{03A6}', '\u{0398}', '\u{03A9}', '\u{03B4}', '\u{221E}', '\u{03C6}', '\u{03B5}', '\u{2229}',
+    '\u{2261}', '\u{00B1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00F7}', '\u{2248}',
+    '\u{00B0}', '\u{2219}', '\u{00B7}', '\u{221A}', '\u{207F}', '\u{00B2}', '\u{25A0}', '\u{00A0}',
+];
 
 fn extract(
     archive: &[u8],
@@ -651,6 +749,32 @@ mod tests {
             "{options:?}"
         );
         assert!(host.stream_bytes(Stream::Stdout).is_empty(), "{options:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn windows_oem_tar_allows_pax_and_rejects_non_ascii_for_gnutar_and_zip() -> HostResult<()> {
+        assert!(!oem_restricts_pathnames(Some(b"pax"), Some(b"OEM"), true));
+        assert!(!oem_restricts_pathnames(Some(b"paxr"), Some(b"OEM"), true));
+        assert!(!oem_restricts_pathnames(Some(b"7zip"), Some(b"OEM"), true));
+        assert!(oem_restricts_pathnames(Some(b"gnutar"), Some(b"OEM"), true));
+        assert!(oem_restricts_pathnames(Some(b"zip"), Some(b"OEM"), true));
+        assert!(!oem_restricts_pathnames(Some(b"zip"), Some(b"UTF-8"), true));
+        assert!(!oem_restricts_pathnames(Some(b"zip"), Some(b"OEM"), false));
+
+        let cwd = Path::new("/work");
+        let host = PureHost::new(cwd.to_owned(), cwd.join("cmake"));
+        host.seed_file(&cwd.join("compress_dir/f1.txt"), b"ok")?;
+        host.seed_file(&cwd.join("compress_dir/café.txt"), b"cp437")?;
+        assert_eq!(
+            first_non_oem_input(&host, cwd, &[BString::from("compress_dir")]),
+            None
+        );
+        host.seed_file(&cwd.join("compress_dir/chinese-质地.txt"), b"utf8")?;
+        assert_eq!(
+            first_non_oem_input(&host, cwd, &[BString::from("compress_dir")]),
+            Some(BString::from("compress_dir/chinese-质地.txt"))
+        );
         Ok(())
     }
 }

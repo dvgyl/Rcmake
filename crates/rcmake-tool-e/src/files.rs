@@ -209,6 +209,11 @@ pub(super) fn copy(command: &[u8], args: &[BString], cx: &ToolCtx<'_>) -> i32 {
                 (false, CopyWhen::Different) => b"Error copying file (if different) from \"",
                 (false, CopyWhen::Newer) => b"Error copying file (if newer) from \"",
             };
+            let reason = if err.kind == ErrorKind::NotFound {
+                NO_FILE
+            } else {
+                &err.os_message
+            };
             status = error(
                 cx,
                 &[
@@ -217,7 +222,7 @@ pub(super) fn copy(command: &[u8], args: &[BString], cx: &ToolCtx<'_>) -> i32 {
                     b"\" to \"",
                     destination,
                     b"\": ",
-                    err.os_message.as_bytes(),
+                    reason.as_bytes(),
                     b"\n",
                 ],
             );

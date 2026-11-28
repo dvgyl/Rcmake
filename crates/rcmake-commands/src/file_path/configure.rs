@@ -94,33 +94,28 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     }
     let output = binary_destination(cx, &request.output);
     let limit = cx.limits().max_value_bytes;
+    let windows = cx.host().system().sysname.starts_with(b"Windows");
     let mut configured = BString::default();
-    for line in request.content.split_inclusive(|&byte| byte == b'\n') {
+    for raw_line in request.content.split_inclusive(|&byte| byte == b'\n') {
         let mut env = CxEnv {
             cx: &mut *cx,
             line: None,
             warn_missing: false,
         };
-        let expanded =
-            configure(line, &mut env, request.options).map_err(|failure| error(failure.message))?;
+        let expanded = configure(raw_line, &mut env, request.options)
+            .map_err(|failure| error(failure.message))?;
+        // `rcmake_expr::configure` always terminates each expanded line with one `\n`.
         let expanded = expanded.strip_suffix(b"\n").unwrap_or(&expanded);
-        let newline = request.newline.unwrap_or_else(|| {
-            if line.ends_with(b"\n") {
-                if cfg!(windows) { b"\r\n" } else { b"\n" }
-            } else {
-                b""
-            }
-        });
-        if configured
-            .len()
-            .saturating_add(expanded.len())
-            .saturating_add(newline.len())
-            > limit
-        {
+        let formatted = format_configured_line(
+            expanded,
+            raw_line.ends_with(b"\n"),
+            request.newline,
+            windows,
+        );
+        if configured.len().saturating_add(formatted.len()) > limit {
             return Err(error("CONFIGURE output exceeds the value size limit."));
         }
-        configured.extend_from_slice(expanded);
-        configured.extend_from_slice(newline);
+        configured.extend_from_slice(&formatted);
     }
     let host = cx.host();
     let range = ReadRange::All {
@@ -138,4 +133,73 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             .map_err(|failure| error(failure.to_string()))?;
     }
     Ok(Flow::Normal)
+}
+
+fn format_configured_line(
+    expanded: &[u8],
+    had_newline: bool,
+    newline: Option<&[u8]>,
+    windows: bool,
+) -> Vec<u8> {
+    if let Some(newline) = newline {
+        // Explicit `NEWLINE_STYLE` opens the output in binary mode: variable-expanded
+        // line endings are written verbatim and only the template's line ending uses `newline`.
+        let mut out = Vec::with_capacity(expanded.len() + newline.len());
+        out.extend_from_slice(expanded);
+        out.extend_from_slice(newline);
+        return out;
+    }
+    let trailing: &[u8] = if had_newline {
+        if windows { b"\r\n" } else { b"\n" }
+    } else {
+        b""
+    };
+    let mut out = Vec::with_capacity(expanded.len() + trailing.len());
+    if windows {
+        // Default text-mode output (`std::ofstream` without `ios::binary`) translates `\n` to `\r\n`.
+        for &byte in expanded {
+            if byte == b'\n' {
+                out.push(b'\r');
+            }
+            out.push(byte);
+        }
+    } else {
+        out.extend_from_slice(expanded);
+    }
+    out.extend_from_slice(trailing);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_configured_line;
+
+    #[test]
+    fn windows_default_newline_converts_embedded_lf_without_trailing_eol() {
+        assert_eq!(
+            format_configured_line(b"a\nb", false, None, true),
+            b"a\r\nb"
+        );
+        assert_eq!(format_configured_line(b"a", true, None, true), b"a\r\n");
+        // Explicit NEWLINE_STYLE writes variable-expanded line endings verbatim.
+        assert_eq!(
+            format_configured_line(b"a\r\nb", false, Some(b"\n"), true),
+            b"a\r\nb\n"
+        );
+        assert_eq!(
+            format_configured_line(b"a\nb", false, Some(b"\r\n"), true),
+            b"a\nb\r\n"
+        );
+        assert_eq!(format_configured_line(b"a\nb", false, None, false), b"a\nb");
+        assert_eq!(
+            format_configured_line(b"a", false, Some(b"\r\n"), true),
+            b"a\r\n"
+        );
+        assert_eq!(
+            format_configured_line(b"d", false, Some(b"\n"), true),
+            b"d\n"
+        );
+        // Trailing newline inside an expanded variable is preserved when the template line also had `\n`.
+        assert_eq!(format_configured_line(b"a\n", true, None, false), b"a\n\n");
+    }
 }

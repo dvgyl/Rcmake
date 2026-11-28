@@ -331,3 +331,156 @@ fn matcher_reuses_scratch_after_success_and_budget_exhaustion() -> Result<(), Re
     );
     Ok(())
 }
+
+#[test]
+fn greedy_dotstar_license_matches_last_viable_occurrence_within_budget() -> Result<(), RegexError> {
+    let re = Regex::new(b".*# License")?;
+    let mut text = Vec::new();
+    text.extend_from_slice(b"/* header\n");
+    for _ in 0..200 {
+        text.extend_from_slice(b"Copyright (C) 2026 Example Contributors. All rights reserved.\n");
+    }
+    text.extend_from_slice(b"# License first\n");
+    for _ in 0..200 {
+        text.extend_from_slice(b"More license text spanning multiple lines and paragraphs.\n");
+    }
+    let last_start = text.len();
+    text.extend_from_slice(b"# License");
+    let last_end = text.len();
+    for _ in 0..300 {
+        text.extend_from_slice(b"Trailing source code lines after the final license marker.\n");
+    }
+
+    let mut budget = 20_000;
+    let caps = re
+        .find_at(&text, 0, MatchOptions::default(), &mut budget)
+        .expect("must finish well within step budget")
+        .expect("must match");
+    assert_eq!(caps.groups[0], Some((0, last_end)));
+    assert!(budget > 10_000, "remaining budget too low: {budget}");
+    assert!(last_start > 10_000);
+
+    // Non-matching large input must also finish quickly within budget (no O(N^2)).
+    let no_match = b"No license marker anywhere in this line.\n".repeat(1000);
+    let mut budget = 20_000;
+    assert_eq!(
+        re.find_at(&no_match, 0, MatchOptions::default(), &mut budget),
+        Ok(None)
+    );
+    assert!(budget > 10_000, "remaining budget too low: {budget}");
+
+    // Tiny budget on large input must hit RegexLimit (no unmetered scan bypass).
+    let mut tiny = 10;
+    assert_eq!(
+        re.find_at(&no_match, 0, MatchOptions::default(), &mut tiny),
+        Err(RegexLimit)
+    );
+    assert_eq!(tiny, 0);
+
+    // Backtracking from a later literal that fails the suffix to an earlier viable one,
+    // plus capture group rollback and overlapping occurrences.
+    assert_eq!(
+        spans(
+            b"(.*)(# License) foo",
+            b"x # License foo y # License bar",
+            3
+        ),
+        vec![Some((0, 15)), Some((0, 2)), Some((2, 11))]
+    );
+    assert_eq!(spans(b".*aa$", b"aaa", 1), vec![Some((0, 3))]);
+    assert_eq!(spans(b".*aab", b"aaab", 1), vec![Some((0, 4))]);
+    assert_eq!(
+        spans(b"(.*)(aa)b", b"aaab", 3),
+        vec![Some((0, 4)), Some((0, 1)), Some((1, 3))]
+    );
+    Ok(())
+}
+
+#[test]
+fn clock_cache_retains_hot_entries_across_eviction() -> Result<(), RegexError> {
+    let mut cache = RegexCache::default();
+    let hot = cache.get_or_compile(b"^hot_pattern$")?;
+    for i in 0..1100 {
+        let _ = cache.get_or_compile(format!("^pat_{i}$").as_bytes())?;
+        if i % 100 == 0 {
+            let again = cache.get_or_compile(b"^hot_pattern$")?;
+            assert!(Arc::ptr_eq(&hot, &again));
+        }
+    }
+    let after = cache.get_or_compile(b"^hot_pattern$")?;
+    assert!(Arc::ptr_eq(&hot, &after));
+    Ok(())
+}
+
+#[test]
+fn non_dotstar_optional_prefix_matches_offset_zero_within_tiny_budget() -> Result<(), RegexError> {
+    let re = Regex::new(b"a?z")?;
+    let mut input = Vec::with_capacity(257);
+    input.push(b'z');
+    input.extend_from_slice(&[b'x'; 256]);
+    let mut budget = 8;
+    let caps = re
+        .find_at(&input, 0, MatchOptions::default(), &mut budget)
+        .expect("a?z must match at offset 0 without scanning backwards to the end")
+        .expect("must match leading z");
+    assert_eq!(caps.groups[0], Some((0, 1)));
+    assert!(budget > 0, "remaining budget should stay positive");
+
+    let mut az_input = Vec::with_capacity(258);
+    az_input.extend_from_slice(b"az");
+    az_input.extend_from_slice(&[b'x'; 256]);
+    let mut az_budget = 8;
+    let az_caps = re
+        .find_at(&az_input, 0, MatchOptions::default(), &mut az_budget)
+        .expect("a?z must match az at offset 0 within 8 steps")
+        .expect("must match leading az");
+    assert_eq!(az_caps.groups[0], Some((0, 2)));
+    Ok(())
+}
+
+#[test]
+fn literal_scans_never_exceed_remaining_step_budget_window() -> Result<(), RegexError> {
+    let forward_re = Regex::new(b"zz")?;
+    let mut forward_input = vec![b'x'; 15];
+    forward_input.extend_from_slice(b"zz");
+    let mut budget = 1;
+    assert_eq!(
+        forward_re.find_at(&forward_input, 0, MatchOptions::default(), &mut budget),
+        Err(RegexLimit)
+    );
+    assert_eq!(budget, 0);
+
+    let long_needle = vec![b'y'; 200];
+    let long_forward = Regex::new(&long_needle)?;
+    let mut long_input = vec![b'x'; 16];
+    long_input.extend_from_slice(&long_needle);
+    let mut budget = 1;
+    assert_eq!(
+        long_forward.find_at(&long_input, 0, MatchOptions::default(), &mut budget),
+        Err(RegexLimit)
+    );
+    assert_eq!(budget, 0);
+
+    let reverse_re = Regex::new(b".*zz")?;
+    let mut reverse_input = b"zz".to_vec();
+    reverse_input.extend_from_slice(&[b'x'; 15]);
+    let mut budget = 1;
+    assert_eq!(
+        reverse_re.find_at(&reverse_input, 0, MatchOptions::default(), &mut budget),
+        Err(RegexLimit)
+    );
+    assert_eq!(budget, 0);
+
+    let mut long_reverse_pat = b".*".to_vec();
+    long_reverse_pat.extend_from_slice(&long_needle);
+    let long_reverse = Regex::new(&long_reverse_pat)?;
+    let mut long_reverse_input = long_needle;
+    long_reverse_input.extend_from_slice(&[b'x'; 16]);
+    let mut budget = 1;
+    assert_eq!(
+        long_reverse.find_at(&long_reverse_input, 0, MatchOptions::default(), &mut budget),
+        Err(RegexLimit)
+    );
+    assert_eq!(budget, 0);
+    Ok(())
+}

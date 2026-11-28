@@ -96,6 +96,7 @@ impl PlatformQueries {
                 stderr,
                 timeout: None,
                 tee: false,
+                default_error_mode: false,
             };
             let Some(key) = query(host.as_ref(), &request).filter(|key| !key.is_absent()) else {
                 continue;

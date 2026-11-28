@@ -328,7 +328,7 @@ fn list_number(cx: &mut Cx<'_>, arg: &[u8]) -> Result<i64, CmdError> {
                 ])));
             }
             PolicyStatus::Warn => {
-                let warning = cat(&[b"\nInvalid list index \"", arg, b"\"."]);
+                let warning = cat(&[b"Invalid list index \"", arg, b"\"."]);
                 crate::policy_misc::issue_warning(cx, policy, b"", &warning);
             }
             PolicyStatus::Old => {}

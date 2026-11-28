@@ -51,6 +51,7 @@ fn request(host: &dyn Host, programs: &[&[u8]]) -> RunRequest {
         stderr: Output::Capture,
         timeout: None,
         tee: false,
+        default_error_mode: false,
     }
 }
 

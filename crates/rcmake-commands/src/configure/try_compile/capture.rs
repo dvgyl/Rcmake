@@ -90,6 +90,9 @@ pub(super) struct PreludeTrace {
     /// Content digest of the exact bytes that each read returned.
     pub(super) read_files: BTreeMap<PathBuf, Digest>,
     pub(super) missing_files: BTreeSet<(PathBuf, bool)>,
+    /// Scratch-relative paths whose metadata lookup returned `NotFound` during the prelude
+    /// (for example optional `include(...)` falling back to `CMAKE_CURRENT_SOURCE_DIR`).
+    pub(super) missing_scratch: BTreeSet<(PathBuf, bool)>,
     pub(super) existing_files: BTreeMap<(PathBuf, bool), MetaObservation>,
     /// Digest of the exact entries that each directory listing returned.
     pub(super) listed_dirs: BTreeMap<PathBuf, Digest>,
@@ -101,9 +104,12 @@ pub(super) struct PreludeTrace {
 struct PreludeTracker {
     binary_dir: PathBuf,
     canonical_binary_dir: Option<PathBuf>,
+    strict_scratch: bool,
+    harness_lists_read: bool,
     mutated_external: bool,
     read_files: BTreeMap<PathBuf, Digest>,
     missing_files: BTreeSet<(PathBuf, bool)>,
+    missing_scratch: BTreeSet<(PathBuf, bool)>,
     existing_files: BTreeMap<(PathBuf, bool), MetaObservation>,
     listed_dirs: BTreeMap<PathBuf, Digest>,
     read_links: BTreeMap<PathBuf, PathBuf>,
@@ -158,9 +164,12 @@ impl PreludeTracker {
         Self {
             binary_dir: norm_binary,
             canonical_binary_dir,
+            strict_scratch: false,
+            harness_lists_read: false,
             mutated_external: false,
             read_files: BTreeMap::new(),
             missing_files: BTreeSet::new(),
+            missing_scratch: BTreeSet::new(),
             existing_files: BTreeMap::new(),
             listed_dirs: BTreeMap::new(),
             read_links: BTreeMap::new(),
@@ -168,16 +177,19 @@ impl PreludeTracker {
         }
     }
 
-    fn inside_binary(&self, p: &Path) -> bool {
+    fn scratch_relative(&self, p: &Path) -> Option<PathBuf> {
         if !p.is_absolute() {
-            return false;
+            return None;
         }
         let norm = normalize_lexical(p);
-        norm.starts_with(&self.binary_dir)
-            || self
-                .canonical_binary_dir
-                .as_ref()
-                .is_some_and(|canon| norm.starts_with(canon))
+        norm.strip_prefix(&self.binary_dir)
+            .ok()
+            .or_else(|| {
+                self.canonical_binary_dir
+                    .as_ref()
+                    .and_then(|canon| norm.strip_prefix(canon).ok())
+            })
+            .map(Path::to_path_buf)
     }
 
     fn note_missing(&mut self, p: &Path, follow_yes: bool) {
@@ -198,7 +210,20 @@ impl PreludeTracker {
     }
 
     fn note_read(&mut self, p: &Path, observation: ReadObservation) {
-        if self.mutated_external || self.inside_binary(p) {
+        if self.mutated_external {
+            return;
+        }
+        if let Some(rel) = self.scratch_relative(p) {
+            // Only the outer `run_configure` harness reading `CMakeLists.txt` once before
+            // `project()` enters language bootstrap is exempt.
+            if !self.strict_scratch
+                && rel == Path::new("CMakeLists.txt")
+                && !self.harness_lists_read
+            {
+                self.harness_lists_read = true;
+            } else {
+                self.mutated_external = true;
+            }
             return;
         }
         match observation {
@@ -218,10 +243,36 @@ impl PreludeTracker {
     }
 
     fn note_metadata(&mut self, p: &Path, follow: Follow, result: &HostResult<Metadata>) {
-        if self.mutated_external || self.inside_binary(p) {
+        if self.mutated_external {
             return;
         }
         let follow_yes = follow == Follow::Yes;
+        if let Some(rel) = self.scratch_relative(p) {
+            if !self.strict_scratch
+                && (rel == Path::new("CMakeLists.txt")
+                    || rel == Path::new("CMakeFiles")
+                    || rel == Path::new("CMakeFiles/pkgRedirects"))
+            {
+                return;
+            }
+            if result
+                .as_ref()
+                .is_err_and(|err| err.kind == ErrorKind::NotFound)
+                && !rel.as_os_str().is_empty()
+            {
+                let key = (rel, follow_yes);
+                if self.missing_scratch.len() < MAX_TRACKED_PROBES
+                    || self.missing_scratch.contains(&key)
+                {
+                    self.missing_scratch.insert(key);
+                } else {
+                    self.mutated_external = true;
+                }
+            } else {
+                self.mutated_external = true;
+            }
+            return;
+        }
         match result {
             Ok(meta) => {
                 if !observe(
@@ -238,7 +289,11 @@ impl PreludeTracker {
     }
 
     fn note_read_dir(&mut self, p: &Path, result: Result<(&[DirEntry], bool), ErrorKind>) {
-        if self.mutated_external || self.inside_binary(p) {
+        if self.mutated_external {
+            return;
+        }
+        if self.scratch_relative(p).is_some() {
+            self.mutated_external = true;
             return;
         }
         match result {
@@ -259,7 +314,11 @@ impl PreludeTracker {
     }
 
     fn note_read_link(&mut self, p: &Path, result: &HostResult<PathBuf>) {
-        if self.mutated_external || self.inside_binary(p) {
+        if self.mutated_external {
+            return;
+        }
+        if self.scratch_relative(p).is_some() {
+            self.mutated_external = true;
             return;
         }
         match result {
@@ -278,7 +337,11 @@ impl PreludeTracker {
     }
 
     fn note_canonicalize(&mut self, p: &Path, result: &HostResult<PathBuf>) {
-        if self.mutated_external || self.inside_binary(p) {
+        if self.mutated_external {
+            return;
+        }
+        if self.scratch_relative(p).is_some() {
+            self.mutated_external = true;
             return;
         }
         match result {
@@ -301,6 +364,7 @@ impl PreludeTracker {
             mutated_external: self.mutated_external,
             read_files: self.read_files,
             missing_files: self.missing_files,
+            missing_scratch: self.missing_scratch,
             existing_files: self.existing_files,
             listed_dirs: self.listed_dirs,
             read_links: self.read_links,
@@ -363,6 +427,13 @@ impl CapturingHost {
         self.prelude_tracking_active.store(true, Ordering::Release);
     }
 
+    /// Switch prelude tracking into strict `project()` body mode where any read, stat,
+    /// or directory operation under the scratch directory marks the prelude non-cacheable.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    pub(super) fn enter_prelude_body(&self) {
+        self.with_prelude_tracker(|tracker| tracker.strict_scratch = true);
+    }
+
     #[cfg(all(feature = "native", any(unix, windows)))]
     pub(super) fn finish_prelude_tracking(&self) -> Option<PreludeTrace> {
         self.prelude_tracking_active.store(false, Ordering::Release);
@@ -411,7 +482,13 @@ impl CapturingHost {
     #[cfg(all(feature = "native", any(unix, windows)))]
     fn note_dir_mutation(&self, p: &Path) {
         self.with_prelude_tracker(|tracker| {
-            if !tracker.inside_binary(p) {
+            let allowed = tracker.scratch_relative(p).is_some_and(|rel| {
+                !tracker.strict_scratch
+                    && (rel.as_os_str().is_empty()
+                        || rel == Path::new("CMakeFiles")
+                        || rel == Path::new("CMakeFiles/pkgRedirects"))
+            });
+            if !allowed {
                 tracker.mutated_external = true;
             }
         });
@@ -675,29 +752,27 @@ impl Host for CapturingHost {
     }
 
     fn remove_file(&self, p: &Path) -> HostResult<()> {
-        self.note_dir_mutation(p);
+        self.note_external_mutation();
         self.parent.remove_file(p)
     }
 
     fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        self.note_dir_mutation(p);
+        self.note_external_mutation();
         self.parent.remove_dir(p)
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        self.note_dir_mutation(p);
+        self.note_external_mutation();
         self.parent.remove_dir_all(p)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.note_dir_mutation(from);
-        self.note_write_path(to);
+        self.note_external_mutation();
         self.parent.rename(from, to)
     }
 
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.note_dir_mutation(from);
-        self.note_write_path(to);
+        self.note_external_mutation();
         self.parent.rename_noreplace(from, to)
     }
 
@@ -792,7 +867,7 @@ impl Host for CapturingHost {
     }
 
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
-        self.note_dir_mutation(p);
+        self.note_external_mutation();
         self.parent.set_permissions(p, mode)
     }
 
@@ -802,7 +877,7 @@ impl Host for CapturingHost {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        self.note_dir_mutation(p);
+        self.note_external_mutation();
         self.parent.set_times(p, atime, mtime)
     }
 
@@ -812,7 +887,7 @@ impl Host for CapturingHost {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        self.note_dir_mutation(p);
+        self.note_external_mutation();
         self.parent.set_symlink_times(p, atime, mtime)
     }
 
@@ -824,6 +899,7 @@ impl Host for CapturingHost {
     }
 
     forward_host!(env_all() -> Vec<(BString, BString)>);
+    forward_host!(env_epoch() -> Option<u64>);
     forward_host!(supports_process_execution() -> bool);
 
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {

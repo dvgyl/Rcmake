@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::panic::Location;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -348,12 +349,23 @@ fn array_pair(value: &Value) -> Result<&[Value; 2], FieldError> {
 
 impl Check {
     fn digest(&self, host: &dyn Host) -> Option<Digest> {
+        self.digest_inner(host, false)
+    }
+
+    fn digest_fresh(&self, host: &dyn Host) -> Option<Digest> {
+        self.digest_inner(host, true)
+    }
+
+    fn digest_inner(&self, host: &dyn Host, fresh: bool) -> Option<Digest> {
         match self {
             Self::Metadata(path, follow) => {
                 let follow = if *follow { Follow::Yes } else { Follow::No };
-                host.metadata(path, follow)
-                    .ok()
-                    .map(|value| metadata_digest(&value))
+                let meta = if fresh {
+                    host.metadata_fresh(path, follow)
+                } else {
+                    host.metadata(path, follow)
+                };
+                meta.ok().map(|value| metadata_digest(&value))
             }
             Self::Slice(path, range) => host
                 .read(
@@ -380,15 +392,24 @@ impl Check {
                 .read_dir(path)
                 .is_err_and(|error| error.kind == ErrorKind::NotFound)
                 .then(|| Digest::hash(b"missing")),
-            Self::FollowMissing(path) => host
-                .metadata(path, Follow::Yes)
-                .is_err_and(|error| error.kind == ErrorKind::NotFound)
-                .then(|| Digest::hash(b"missing")),
+            Self::FollowMissing(path) => {
+                let meta = if fresh {
+                    host.metadata_fresh(path, Follow::Yes)
+                } else {
+                    host.metadata(path, Follow::Yes)
+                };
+                meta.is_err_and(|error| error.kind == ErrorKind::NotFound)
+                    .then(|| Digest::hash(b"missing"))
+            }
             Self::Link(path) => host.read_link(path).ok().map(|target| path_digest(&target)),
-            Self::Canonical(path) => host
-                .canonicalize(path)
-                .ok()
-                .map(|target| path_digest(&target)),
+            Self::Canonical(path) => {
+                let canon = if fresh {
+                    host.canonicalize_fresh(path)
+                } else {
+                    host.canonicalize(path)
+                };
+                canon.ok().map(|target| path_digest(&target))
+            }
             Self::Environment => Some(process_environment_fingerprint(&host.env_all())),
             Self::Executable => host.current_exe().ok().map(|exe| path_digest(&exe)),
             Self::WorkingDirectory => Some(path_digest(&host.initial_cwd())),
@@ -674,6 +695,18 @@ impl Journal {
     pub(super) fn checks(&self) -> &JournalChecks {
         &self.checks
     }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn request_check_digests(&self) -> Vec<(u32, Digest)> {
+        self.checks
+            .0
+            .iter()
+            .filter_map(|(check, digest)| match check {
+                Check::Request(index) => Some((*index, *digest)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 fn verify_inputs(host: &dyn Host, trace: &[InputStamp], memo: Option<&TraceMemo>) -> VerifyOutcome {
@@ -681,6 +714,105 @@ fn verify_inputs(host: &dyn Host, trace: &[InputStamp], memo: Option<&TraceMemo>
         || verify_trace(host, trace),
         |memo| memo.verify(host, trace),
     )
+}
+
+/// Owned, self-contained snapshot of every [`JournalHost`] observation captured during
+/// a `try_compile` prelude.
+///
+/// Spliced back into a subsequent journaled child's [`JournalHost`] only after live
+/// re-validation of every stamp, check, and environment read succeeds.
+#[derive(Clone)]
+pub(super) struct PreludeJournalSlice {
+    stamps: Vec<InputStamp>,
+    checks: Vec<(Check, Digest)>,
+    environment: Vec<(Vec<u8>, Option<BString>)>,
+    full_environment: Option<Vec<(BString, BString)>>,
+    processes: Vec<RunRequest>,
+    output: Vec<(Stream, Vec<u8>)>,
+    impure: Option<ImpureReason>,
+    missing_scratch: Vec<(PathBuf, Follow)>,
+}
+
+impl PreludeJournalSlice {
+    #[cfg(all(test, unix))]
+    pub(super) fn from_requests_for_test(requests: Vec<RunRequest>) -> Self {
+        let checks = requests
+            .iter()
+            .enumerate()
+            .map(|(index, req)| (Check::Request(index as u32), request_digest(req)))
+            .collect();
+        Self {
+            stamps: Vec::new(),
+            checks,
+            environment: Vec::new(),
+            full_environment: None,
+            processes: requests,
+            output: Vec::new(),
+            impure: None,
+            missing_scratch: Vec::new(),
+        }
+    }
+
+    /// Verify that every scratch-relative path whose metadata returned `NotFound` during
+    /// capture is still absent in the target probe's `scratch` directory.
+    pub(super) fn validate_scratch(&self, live_host: &dyn Host, scratch: &Path) -> bool {
+        self.missing_scratch.iter().all(|(rel, follow)| {
+            live_host
+                .metadata_fresh(&scratch.join(rel), *follow)
+                .is_err_and(|err| err.kind == ErrorKind::NotFound)
+        })
+    }
+
+    /// Validate every recorded observation against the live unwrapped host before splicing.
+    pub(super) fn validate(&self, live_host: &dyn Host, trace_memo: &TraceMemo) -> bool {
+        if self.impure.is_some() || !self.output.is_empty() {
+            return false;
+        }
+        if trace_memo.verify(live_host, &self.stamps) != VerifyOutcome::Hit {
+            return false;
+        }
+        for (name, expected) in &self.environment {
+            if live_host.env_get(name) != *expected {
+                return false;
+            }
+        }
+        if let Some(expected_full) = &self.full_environment
+            && live_host.env_all() != *expected_full
+        {
+            return false;
+        }
+        for (check, expected) in &self.checks {
+            match check {
+                Check::Request(index) => {
+                    let Some(req) = self.processes.get(*index as usize) else {
+                        return false;
+                    };
+                    if request_digest(req) != *expected {
+                        return false;
+                    }
+                }
+                _ => {
+                    if check.digest_fresh(live_host) != Some(*expected) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+const PRELUDE_WATCH_OFF: u8 = 0;
+const PRELUDE_WATCH_HARNESS: u8 = 1;
+const PRELUDE_WATCH_BODY: u8 = 2;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ScratchAccessKind {
+    Read,
+    Metadata,
+    MetadataMissing { follow_yes: bool },
+    CreateDir,
+    Other,
 }
 
 /// Host adapter for a single probe.
@@ -699,6 +831,10 @@ pub(crate) struct JournalHost<'a> {
     sorted_listings: bool,
     /// Files whose contents the probe key binds. Reads do not stamp them.
     bound: BTreeSet<PathBuf>,
+    prelude_watch: AtomicU8,
+    harness_lists_reads: AtomicU8,
+    prelude_touched_scratch: AtomicBool,
+    prelude_missing_scratch: Mutex<BTreeSet<(PathBuf, bool)>>,
     state: Mutex<State>,
 }
 
@@ -756,8 +892,245 @@ impl<'a> JournalHost<'a> {
             compile_intervals: None,
             sorted_listings: false,
             bound: BTreeSet::new(),
+            prelude_watch: AtomicU8::new(PRELUDE_WATCH_OFF),
+            harness_lists_reads: AtomicU8::new(0),
+            prelude_touched_scratch: AtomicBool::new(false),
+            prelude_missing_scratch: Mutex::default(),
             state: Mutex::default(),
         })
+    }
+
+    /// Arm outer-harness scratch-access detection before `run_configure` loads the
+    /// generated `CMakeLists.txt`. Transitions to strict body mode once `project()` enters
+    /// language bootstrap via [`Self::enter_prelude_body`].
+    pub(super) fn begin_prelude_harness(&self) {
+        self.prelude_touched_scratch.store(false, Ordering::Release);
+        self.harness_lists_reads.store(0, Ordering::Release);
+        self.prelude_missing_scratch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.prelude_watch
+            .store(PRELUDE_WATCH_HARNESS, Ordering::Release);
+    }
+
+    /// Transition from outer harness setup into the `project()` prelude body, where ANY
+    /// read, metadata stat, or mutation under scratch marks the prelude non-cacheable.
+    pub(super) fn enter_prelude_body(&self) {
+        self.prelude_watch
+            .store(PRELUDE_WATCH_BODY, Ordering::Release);
+    }
+
+    /// Arm strict scratch-access detection directly for the prelude body (zero exemptions).
+    #[cfg(all(test, unix))]
+    pub(super) fn begin_prelude_watch(&self) {
+        self.prelude_touched_scratch.store(false, Ordering::Release);
+        self.harness_lists_reads.store(0, Ordering::Release);
+        self.prelude_missing_scratch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.prelude_watch
+            .store(PRELUDE_WATCH_BODY, Ordering::Release);
+    }
+
+    /// Disarm scratch-access detection and clone all pure journal observations recorded
+    /// during the prelude. Returns `None` if the prelude was impure, produced output,
+    /// ran any external process, exceeded the observation limit, or accessed scratch paths.
+    pub(super) fn capture_prelude_slice(&self) -> Option<PreludeJournalSlice> {
+        self.prelude_watch
+            .store(PRELUDE_WATCH_OFF, Ordering::Release);
+        if self.prelude_touched_scratch.load(Ordering::Acquire) {
+            return None;
+        }
+        let missing_scratch: Vec<(PathBuf, Follow)> = self
+            .prelude_missing_scratch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(rel, follow_yes)| {
+                (
+                    rel.clone(),
+                    if *follow_yes { Follow::Yes } else { Follow::No },
+                )
+            })
+            .collect();
+        let state = self.state();
+        let observations = state
+            .stamps
+            .len()
+            .saturating_add(state.checks.len())
+            .saturating_add(state.environment.len())
+            .saturating_add(state.processes.len())
+            .saturating_add(missing_scratch.len());
+        if state.impure.is_some()
+            || !state.output.is_empty()
+            || !state.processes.is_empty()
+            || observations >= MAX_OBSERVATIONS
+        {
+            return None;
+        }
+        Some(PreludeJournalSlice {
+            stamps: state.stamps.values().cloned().collect(),
+            checks: state.checks.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            environment: state
+                .environment
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            full_environment: state.full_environment.clone(),
+            processes: state.processes.clone(),
+            output: state.output.clone(),
+            impure: state.impure,
+            missing_scratch,
+        })
+    }
+
+    /// Splice a previously validated [`PreludeJournalSlice`] into this journal.
+    ///
+    /// Validates capacity and conflict freedom before mutating state so a rejected splice
+    /// leaves the journal clean for live fallback execution.
+    pub(super) fn splice_prelude_slice(&self, slice: &PreludeJournalSlice) -> bool {
+        if slice.impure.is_some() || !slice.output.is_empty() {
+            return false;
+        }
+        let mut state = self.state();
+        if state.impure.is_some() {
+            return false;
+        }
+        let projected = state
+            .stamps
+            .len()
+            .saturating_add(slice.stamps.len())
+            .saturating_add(state.checks.len())
+            .saturating_add(slice.checks.len())
+            .saturating_add(state.environment.len())
+            .saturating_add(slice.environment.len())
+            .saturating_add(state.processes.len())
+            .saturating_add(slice.processes.len());
+        if projected >= MAX_OBSERVATIONS {
+            return false;
+        }
+        let process_base = match u32::try_from(state.processes.len()) {
+            Ok(base) => base,
+            Err(_) => return false,
+        };
+        // Pre-validate all entries before mutating state.
+        for stamp in &slice.stamps {
+            if let Some(existing) = state.stamps.get(&StampKey::from(stamp))
+                && existing != stamp
+            {
+                return false;
+            }
+        }
+        for (check, digest) in &slice.checks {
+            let rebased = match check {
+                Check::Request(index) => match process_base.checked_add(*index) {
+                    Some(new_index) => Check::Request(new_index),
+                    None => return false,
+                },
+                other => other.clone(),
+            };
+            if let Some(existing) = state.checks.get(&rebased)
+                && existing != digest
+            {
+                return false;
+            }
+        }
+        for (name, value) in &slice.environment {
+            if let Some(existing) = state.environment.get(name)
+                && existing != value
+            {
+                return false;
+            }
+        }
+        if let (Some(existing), Some(incoming)) = (&state.full_environment, &slice.full_environment)
+            && existing != incoming
+        {
+            return false;
+        }
+        // Commit all entries cleanly.
+        for stamp in &slice.stamps {
+            state.stamps.insert(StampKey::from(stamp), stamp.clone());
+        }
+        for (check, digest) in &slice.checks {
+            let rebased = match check {
+                Check::Request(index) => Check::Request(process_base + *index),
+                other => other.clone(),
+            };
+            state.checks.insert(rebased, *digest);
+        }
+        for (name, value) in &slice.environment {
+            state.environment.insert(name.clone(), value.clone());
+        }
+        if state.full_environment.is_none() {
+            state.full_environment.clone_from(&slice.full_environment);
+        }
+        state.processes.extend(slice.processes.iter().cloned());
+        true
+    }
+
+    pub(super) fn note_prelude_scratch_access(&self, path: &Path, kind: ScratchAccessKind) {
+        let mode = self.prelude_watch.load(Ordering::Acquire);
+        if mode == PRELUDE_WATCH_OFF {
+            return;
+        }
+        let Some(rel) = self.scratch_relative(path) else {
+            return;
+        };
+        if mode == PRELUDE_WATCH_BODY {
+            if let ScratchAccessKind::MetadataMissing { follow_yes } = kind
+                && !rel.as_os_str().is_empty()
+            {
+                let mut missing = self
+                    .prelude_missing_scratch
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let key = (rel, follow_yes);
+                if missing.len() < MAX_OBSERVATIONS || missing.contains(&key) {
+                    missing.insert(key);
+                } else {
+                    self.prelude_touched_scratch.store(true, Ordering::Release);
+                }
+                return;
+            }
+            self.prelude_touched_scratch.store(true, Ordering::Release);
+            return;
+        }
+        // Only the outer `run_configure` harness parsing the generated `CMakeLists.txt`
+        // and initializing `CMakeFiles/pkgRedirects` is exempt prior to `project()`.
+        let allowed = match kind {
+            ScratchAccessKind::Read => {
+                rel == Path::new("CMakeLists.txt")
+                    && self.harness_lists_reads.fetch_add(1, Ordering::AcqRel) == 0
+            }
+            ScratchAccessKind::Metadata | ScratchAccessKind::MetadataMissing { .. } => {
+                rel == Path::new("CMakeLists.txt")
+                    || rel == Path::new("CMakeFiles")
+                    || rel == Path::new("CMakeFiles/pkgRedirects")
+            }
+            ScratchAccessKind::CreateDir => {
+                rel.as_os_str().is_empty()
+                    || rel == Path::new("CMakeFiles")
+                    || rel == Path::new("CMakeFiles/pkgRedirects")
+            }
+            ScratchAccessKind::Other => false,
+        };
+        if !allowed {
+            self.prelude_touched_scratch.store(true, Ordering::Release);
+        }
+    }
+
+    fn scratch_relative(&self, p: &Path) -> Option<PathBuf> {
+        if !p.is_absolute() {
+            return None;
+        }
+        let cmake = path::from_native_cmake(p);
+        let norm = path::to_native(&rcmake_base::path_lex::Lexical::new(&cmake).normalize());
+        norm.strip_prefix(&self.scratch)
+            .ok()
+            .or_else(|| norm.strip_prefix(&self.canonical_scratch).ok())
+            .map(Path::to_path_buf)
     }
 
     pub(super) fn with_impurity_sites(self, enabled: bool) -> Self {

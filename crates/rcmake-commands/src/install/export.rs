@@ -1,6 +1,6 @@
 //! The `export()` command.
 
-use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_base::BString;
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
@@ -128,10 +128,11 @@ pub(super) fn command(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
                 r#"attempted to write the file "{file}" into a source directory."#
             )));
         }
-        let output = Lexical::new(&from_native(
-            &cx.current_binary_dir().join(to_native(&file)),
-        ))
-        .normalize();
+        let output = export_options::output_path(
+            &from_native(&cx.current_binary_dir()),
+            &file,
+            cfg!(windows),
+        );
         let key = [b"_RCMAKE_EXPORT_OUTPUT_".as_slice(), output.as_slice()].concat();
         if !append && cx.global().props.get(&key).is_some() {
             export_options::repeat(cx, &file)?;

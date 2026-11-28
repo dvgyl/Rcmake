@@ -8,7 +8,8 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use process_wrap::std::{ChildWrapper, CommandWrap, JobObject};
+use process_wrap::std::{ChildWrapper, CommandWrap, CreationFlags, JobObject};
+use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
 use super::super::{io_at, open_output};
 use crate::{
@@ -166,6 +167,10 @@ impl Pipeline {
 
             let mut command = CommandWrap::from(command);
             command.wrap(JobObject);
+            let creation_flags = crate::windows_child_creation_flags(req.default_error_mode);
+            if creation_flags != 0 {
+                command.wrap(CreationFlags(PROCESS_CREATION_FLAGS(creation_flags)));
+            }
             let stage = match command.spawn() {
                 Ok(job) => Stage {
                     job: Some(job),

@@ -284,6 +284,7 @@ fn run_command(
             stderr: Output::Capture,
             timeout,
             tee: false,
+            default_error_mode: false,
         },
         limit,
     )?;

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcmake_base::{BString, Limits};
 use rcmake_host::{
-    FileKind, Follow, HostError, HostResult, ReadRange, Stream, WriteMode, path::from_native,
+    FileKind, Follow, HostError, HostResult, ReadRange, Stream, WriteMode, path::from_native_cmake,
 };
 
 use super::{ToolCtx, error, is_dir, path, read_all, split_once};
@@ -189,13 +189,14 @@ fn write_bin2c_file(
     let temp = match open_bin2c_temp(cx, &file) {
         Ok(temp) => temp,
         Err((temp, cause)) => {
+            let reason = bin2c_system_error(&cause);
             return error(
                 cx,
                 &[
                     b"CMake Error: Cannot open file for write: ",
-                    &from_native(&temp),
+                    &from_native_cmake(&temp),
                     b"\nCMake Error: : System Error: ",
-                    cause.os_message.as_bytes(),
+                    reason.as_bytes(),
                     b"\nCould not open file for writing: \"",
                     output,
                     b"\"\n",
@@ -246,6 +247,16 @@ fn write_bin2c_file(
         );
     }
     rendered.map_or_else(|message| error(cx, &[message]), |()| 0)
+}
+
+fn bin2c_system_error(cause: &HostError) -> &str {
+    match cause.kind {
+        ErrorKind::NotFound => "No such file or directory",
+        ErrorKind::NotADirectory => "Not a directory",
+        ErrorKind::PermissionDenied => "Permission denied",
+        ErrorKind::IsADirectory => "Is a directory",
+        _ => &cause.os_message,
+    }
 }
 
 fn open_bin2c_temp(cx: &ToolCtx<'_>, file: &Path) -> Result<PathBuf, (PathBuf, HostError)> {
@@ -433,4 +444,31 @@ fn render_template(
     }
     emit(remaining);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use rcmake_host::HostError;
+
+    use super::bin2c_system_error;
+
+    #[test]
+    fn bin2c_maps_not_found_and_not_a_directory_errors_portably() {
+        let not_found = HostError::from_io(
+            std::io::Error::new(
+                ErrorKind::NotFound,
+                "The system cannot find the path specified.",
+            ),
+            None,
+        );
+        assert_eq!(bin2c_system_error(&not_found), "No such file or directory");
+
+        let not_dir = HostError::from_io(
+            std::io::Error::new(ErrorKind::NotADirectory, "Not a directory"),
+            None,
+        );
+        assert_eq!(bin2c_system_error(&not_dir), "Not a directory");
+    }
 }

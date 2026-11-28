@@ -33,6 +33,7 @@ pub(super) fn decompress(
                 stderr: Output::Null,
                 timeout: Some(Duration::from_secs(30)),
                 tee: false,
+                default_error_mode: false,
             },
             usize::try_from(cap).unwrap_or(usize::MAX),
         )

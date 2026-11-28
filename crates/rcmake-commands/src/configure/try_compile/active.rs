@@ -140,6 +140,16 @@ impl ProbeRuntime {
         &self.cache.memo
     }
 
+    /// Return the unwrapped live host for fresh validation outside any `MemoHost`.
+    pub(super) fn live_host(&self) -> &Arc<dyn Host> {
+        &self.host
+    }
+
+    /// Return a cached environment snapshot keyed by `Host::env_epoch`.
+    pub(super) fn env_snapshot(&self) -> super::plan::CachedEnv {
+        self.cache.env_snapshot(self.host.as_ref())
+    }
+
     /// Start background work that warms the session memo for a C-family compiler.
     ///
     /// The work overlaps compiler identification. It hashes the Rcmake executable
@@ -354,8 +364,8 @@ impl PreparedProbe {
         if !compiler::admit_source(&name, &contents) {
             return None;
         }
-        let environment = host.env_all();
-        if !compiler::admit_environment(&environment) {
+        let env_snapshot = runtime.env_snapshot();
+        if !env_snapshot.admitted {
             return None;
         }
         let select = |cx: &mut Cx<'_>| {
@@ -367,6 +377,7 @@ impl PreparedProbe {
                 &runtime.cache.memo,
                 external.then(|| (file, Digest::hash(&contents))),
                 &dirs.binary,
+                &env_snapshot,
             )
         };
         let compiler = if runtime.executable.get().is_none() {
@@ -428,7 +439,7 @@ impl PreparedProbe {
             imports: template
                 .capture(format!("{imports:?}").as_bytes())?
                 .digest(),
-            environment: process_environment_fingerprint(&environment),
+            environment: env_snapshot.fingerprint,
             scope: ReuseScope::VerifiedRelocation,
             bindings,
             try_run: false,
@@ -452,14 +463,20 @@ impl PreparedProbe {
     ) -> Option<ProbeResult> {
         let runtime = &self.runtime;
         let host = runtime.host.as_ref();
+        let need_artifact = options.has(b"COPY_FILE") || runtime.mode == ProbeCacheMode::Verify;
         let result = runtime
             .cache
-            .lookup(host, &runtime.store, &self.recipe)
+            .lookup_for_probe(host, &runtime.store, &self.recipe, need_artifact)
             .or_else(|| {
                 let queue = cx.session_data::<crate::configure::probe_pool::ProbeQueue>()?;
                 let spec = queue.take(compute_probe_key(&self.recipe))?;
                 if runtime.mode == ProbeCacheMode::Off {
-                    return super::cache::rebind_speculation(host, &self.recipe, spec);
+                    return super::cache::rebind_speculation(
+                        host,
+                        &self.recipe,
+                        runtime.env_snapshot().fingerprint,
+                        spec,
+                    );
                 }
                 if !runtime
                     .cache
@@ -480,9 +497,12 @@ impl PreparedProbe {
                 {
                     return None;
                 }
-                runtime
-                    .cache
-                    .lookup_uncounted(host, &runtime.store, &self.recipe)
+                runtime.cache.lookup_uncounted_for_probe(
+                    host,
+                    &runtime.store,
+                    &self.recipe,
+                    need_artifact,
+                )
             })
             .or_else(|| {
                 runtime

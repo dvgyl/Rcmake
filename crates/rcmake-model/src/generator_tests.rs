@@ -23,12 +23,18 @@ fn names_round_trip() {
 
 #[test]
 fn method_table_matches_design() {
-    use GeneratorKind::{Ninja, NinjaMultiConfig, UnixMakefiles, Xcode};
+    use GeneratorKind::{NMakeMakefiles, Ninja, NinjaMultiConfig, UnixMakefiles, Xcode};
     let multi: Vec<bool> = GeneratorKind::ALL.map(GeneratorKind::multi_config).into();
-    assert_eq!(multi, [false, false, true, true, true, true]);
+    assert_eq!(multi, [false, false, false, true, true, true, true]);
     let ide: Vec<bool> = GeneratorKind::ALL.map(GeneratorKind::is_ide).into();
-    assert_eq!(ide, [false, false, false, true, true, true]);
+    assert_eq!(ide, [false, false, false, false, true, true, true]);
+    assert!(NMakeMakefiles.is_make_or_ninja());
+    assert!(!NMakeMakefiles.is_ninja());
     assert_eq!(UnixMakefiles.find_make_module(), Some("CMakeUnixFindMake"));
+    assert_eq!(
+        NMakeMakefiles.find_make_module(),
+        Some("CMakeNMakeFindMake")
+    );
     assert_eq!(Ninja.find_make_module(), Some("CMakeNinjaFindMake"));
     assert_eq!(
         NinjaMultiConfig.find_make_module(),
@@ -38,6 +44,7 @@ fn method_table_matches_design() {
     assert_eq!(VS17.find_make_module(), None);
     assert!(Ninja.default_configuration_types().is_empty());
     assert!(UnixMakefiles.default_configuration_types().is_empty());
+    assert!(NMakeMakefiles.default_configuration_types().is_empty());
     assert_eq!(
         NinjaMultiConfig.default_configuration_types(),
         ["Debug", "Release", "RelWithDebInfo"]
@@ -50,6 +57,7 @@ fn method_table_matches_design() {
     }
     assert_eq!(Ninja.cfg_int_dir(), ".");
     assert_eq!(UnixMakefiles.cfg_int_dir(), ".");
+    assert_eq!(NMakeMakefiles.cfg_int_dir(), ".");
     assert_eq!(NinjaMultiConfig.cfg_int_dir(), "${CONFIGURATION}");
     assert_eq!(
         Xcode.cfg_int_dir(),
@@ -57,8 +65,10 @@ fn method_table_matches_design() {
     );
     assert_eq!(VS18.cfg_int_dir(), "$(Configuration)");
     assert_eq!(Ninja.toolset_support(), ToolsetSupport::None);
+    assert_eq!(NMakeMakefiles.toolset_support(), ToolsetSupport::None);
     assert_eq!(Xcode.toolset_support(), ToolsetSupport::Xcode);
     assert_eq!(VS17.toolset_support(), ToolsetSupport::VisualStudio);
+    assert!(!NMakeMakefiles.supports_platform() && !NMakeMakefiles.supports_instance());
     assert!(!Xcode.supports_platform() && !Xcode.supports_instance());
     assert!(VS17.supports_platform() && VS18.supports_instance());
     assert_eq!(VsVersion::Vs17.default_toolset(), "v143");
@@ -73,7 +83,11 @@ fn available_generators_follow_host() {
     let names: Vec<&str> = GeneratorKind::available()
         .map(GeneratorKind::name)
         .collect();
-    let mut expected = vec!["Unix Makefiles", "Ninja", "Ninja Multi-Config"];
+    let mut expected = vec!["Unix Makefiles"];
+    if cfg!(windows) {
+        expected.push("NMake Makefiles");
+    }
+    expected.extend(["Ninja", "Ninja Multi-Config"]);
     if cfg!(target_os = "macos") {
         expected.push("Xcode");
     }
