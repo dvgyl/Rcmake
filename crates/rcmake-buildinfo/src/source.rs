@@ -7,10 +7,11 @@ use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_host::{FileKind, FileTime, Follow, Host};
 
 use crate::compdb::{self, Compiler, Frontend};
+use crate::diff::{canonical_root, is_trivial_root};
 use crate::reader::{ArtifactReader, ReadError, ReadLimits};
 use crate::snapshot::{
-    BuildSnapshot, CacheRecord, DataSource, Evidence, Producer, Section, ToolchainSnapshot,
-    TraceInput,
+    BuildSnapshot, CacheRecord, DataSource, Evidence, Producer, Section, SnapshotHost,
+    ToolchainSnapshot, TraceInput,
 };
 use crate::{cache_file, fileapi, packages};
 
@@ -208,6 +209,18 @@ fn literal_set(rest: &[u8]) -> Option<(&[u8], BString)> {
         .trim_ascii();
     let literal = value.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
     (!literal.contains(&b'$')).then(|| (key, BString::from(literal)))
+}
+
+fn home_root(host: &dyn Host) -> Option<BString> {
+    let raw = host
+        .env_get(b"HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            host.env_get(b"USERPROFILE")
+                .filter(|value| !value.is_empty())
+        })?;
+    let normalized = canonical_root(&raw);
+    (!is_trivial_root(&normalized)).then_some(normalized)
 }
 
 /// Read one build directory. `trace` is the native find trace of the directory,
@@ -455,12 +468,26 @@ pub fn load(host: &dyn Host, dir: &Path, trace: TraceInput) -> Result<BuildSnaps
     }
     evidence.insert(Section::Packages, package_evidence);
 
+    let system = host.system();
+    let snapshot_host = Some(SnapshotHost {
+        os: system.sysname,
+        arch: system.machine,
+    });
+    let home_root = home_root(host);
+
     Ok(BuildSnapshot {
         path: given,
         build_root,
-        producer: Producer { tool, version },
+        producer: Producer {
+            tool: tool.into(),
+            version,
+        },
+        host: snapshot_host,
         generator,
         source_root,
+        home_root,
+        is_normalized: false,
+        saved_cache_set: None,
         configs,
         targets,
         toolchains,

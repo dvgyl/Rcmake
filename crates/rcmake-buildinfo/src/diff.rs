@@ -10,21 +10,14 @@ use crate::snapshot::{
     PackageObservation, PackageSnapshot, Section, SourceInvocations, TargetSnapshot,
 };
 
+pub use crate::snapshot::CacheSet;
+
 /// Most changed sources that one comparison records. A larger result is cut and
 /// marked partial.
 const MAX_CHANGED_SOURCES: usize = 200_000;
 
-/// Cache entries to compare.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CacheSet {
-    /// Build-relevant `CMAKE_*` entries and project options.
-    #[default]
-    Key,
-    /// Every entry that is not `INTERNAL` or `STATIC`.
-    All,
-    /// No cache entries.
-    None,
-}
+/// Approximate byte budget for materialized compile change payloads across one comparison.
+const MAX_COMPILE_CHANGE_BYTES: usize = 64 << 20;
 
 /// Comparison options.
 #[derive(Clone, Debug)]
@@ -35,7 +28,8 @@ pub struct DiffOptions {
     pub targets: Vec<BString>,
     /// Cache entries to compare.
     pub cache: CacheSet,
-    /// Replace build and source roots with `${build}` and `${source}`.
+    /// Replace build, source, and home roots with `${build}`, `${source}`, and `${home}`
+    /// and normalize Windows path separators.
     pub normalize: bool,
     /// Forced configuration pair.
     pub config_pair: Option<(BString, BString)>,
@@ -265,42 +259,312 @@ impl ConfigDiff {
     }
 }
 
-fn replace_root(value: &mut BString, root: &[u8], token: &[u8]) {
-    if root.is_empty() || root == b"/" {
+/// Convert a root path to forward-slash form with trailing slashes removed.
+pub(crate) fn canonical_root(raw: &[u8]) -> BString {
+    let stripped = raw
+        .strip_prefix(br"\\?\")
+        .or_else(|| raw.strip_prefix(b"//?/"))
+        .unwrap_or(raw);
+    let mut out: Vec<u8> = if let Some(unc) = stripped
+        .strip_prefix(br"UNC\")
+        .or_else(|| stripped.strip_prefix(b"UNC/"))
+    {
+        let mut buf = Vec::with_capacity(unc.len() + 2);
+        buf.extend_from_slice(b"//");
+        buf.extend(unc.iter().map(|&b| if b == b'\\' { b'/' } else { b }));
+        buf
+    } else {
+        stripped
+            .iter()
+            .map(|&b| if b == b'\\' { b'/' } else { b })
+            .collect()
+    };
+    while out.len() > 1 && out.ends_with(b"/") {
+        if out.len() == 3
+            && out.first().is_some_and(u8::is_ascii_alphabetic)
+            && out.get(1) == Some(&b':')
+        {
+            break;
+        }
+        out.pop();
+    }
+    BString::from(out)
+}
+
+/// Return whether `root` is empty or a filesystem root (`/` or `C:/`) that must not be replaced.
+pub(crate) fn is_trivial_root(root: &[u8]) -> bool {
+    root.is_empty()
+        || root == b"/"
+        || (root.len() == 3
+            && root.first().is_some_and(u8::is_ascii_alphabetic)
+            && root.get(1) == Some(&b':')
+            && root.get(2) == Some(&b'/'))
+}
+
+fn is_path_boundary_before(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'"' | b'\'' | b'=' | b'I' | b'L' | b',' | b':' | b';'
+    )
+}
+
+fn is_path_boundary_after(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'/' | b'\\' | b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b';' | b',' | b':'
+    )
+}
+
+fn is_windows_path(path: &[u8]) -> bool {
+    path.starts_with(br"\\?\")
+        || path.starts_with(br"\\")
+        || (path.len() >= 3
+            && path.first().is_some_and(u8::is_ascii_alphabetic)
+            && path.get(1) == Some(&b':')
+            && matches!(path.get(2), Some(b'\\' | b'/')))
+}
+
+fn is_windows_snapshot(snapshot: &BuildSnapshot) -> bool {
+    snapshot
+        .host
+        .as_ref()
+        .is_some_and(|host| host.os.eq_ignore_ascii_case(b"windows"))
+        || is_windows_path(&snapshot.build_root)
+        || snapshot
+            .source_root
+            .as_deref()
+            .is_some_and(|path| is_windows_path(path))
+        || snapshot
+            .home_root
+            .as_deref()
+            .is_some_and(|path| is_windows_path(path))
+}
+
+fn root_matches_at(haystack: &[u8], root: &[u8], drive_root: bool, allow_backslash: bool) -> bool {
+    let Some(candidate) = haystack.get(..root.len()) else {
+        return false;
+    };
+    for (index, (&h, &r)) in candidate.iter().zip(root.iter()).enumerate() {
+        if index == 0 && drive_root {
+            if !h.eq_ignore_ascii_case(&r) {
+                return false;
+            }
+        } else if h != r && !(allow_backslash && r == b'/' && h == b'\\') {
+            return false;
+        }
+    }
+    true
+}
+
+fn normalize_path_tail(out: &mut Vec<u8>, tail: &[u8], closing_quote: Option<u8>) -> usize {
+    let mut consumed = 0;
+    while let Some(&byte) = tail.get(consumed) {
+        if let Some(quote) = closing_quote {
+            if byte == quote {
+                break;
+            }
+            if byte == b'\\' {
+                if tail.get(consumed + 1) == Some(&quote) {
+                    break;
+                }
+                out.push(b'/');
+            } else {
+                out.push(byte);
+            }
+        } else {
+            if matches!(byte, b' ' | b'"' | b'\'' | b';' | b',' | b'=') {
+                break;
+            }
+            if byte == b'\\' {
+                if matches!(tail.get(consumed + 1), Some(b'"' | b'\'' | b' ')) {
+                    break;
+                }
+                out.push(b'/');
+            } else {
+                out.push(byte);
+            }
+        }
+        consumed += 1;
+    }
+    consumed
+}
+
+fn replace_root(value: &mut BString, root: &[u8], token: &[u8], windows_paths: bool) {
+    if is_trivial_root(root) || value.len() < root.len() {
         return;
     }
+    let drive_root = root.len() >= 2
+        && root.first().is_some_and(u8::is_ascii_alphabetic)
+        && root.get(1) == Some(&b':');
+    let allow_backslash = drive_root || windows_paths;
     let mut out = Vec::with_capacity(value.len());
     let mut rest = value.as_slice();
-    while let Some(at) = rest.windows(root.len()).position(|window| window == root) {
-        let before_ok = at == 0
-            || rest
-                .get(at - 1)
-                .is_some_and(|byte| matches!(byte, b' ' | b'"' | b'=' | b'I' | b',' | b':' | b';'));
+    while rest.len() >= root.len() {
+        let max_start = rest.len() - root.len();
+        let Some(at) = (0..=max_start).find(|&pos| {
+            rest.get(pos..)
+                .is_some_and(|slice| root_matches_at(slice, root, drive_root, allow_backslash))
+        }) else {
+            break;
+        };
+        let prev_byte = if at == 0 {
+            out.last().copied()
+        } else {
+            rest.get(at - 1).copied()
+        };
+        let before_ok = prev_byte.is_none_or(is_path_boundary_before);
         let after = rest.get(at + root.len());
-        let after_ok = after.is_none_or(|byte| matches!(byte, b'/' | b' ' | b'"' | b';' | b','));
-        let (head, tail) = rest.split_at(at + root.len());
+        let after_ok = after.is_none_or(|&byte| {
+            (is_path_boundary_after(byte) && (allow_backslash || byte != b'\\'))
+                || (byte == b'.'
+                    && rest
+                        .get(at + root.len() + 1)
+                        .is_none_or(u8::is_ascii_whitespace))
+        });
+        let Some((head, tail)) = rest.split_at_checked(at + root.len()) else {
+            break;
+        };
         if before_ok && after_ok {
             out.extend_from_slice(head.get(..at).unwrap_or_default());
             out.extend_from_slice(token);
+            if allow_backslash {
+                let closing_quote = match prev_byte {
+                    Some(b'"') => Some(b'"'),
+                    Some(b'\'') => Some(b'\''),
+                    _ => None,
+                };
+                let consumed = normalize_path_tail(&mut out, tail, closing_quote);
+                rest = tail.get(consumed..).unwrap_or_default();
+            } else {
+                rest = tail;
+            }
         } else {
-            out.extend_from_slice(head);
+            out.extend_from_slice(head.get(..at + 1).unwrap_or_default());
+            rest = rest.get(at + 1..).unwrap_or_default();
         }
-        rest = tail;
     }
     out.extend_from_slice(rest);
     *value = out.into();
 }
 
-/// Replace the roots of `snapshot`, longest root first.
+fn normalize_drive_slashes(value: &mut BString) {
+    let bytes = value.as_slice();
+    if !bytes.contains(&b'\\') {
+        return;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while let Some(&byte) = bytes.get(idx) {
+        let prev_byte = if idx == 0 {
+            None
+        } else {
+            bytes.get(idx - 1).copied()
+        };
+        let is_drive = byte.is_ascii_alphabetic()
+            && bytes.get(idx + 1) == Some(&b':')
+            && bytes.get(idx + 2) == Some(&b'\\')
+            && prev_byte.is_none_or(is_path_boundary_before);
+        if is_drive {
+            out.push(byte);
+            out.push(b':');
+            idx += 2;
+            let closing_quote = match prev_byte {
+                Some(b'"') => Some(b'"'),
+                Some(b'\'') => Some(b'\''),
+                _ => None,
+            };
+            let tail = bytes.get(idx..).unwrap_or_default();
+            let consumed = normalize_path_tail(&mut out, tail, closing_quote);
+            idx += consumed;
+        } else {
+            out.push(byte);
+            idx += 1;
+        }
+    }
+    *value = out.into();
+}
+
+fn normalize_path_separators(value: &mut BString) {
+    if !value.contains(&b'\\') {
+        return;
+    }
+    let stripped = value.strip_prefix(br"\\?\").unwrap_or(value.as_slice());
+    let out: Vec<u8> = if let Some(unc) = stripped.strip_prefix(br"UNC\") {
+        let mut buf = Vec::with_capacity(unc.len() + 2);
+        buf.extend_from_slice(b"//");
+        buf.extend(unc.iter().map(|&b| if b == b'\\' { b'/' } else { b }));
+        buf
+    } else {
+        stripped
+            .iter()
+            .map(|&b| if b == b'\\' { b'/' } else { b })
+            .collect()
+    };
+    *value = out.into();
+}
+
+fn normalize_link_slashes(value: &mut BString) {
+    let bytes = value.as_slice();
+    if !bytes.contains(&b'\\') {
+        return;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    for (idx, &byte) in bytes.iter().enumerate() {
+        if byte == b'\\' && !matches!(bytes.get(idx + 1), Some(b'"' | b'\'' | b' ')) {
+            out.push(b'/');
+        } else {
+            out.push(byte);
+        }
+    }
+    *value = out.into();
+}
+
+/// Replace the build, source, and home roots of `snapshot` (longest root first) and
+/// normalize Windows path separators for cross-machine comparison.
+///
+/// Calling `normalize` on a snapshot that already has [`BuildSnapshot::is_normalized`] set
+/// is a no-op so loaded portable snapshots are never double-normalized.
 pub fn normalize(snapshot: &mut BuildSnapshot) {
-    let mut roots: Vec<(BString, &[u8])> = vec![(snapshot.build_root.clone(), b"${build}")];
+    if snapshot.is_normalized {
+        return;
+    }
+    let windows_paths = is_windows_snapshot(snapshot);
+    let mut roots: Vec<(BString, &[u8])> = Vec::with_capacity(3);
+    let build = canonical_root(&snapshot.build_root);
+    if !is_trivial_root(&build) {
+        roots.push((build, b"${build}"));
+    }
     if let Some(source) = &snapshot.source_root {
-        roots.push((source.clone(), b"${source}"));
+        let source = canonical_root(source);
+        if !is_trivial_root(&source) {
+            roots.push((source, b"${source}"));
+        }
+    }
+    if let Some(home) = &snapshot.home_root {
+        let home = canonical_root(home);
+        if !is_trivial_root(&home) {
+            roots.push((home, b"${home}"));
+        }
     }
     roots.sort_by_key(|(root, _)| std::cmp::Reverse(root.len()));
-    let fix = |value: &mut BString| {
+    let fix_text = |value: &mut BString| {
         for (root, token) in &roots {
-            replace_root(value, root, token);
+            replace_root(value, root, token, windows_paths);
+        }
+        normalize_drive_slashes(value);
+    };
+    let fix_path = |value: &mut BString| {
+        if windows_paths || is_windows_path(value) {
+            normalize_path_separators(value);
+        }
+        for (root, token) in &roots {
+            replace_root(value, root, token, windows_paths);
+        }
+    };
+    let fix_link = |value: &mut BString| {
+        fix_text(value);
+        if windows_paths {
+            normalize_link_slashes(value);
         }
     };
     // Shared settings are normalized once, so sharing survives normalization.
@@ -309,7 +573,8 @@ pub fn normalize(snapshot: &mut BuildSnapshot) {
     for (key, mut target) in targets {
         let sources = std::mem::take(&mut target.sources);
         for (mut path, invocations) in sources {
-            fix(&mut path);
+            let original_path = path.clone();
+            fix_path(&mut path);
             let invocations: SourceInvocations = invocations
                 .into_iter()
                 .map(|settings| {
@@ -319,25 +584,142 @@ pub fn normalize(snapshot: &mut BuildSnapshot) {
                         settings
                             .includes
                             .iter_mut()
-                            .for_each(|include| fix(&mut include.path));
-                        settings.fragments.iter_mut().for_each(&fix);
-                        settings.defines.iter_mut().for_each(&fix);
-                        settings.compiler.iter_mut().for_each(&fix);
-                        settings.launcher.iter_mut().for_each(&fix);
+                            .for_each(|include| fix_path(&mut include.path));
+                        settings.fragments.iter_mut().for_each(&fix_text);
+                        settings.defines.iter_mut().for_each(&fix_text);
+                        settings.compiler.iter_mut().for_each(&fix_path);
+                        settings.launcher.iter_mut().for_each(&fix_text);
                         Arc::new(settings)
                     }))
                 })
                 .collect();
-            target.sources.insert(path, invocations);
+            if target.sources.contains_key(&path) {
+                target.sources.insert(original_path, invocations);
+            } else {
+                target.sources.insert(path, invocations);
+            }
         }
         for fragment in target.link.iter_mut().flatten() {
-            fix(&mut fragment.fragment);
+            fix_link(&mut fragment.fragment);
         }
-        target.artifacts.iter_mut().for_each(&fix);
+        target.artifacts.iter_mut().for_each(&fix_path);
+        target.backtrace.iter_mut().for_each(&fix_path);
         snapshot.targets.insert(key, target);
     }
+    for toolchain in &mut snapshot.toolchains {
+        toolchain.path.iter_mut().for_each(&fix_path);
+    }
+    for package in snapshot.packages.values_mut() {
+        package.cached_dir.iter_mut().for_each(&fix_path);
+        for observation in &mut package.observed {
+            observation.selected.iter_mut().for_each(&fix_path);
+        }
+    }
     for record in snapshot.cache.values_mut() {
-        fix(&mut record.value);
+        if matches!(record.ty.as_slice(), b"PATH" | b"FILEPATH") {
+            fix_path(&mut record.value);
+        } else {
+            fix_text(&mut record.value);
+        }
+    }
+    for evidence in snapshot.evidence.values_mut() {
+        match evidence {
+            Evidence::Complete(_) => {}
+            Evidence::Partial(_, reason) | Evidence::Unavailable(reason) => fix_text(reason),
+        }
+    }
+    snapshot.warnings.iter_mut().for_each(&fix_text);
+    snapshot.build_root = BString::from("${build}");
+    if snapshot.source_root.is_some() {
+        snapshot.source_root = Some(BString::from("${source}"));
+    }
+    snapshot.home_root = None;
+    snapshot.is_normalized = true;
+}
+
+fn split_identifier_tokens(name: &[u8]) -> Vec<Vec<u8>> {
+    let mut tokens = Vec::new();
+    let mut current = Vec::new();
+    let mut prev: Option<u8> = None;
+    for (idx, &byte) in name.iter().enumerate() {
+        if matches!(byte, b'_' | b'-' | b'.' | b':' | b'/') {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            prev = None;
+            continue;
+        }
+        if !current.is_empty() && byte.is_ascii_uppercase() {
+            let next = name.get(idx + 1).copied();
+            let camel_boundary = prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit());
+            let acronym_boundary = prev.is_some_and(|p| p.is_ascii_uppercase())
+                && next.is_some_and(|n| n.is_ascii_lowercase());
+            if camel_boundary || acronym_boundary {
+                tokens.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(byte.to_ascii_uppercase());
+        prev = Some(byte);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Return whether a cache variable name looks like a credential or secret (for example
+/// `API_KEY`, `DB_PASSWORD`, `AUTH_TOKEN`, `clientSecret`, or `accessToken`).
+pub(crate) fn is_secret_cache_name(name: &[u8]) -> bool {
+    const SINGLE_SEGMENTS: [&[u8]; 12] = [
+        b"SECRET",
+        b"SECRETS",
+        b"PASSWORD",
+        b"PASSWD",
+        b"PASSPHRASE",
+        b"TOKEN",
+        b"TOKENS",
+        b"APIKEY",
+        b"PRIVKEY",
+        b"CREDENTIAL",
+        b"CREDENTIALS",
+        b"BEARER",
+    ];
+    const KEY_PREFIXES: [&[u8]; 12] = [
+        b"API",
+        b"PRIVATE",
+        b"ACCESS",
+        b"AUTH",
+        b"SIGNING",
+        b"ENCRYPTION",
+        b"MASTER",
+        b"CLIENT",
+        b"SSH",
+        b"GPG",
+        b"TLS",
+        b"SSL",
+    ];
+    let tokens = split_identifier_tokens(name);
+    if tokens
+        .iter()
+        .any(|segment| SINGLE_SEGMENTS.contains(&segment.as_slice()))
+    {
+        return true;
+    }
+    tokens.windows(2).any(|pair| {
+        matches!(
+            (pair.first().map(Vec::as_slice), pair.get(1).map(Vec::as_slice)),
+            (Some(prefix), Some(b"KEY" | b"KEYS")) if KEY_PREFIXES.contains(&prefix)
+        )
+    })
+}
+
+/// Return whether `name` with `record` is included by `set`.
+#[must_use]
+pub fn cache_set_includes(set: CacheSet, name: &[u8], record: &CacheRecord) -> bool {
+    match set {
+        CacheSet::Key => key_cache_entry(name, record),
+        CacheSet::All => !matches!(record.ty.as_slice(), b"INTERNAL" | b"STATIC"),
+        CacheSet::None => false,
     }
 }
 
@@ -346,6 +728,7 @@ fn key_cache_entry(name: &[u8], record: &CacheRecord) -> bool {
     if matches!(record.ty.as_slice(), b"INTERNAL" | b"STATIC")
         || matches!(name, b"CMAKE_CACHEFILE_DIR" | b"CMAKE_HOME_DIRECTORY")
         || SKIP_SUFFIX.iter().any(|suffix| name.ends_with(suffix))
+        || is_secret_cache_name(name)
     {
         return false;
     }
@@ -493,12 +876,28 @@ struct Sides {
     b_complete: bool,
 }
 
+fn compile_settings_payload_bytes(settings: &CompileSettings) -> usize {
+    let opt_len = |value: &Option<BString>| value.as_ref().map_or(0, |s| s.len());
+    let vec_len = |items: &[BString]| items.iter().map(|s| s.len()).sum::<usize>();
+    let inc_len: usize = settings.includes.iter().map(|inc| inc.path.len()).sum();
+    64_usize
+        .saturating_add(opt_len(&settings.language))
+        .saturating_add(opt_len(&settings.standard))
+        .saturating_add(opt_len(&settings.compiler))
+        .saturating_add(vec_len(&settings.defines))
+        .saturating_add(inc_len)
+        .saturating_add(vec_len(&settings.fragments))
+        .saturating_add(vec_len(&settings.launcher))
+}
+
 /// State that the target comparisons of one compare call share.
 struct Scope {
     /// Compile evidence of each side.
     compile: Sides,
     /// Changed sources that can still be recorded.
     budget: usize,
+    /// Remaining byte budget for materialized compile change groups.
+    change_bytes_budget: usize,
     /// Notes for the partial list.
     notes: Vec<BString>,
 }
@@ -530,7 +929,7 @@ fn target_change(
                         if !settings_differ(l, r) && count.is_none() {
                             continue;
                         }
-                        if scope.budget == 0 {
+                        if scope.budget == 0 || scope.change_bytes_budget == 0 {
                             break;
                         }
                         scope.budget -= 1;
@@ -540,10 +939,21 @@ fn target_change(
                                 if let Some((_, sources)) = ordered.get_mut(at)
                                     && sources.last() != Some(path)
                                 {
+                                    scope.change_bytes_budget =
+                                        scope.change_bytes_budget.saturating_sub(path.len());
                                     sources.push(path.clone());
                                 }
                             }
                             None => {
+                                let cost = compile_settings_payload_bytes(l)
+                                    .saturating_add(compile_settings_payload_bytes(r))
+                                    .saturating_add(path.len());
+                                if cost > scope.change_bytes_budget && !ordered.is_empty() {
+                                    scope.change_bytes_budget = 0;
+                                    break;
+                                }
+                                scope.change_bytes_budget =
+                                    scope.change_bytes_budget.saturating_sub(cost);
                                 groups.insert(key.clone(), ordered.len());
                                 ordered.push((key, vec![path.clone()]));
                             }
@@ -643,6 +1053,7 @@ fn compare_targets(
     let mut scope = Scope {
         compile: compile_sides,
         budget: MAX_CHANGED_SOURCES,
+        change_bytes_budget: MAX_COMPILE_CHANGE_BYTES,
         notes: Vec::new(),
     };
     for pair in diff.config_pairs.clone() {
@@ -709,6 +1120,11 @@ fn compare_targets(
     if scope.budget == 0 {
         scope.notes.push(
             format!("The comparison stopped after {MAX_CHANGED_SOURCES} changed sources.").into(),
+        );
+    }
+    if scope.change_bytes_budget == 0 {
+        scope.notes.push(
+            format!("The comparison stopped after reaching the {MAX_COMPILE_CHANGE_BYTES}-byte compile diff budget.").into(),
         );
     }
     for note in scope.notes {
@@ -823,15 +1239,16 @@ fn compare_cache(a: &BuildSnapshot, b: &BuildSnapshot, set: CacheSet, diff: &mut
     if set == CacheSet::None {
         return;
     }
-    let include = |name: &[u8], record: &CacheRecord| match set {
-        CacheSet::Key => key_cache_entry(name, record),
-        CacheSet::All => !matches!(record.ty.as_slice(), b"INTERNAL" | b"STATIC"),
-        CacheSet::None => false,
-    };
     let names: BTreeSet<&BString> = a.cache.keys().chain(b.cache.keys()).collect();
     for name in names {
-        let left = a.cache.get(name).filter(|record| include(name, record));
-        let right = b.cache.get(name).filter(|record| include(name, record));
+        let left = a
+            .cache
+            .get(name)
+            .filter(|record| cache_set_includes(set, name, record));
+        let right = b
+            .cache
+            .get(name)
+            .filter(|record| cache_set_includes(set, name, record));
         if left.is_none() && right.is_none() {
             continue;
         }
@@ -942,7 +1359,7 @@ pub fn compare(a: &BuildSnapshot, b: &BuildSnapshot, options: &DiffOptions) -> C
     let link = comparable(Section::Link, &mut diff);
     let toolchain = comparable(Section::Toolchain, &mut diff);
     let packages = comparable(Section::Packages, &mut diff);
-    let cache = comparable(Section::Cache, &mut diff);
+    let cache = options.cache != CacheSet::None && comparable(Section::Cache, &mut diff);
     if targets || compile || link {
         pair_configs(&a, &b, options, &mut diff);
         let mut gated = options.clone();
@@ -961,7 +1378,20 @@ pub fn compare(a: &BuildSnapshot, b: &BuildSnapshot, options: &DiffOptions) -> C
         compare_packages(&a, &b, &mut diff);
     }
     if cache {
-        compare_cache(&a, &b, options.cache, &mut diff);
+        let effective_cache = if options.cache == CacheSet::All
+            && (a.saved_cache_set == Some(CacheSet::Key)
+                || b.saved_cache_set == Some(CacheSet::Key))
+        {
+            diff.partial.push((
+                Section::Cache,
+                "A snapshot was saved with --cache key, so only key cache entries were compared."
+                    .into(),
+            ));
+            CacheSet::Key
+        } else {
+            options.cache
+        };
+        compare_cache(&a, &b, effective_cache, &mut diff);
     }
     diff.partial.sort();
     diff.partial.dedup();

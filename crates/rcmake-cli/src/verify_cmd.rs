@@ -218,6 +218,7 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
         stderr: Output::Stream,
         timeout: Some(launcher_timeout),
         tee: false,
+        default_error_mode: false,
     };
 
     let host_ref = host.as_ref();

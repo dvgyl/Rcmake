@@ -106,6 +106,7 @@ fn execute(host: &dyn Host, program: &BString, args: Vec<BString>, stdout: Outpu
         stderr: Output::Inherit,
         timeout: Some(Duration::from_secs(120)),
         tee: false,
+        default_error_mode: false,
     };
     match host.run(&request, &mut |_, _| {}) {
         Ok(output) => match output.results.first() {

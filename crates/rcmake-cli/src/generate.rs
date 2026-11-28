@@ -154,7 +154,8 @@ fn generate(
             GeneratorKind::VisualStudio(_) => Some(IdeFlavor::VisualStudio),
             GeneratorKind::Ninja
             | GeneratorKind::NinjaMultiConfig
-            | GeneratorKind::UnixMakefiles => None,
+            | GeneratorKind::UnixMakefiles
+            | GeneratorKind::NMakeMakefiles => None,
         },
     };
     configure_rules(interp)?;
@@ -322,9 +323,10 @@ fn generate(
         GeneratorKind::VisualStudio(_) => {
             return Err(format!("Could not create named generator {}", kind.name()).into());
         }
-        GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles => {
-            None
-        }
+        GeneratorKind::Ninja
+        | GeneratorKind::NinjaMultiConfig
+        | GeneratorKind::UnixMakefiles
+        | GeneratorKind::NMakeMakefiles => None,
     };
     if let Some(Err(err)) = ide_result {
         return Err(err.to_string().into());
@@ -366,6 +368,9 @@ fn generate(
         }
         GeneratorKind::UnixMakefiles => {
             rcmake_gen_make::generate_with_model(&result, host, bin, interp.cx().project())
+        }
+        GeneratorKind::NMakeMakefiles => {
+            rcmake_gen_make::generate_nmake_with_model(&result, host, bin, interp.cx().project())
         }
         GeneratorKind::Xcode | GeneratorKind::VisualStudio(_) => Ok(()),
     };
@@ -537,8 +542,23 @@ fn configure_rules(interp: &mut Interp) -> Result<(), Failure> {
                 for command in commands {
                     let result = cx
                         .expand_raw_args(&args)
-                        .and_then(|args| cx.call_command(command, args));
-                    failed |= result.is_err();
+                        .and_then(|args| cx.call_command_in_current_frame(command, args));
+                    if result.is_err() {
+                        failed = true;
+                        cx.issue(
+                            MessageKind::Error,
+                            Effect::SetError,
+                            None,
+                            format!(
+                                "Erroneous execution of the CONFIGURATOR \"{}\", from the RULE \"{}\", for the FILE_SET \"{}\" of TARGET \"{}\".",
+                                BString::from(command.as_slice()),
+                                call.name,
+                                call.file_set,
+                                call.target,
+                            )
+                            .into(),
+                        );
+                    }
                 }
                 cx.global().props.unset(b"\0RCMAKE_IN_RULE_CONFIGURATOR");
                 cx.var_or_empty(variable)

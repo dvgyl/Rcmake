@@ -29,9 +29,10 @@ fn config(name: &[u8]) -> String {
 }
 
 fn header(snapshot: &BuildSnapshot) -> String {
+    let tool = display(&snapshot.producer.tool);
     let producer = match &snapshot.producer.version {
-        Some(version) => format!("{} {}", snapshot.producer.tool, display(version)),
-        None => snapshot.producer.tool.to_owned(),
+        Some(version) => format!("{tool} {}", display(version)),
+        None => tool,
     };
     let source = snapshot
         .evidence(crate::Section::Compile)
@@ -331,7 +332,7 @@ fn side_json(snapshot: &BuildSnapshot) -> Value {
         (
             "producer",
             Value::object_from([
-                ("tool", Value::string(snapshot.producer.tool)),
+                ("tool", string(&snapshot.producer.tool)),
                 ("version", nullable(snapshot.producer.version.as_ref())),
             ]),
         ),
@@ -393,10 +394,7 @@ fn package_json(package: Option<&PackageSnapshot>) -> Value {
 }
 
 fn attribution(value: Attribution) -> Value {
-    Value::string(match value {
-        Attribution::Exact => "exact",
-        Attribution::Inferred => "inferred",
-    })
+    Value::string(value.label())
 }
 
 /// Render the comparison as deterministic `rcmake-diff-config-v1` JSON.

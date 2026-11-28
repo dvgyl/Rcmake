@@ -95,7 +95,10 @@ pub(crate) fn run(args: &[BString], persona: Persona, host: &dyn Host) -> i32 {
     match kind {
         GeneratorKind::Xcode => open_xcode(host, &dir_path, &project_name.value),
         GeneratorKind::VisualStudio(_) => open_visual_studio(host, &dir_path, &project_name.value),
-        GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles => {
+        GeneratorKind::Ninja
+        | GeneratorKind::NinjaMultiConfig
+        | GeneratorKind::UnixMakefiles
+        | GeneratorKind::NMakeMakefiles => {
             if persona == Persona::Native {
                 error(
                     host,
@@ -194,6 +197,7 @@ fn launch(
         stderr: Output::Capture,
         timeout: None,
         tee: true,
+        default_error_mode: false,
     };
     match host.run(&request, &mut |stream, bytes| host.write_out(stream, bytes)) {
         Ok(output) if output.results.first() == Some(&ProcessResult::Exited(0)) => 0,

@@ -50,6 +50,7 @@ fn deep_eval_recursion_stops_with_an_error_and_exit_code_1()
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(300)),
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     )?;

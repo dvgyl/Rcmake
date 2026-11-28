@@ -131,12 +131,12 @@ struct Configured {
 /// Allows `ccmake` to run [`RetainedConfigure::generate`] directly on the
 /// configured [`Interp`] and model without re-executing `CMakeLists.txt` or
 /// spawning configure-time child processes a second time.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) struct RetainedConfigure {
     inner: Option<RetainedInner>,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 struct RetainedInner {
     argv: Vec<BString>,
     host: Arc<dyn Host>,
@@ -156,7 +156,7 @@ struct RetainedInner {
     time: FileTime,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl RetainedConfigure {
     /// Run the generate phase on the retained configured session and finalize
     /// runtime records, profiling, and SARIF output.
@@ -213,7 +213,7 @@ impl RetainedConfigure {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl Drop for RetainedConfigure {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
@@ -223,7 +223,7 @@ impl Drop for RetainedConfigure {
 }
 
 /// Resolve the target binary directory for `opts` without modifying disk state.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn resolve_binary_dir(opts: &Options, host: &dyn Host) -> PathBuf {
     let (mut src, mut bin) = resolve_directories(
         host,
@@ -261,7 +261,7 @@ pub(crate) fn resolve_binary_dir(opts: &Options, host: &dyn Host) -> PathBuf {
 /// preset variables, the cache arguments (`-C`, `-D`, `-U`) in order, and the
 /// `PreLoad.cmake` scripts (`cmCursesMainForm::LoadCache`). The function writes no
 /// file.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn prepare_cache(
     argv: Vec<BString>,
     mut opts: Options,
@@ -287,7 +287,7 @@ pub(crate) fn prepare_cache(
 
 /// Run ONLY the configure phase (writing `CMakeCache.txt` without generating
 /// build files) and return the retained session ready for [`RetainedConfigure::generate`].
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn configure_only(
     argv: Vec<BString>,
     opts: Options,
@@ -856,7 +856,7 @@ impl<'a> ConfigureSession<'a> {
             };
         Err(Exit::Message(format!(
             "The source directory \"{}\" {problem}.\n{hint}{profile_hint}",
-            self.src.display()
+            path::from_native_cmake(&self.src)
         )))
     }
 
@@ -999,8 +999,8 @@ impl<'a> ConfigureSession<'a> {
                 host,
                 &format!(
                     "-- Generating {}\n   Called from: [1]\t{}\n",
-                    self.bin.display(),
-                    self.src.join("CMakeLists.txt").display()
+                    path::from_native_cmake(&self.bin),
+                    path::from_native_cmake(&self.src.join("CMakeLists.txt"))
                 ),
             );
         }
@@ -1047,7 +1047,16 @@ impl<'a> ConfigureSession<'a> {
             );
         }
         let generated = matches!(outcome, Outcome::Complete);
-        if unused_cli::report(host, interp, results) || matches!(outcome, Outcome::DeferredError) {
+        let allow_unused_hints = self.opts.persona == Persona::Native
+            && !crate::persona::oracle_mode(host)
+            && !self.opts.view
+            && self.opts.list_cache.is_none()
+            && !host
+                .env_get(b"RCMAKE_NO_HINTS")
+                .is_some_and(|value| value.as_slice() == b"1");
+        if unused_cli::report(host, interp, results, allow_unused_hints)
+            || matches!(outcome, Outcome::DeferredError)
+        {
             generation_failed(host);
             return Err(Exit::Code(1));
         }
@@ -1157,27 +1166,27 @@ fn resolve_directories(
         .any(|arg| matches!(arg, DirectoryArg::Binary(_)));
     let mut ignored = Vec::new();
     for (index, arg) in args.iter().enumerate() {
-        let (slot, path, slash) = match arg {
-            DirectoryArg::Source(path) => (&mut source, path.as_path(), false),
-            DirectoryArg::Binary(path) => (&mut binary, path.as_path(), false),
-            DirectoryArg::Positional(pos, slash) => {
+        let (slot, path, positional_raw) = match arg {
+            DirectoryArg::Source(path) => (&mut source, path.as_path(), None),
+            DirectoryArg::Binary(path) => (&mut binary, path.as_path(), None),
+            DirectoryArg::Positional(pos, raw) => {
                 let path = match pos.file_name().and_then(|name| name.to_str()) {
                     Some("CMakeCache.txt" | "CMakeLists.txt") => pos.parent().unwrap_or(pos),
                     _ => pos,
                 };
                 if is_file(host, &path.join("CMakeCache.txt")) && !explicit_binary {
-                    (&mut binary, path, *slash)
+                    (&mut binary, path, Some(raw.as_slice()))
                 } else if is_file(host, &path.join("CMakeLists.txt")) || source.is_none() {
-                    (&mut source, path, *slash)
+                    (&mut source, path, Some(raw.as_slice()))
                 } else if !explicit_binary && binary.is_none() {
-                    (&mut binary, path, *slash)
+                    (&mut binary, path, Some(raw.as_slice()))
                 } else {
-                    ignored.push((index, path, *slash));
+                    ignored.push((index, path, Some(raw.as_slice())));
                     continue;
                 }
             }
         };
-        if let Some(old) = slot.replace((index, path, slash))
+        if let Some(old) = slot.replace((index, path, positional_raw))
             && old.1 != path
         {
             ignored.push(old);
@@ -1186,13 +1195,9 @@ fn resolve_directories(
     let source = source.map(|(_, path, _)| path);
     let binary = binary.map(|(_, path, _)| path);
     ignored.sort_by_key(|(index, _, _)| *index);
-    for (_, path, slash) in ignored {
+    for (_, path, positional_raw) in ignored {
         if source != Some(path) && binary != Some(path) {
-            let suffix = if slash && path.parent().is_some() {
-                "/"
-            } else {
-                ""
-            };
+            let rendered = format_ignored_path(path, positional_raw);
             let profile_hint = if bare_profile_arg == Some(path) {
                 "\n\n  Hint: pass a profile output directory with --profile=<dir>."
             } else {
@@ -1201,13 +1206,41 @@ fn resolve_directories(
             options::warn(
                 host,
                 &format!(
-                    "Ignoring extra path from command line:\n\n   \"{}{suffix}\"{profile_hint}",
-                    path.display()
+                    "Ignoring extra path from command line:\n\n   \"{rendered}\"{profile_hint}"
                 ),
             );
         }
     }
     (source.map(Path::to_path_buf), binary.map(Path::to_path_buf))
+}
+
+fn format_ignored_path(path: &Path, positional_raw: Option<&[u8]>) -> BString {
+    if let Some(raw) = positional_raw {
+        if raw.starts_with(b"/") && !raw.starts_with(b"//") {
+            return BString::from(raw);
+        }
+        let mut rendered = render_ignored_path(path);
+        if raw.ends_with(b"/") && path.parent().is_some() && !rendered.ends_with(b"/") {
+            rendered.push(b'/');
+        }
+        return rendered;
+    }
+    render_ignored_path(path)
+}
+
+fn render_ignored_path(path: &Path) -> BString {
+    let raw = path::from_native(path);
+    if cfg!(windows)
+        || matches!(
+            raw.as_slice(),
+            [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()
+        )
+        || raw.starts_with(b"\\\\?\\")
+    {
+        rcmake_base::path_lex::cmake_style_windows(&raw)
+    } else {
+        raw
+    }
 }
 
 fn set_directory_vars(interp: &mut Interp, src: &Path, bin: &Path) {
@@ -1357,4 +1390,62 @@ message(FATAL_ERROR "Cannot configure this project.")
             .any(|entry| entry.name.starts_with(b"error-"))
     );
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn format_ignored_path_preserves_positional_rooted_operands_and_normalizes_explicit_flags() {
+    use rcmake_host::PureHost;
+
+    assert_eq!(
+        format_ignored_path(Path::new("D:\\extra\\path"), Some(b"/extra/path/")),
+        BString::from("/extra/path/")
+    );
+    assert_eq!(
+        format_ignored_path(
+            Path::new("D:\\work\\ExplicitDirs-build\\other_dir"),
+            Some(b"D:/work/ExplicitDirs-build/other_dir")
+        ),
+        BString::from("D:/work/ExplicitDirs-build/other_dir")
+    );
+    assert_eq!(
+        format_ignored_path(Path::new("/work/other_dir"), Some(b"other_dir/")),
+        BString::from("/work/other_dir/")
+    );
+    assert_eq!(
+        format_ignored_path(Path::new("/work/old"), None),
+        BString::from("/work/old")
+    );
+
+    let host = PureHost::default();
+    let args = [
+        BString::from("-S"),
+        BString::from("/work/a/../old"),
+        BString::from("-S"),
+        BString::from("/work/new"),
+        BString::from("-B"),
+        BString::from("/work/build"),
+        BString::from("/extra/path/"),
+    ];
+    let options::ParseResult::Run(opts) =
+        options::parse(&args, crate::persona::Persona::Compat, &host)
+    else {
+        panic!("expected option parse to succeed");
+    };
+    let (src, bin) = resolve_directories(&host, &opts.directories, None);
+    assert_eq!(src.as_deref(), Some(Path::new("/work/new")));
+    assert_eq!(bin.as_deref(), Some(Path::new("/work/build")));
+    let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+    assert!(
+        stderr.contains("   \"/work/old\""),
+        "repeated -S should report normalized path:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("/work/a/../old"),
+        "repeated -S should not leak unnormalized spelling:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("   \"/extra/path/\""),
+        "extra positional operand should preserve raw spelling:\n{stderr}"
+    );
 }

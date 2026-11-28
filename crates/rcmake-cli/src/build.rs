@@ -382,7 +382,12 @@ pub(crate) fn run(
         argv,
         rcmake_instrument::SnippetRole::CMakeBuild,
         rcmake_instrument::Hook::PostCMakeBuild,
-        || dispatch(host, dir, &opts, env.into_iter().collect()),
+        || {
+            if let Some(flag) = host.env_get(rcmake_instrument::IN_CMAKE_BUILD_ENV) {
+                env.insert(rcmake_instrument::IN_CMAKE_BUILD_ENV.into(), flag);
+            }
+            dispatch(host, dir, &opts, env.into_iter().collect())
+        },
     )
 }
 
@@ -459,8 +464,13 @@ fn dispatch(
             rcmake_gen_ninja::build_commands(&request)
         }
         GeneratorKind::UnixMakefiles => rcmake_gen_make::build_commands(&request),
+        GeneratorKind::NMakeMakefiles => rcmake_gen_make::build_commands_nmake(&request),
         #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
-        GeneratorKind::Xcode => rcmake_gen_xcode::build_commands(&request),
+        GeneratorKind::Xcode => rcmake_gen_xcode::build::build_commands_with_workspace(
+            &request,
+            &cached(b"CMAKE_OSX_SYSROOT"),
+            host,
+        ),
         #[cfg(any(windows, feature = "vs-cross"))]
         GeneratorKind::VisualStudio(_) => rcmake_gen_vs::build::build_commands_with_restore(
             &request,
@@ -516,6 +526,7 @@ fn dispatch(
                 stderr: Output::Capture,
                 timeout: None,
                 tee: true,
+                default_error_mode: false,
             },
         );
         if exit.code() != 0 {

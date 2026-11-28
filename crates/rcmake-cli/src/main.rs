@@ -20,6 +20,7 @@ enum ShimTool {
     Cmake,
     Ctest,
     Cpack,
+    Ccmake,
     RcmakeLsp,
 }
 
@@ -30,6 +31,7 @@ impl ShimTool {
             "cmake" => Some(Self::Cmake),
             "ctest" => Some(Self::Ctest),
             "cpack" => Some(Self::Cpack),
+            "ccmake" => Some(Self::Ccmake),
             "rcmake-lsp" => Some(Self::RcmakeLsp),
             _ => None,
         }
@@ -40,6 +42,7 @@ impl ShimTool {
             Self::Cmake => Some(rcmake_cli::Tool::Cmake),
             Self::Ctest => Some(rcmake_cli::Tool::Ctest),
             Self::Cpack => Some(rcmake_cli::Tool::Cpack),
+            Self::Ccmake => Some(rcmake_cli::Tool::Ccmake),
             Self::RcmakeLsp => None,
         }
     }
@@ -276,7 +279,12 @@ fn main() -> ExitCode {
 
     // The main thread has an unknown stack size, so it never runs the evaluator.
     let result = match spawned {
-        Ok(handle) => handle.join(),
+        Ok(handle) => {
+            // Keep Thread 0 from taking process-directed SIGINT while the worker
+            // thread runs an instrumented command under an interrupt guard.
+            rcmake_instrument::interrupt::shield_current_thread();
+            handle.join()
+        }
         Err(error) => {
             let prefix = if is_native {
                 "rcmake: internal error"
@@ -322,6 +330,7 @@ mod tests {
             ("cmake", ShimTool::Cmake),
             ("ctest", ShimTool::Ctest),
             ("cpack", ShimTool::Cpack),
+            ("ccmake", ShimTool::Ccmake),
             ("rcmake-lsp", ShimTool::RcmakeLsp),
         ] {
             let tool_flag = format!("--rcmake-internal-shim-tool={tool_name}");

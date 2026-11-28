@@ -27,7 +27,7 @@ pub(crate) enum CacheEdit {
 pub(crate) enum DirectoryArg {
     Source(PathBuf),
     Binary(PathBuf),
-    Positional(PathBuf, bool),
+    Positional(PathBuf, BString),
 }
 
 #[derive(Default)]
@@ -44,6 +44,12 @@ pub(crate) struct Options {
     /// `--compile-no-warning-as-error`.
     pub ignore_compile_warning_as_error: bool,
     pub regenerate_during_build: bool,
+    /// `--check-stamp-file <stamp>`.
+    pub check_stamp_file: Option<PathBuf>,
+    /// `--check-stamp-list <list>`.
+    pub check_stamp_list: Option<PathBuf>,
+    /// `--vs-solution-file <file>`.
+    pub vs_solution_file: Option<PathBuf>,
     pub generator: Option<BString>,
     pub architecture: Option<BString>,
     pub toolset: Option<BString>,
@@ -281,6 +287,7 @@ fn parse_args(
     let mut last_unknown = None;
     let mut iter = args.iter().peekable();
     let mut profile_format = None;
+    let mut profile_output_raw = None;
     while let Some(raw) = iter.next() {
         if script_role && raw.as_slice() == b"--" {
             if opts.script.is_none() {
@@ -324,7 +331,13 @@ fn parse_args(
             || cache::parse(&mut arg, &mut opts, host)?
             || diagnostics::parse(&mut arg, &mut opts, host)?
             || trace::parse(&mut arg, &mut opts, host)?
-            || debug::parse(&mut arg, &mut opts, host, &mut profile_format)?
+            || debug::parse(
+                &mut arg,
+                &mut opts,
+                host,
+                &mut profile_format,
+                &mut profile_output_raw,
+            )?
         {
             continue;
         }
@@ -345,7 +358,7 @@ fn parse_args(
         ));
     }
     validate_script_mode(&opts, host)?;
-    debug::validate_profile(host, &opts, profile_format)?;
+    debug::validate_profile(host, &opts, profile_format, profile_output_raw)?;
     Ok(Some(opts))
 }
 
@@ -379,7 +392,7 @@ fn parse_project(
         raw if !raw.starts_with(b"-") => {
             opts.directories.push(DirectoryArg::Positional(
                 resolve_project_path(host, raw),
-                raw.ends_with(b"/"),
+                BString::from(raw),
             ));
         }
         b"-i" => {
@@ -409,6 +422,24 @@ fn parse_project(
         _ => match arg.flag {
             b"--regenerate-during-build" if arg.inline.is_none() => {
                 opts.regenerate_during_build = true
+            }
+            b"--check-stamp-file" => {
+                opts.check_stamp_file = Some(resolve_cli_path(
+                    host,
+                    arg.required("No file specified for --check-stamp-file")?,
+                ));
+            }
+            b"--check-stamp-list" => {
+                opts.check_stamp_list = Some(resolve_cli_path(
+                    host,
+                    arg.required("No file specified for --check-stamp-list")?,
+                ));
+            }
+            b"--vs-solution-file" => {
+                opts.vs_solution_file = Some(resolve_cli_path(
+                    host,
+                    arg.required("No file specified for --vs-solution-file")?,
+                ));
             }
             b"--graphviz" => {
                 opts.graphviz = Some(resolve_cli_path(
@@ -446,10 +477,8 @@ fn parse_directory(
     let is_build = arg.flag == b"-B";
     let label = if is_build { "build" } else { "source" };
     let flag = String::from_utf8_lossy(arg.flag);
-    let path = resolve_project_path(
-        host,
-        arg.required(format!("No {label} directory specified for {flag}"))?,
-    );
+    let raw = arg.required(format!("No {label} directory specified for {flag}"))?;
+    let path = resolve_project_path(host, raw);
     if arg.flag == b"-H" {
         host.write_out(
             Stream::Stderr,
@@ -1074,6 +1103,23 @@ mod tests {
         assert_eq!(
             resolve_config_dir(&win, ConfigPlatform::Macos),
             "cmake_config_dir"
+        );
+    }
+
+    #[test]
+    fn profiling_output_error_preserves_raw_operand_spelling() {
+        let (host, result) = parse_with(
+            Persona::Compat,
+            &[
+                "--profiling-output=/no/such/file.txt",
+                "--profiling-format=google-trace",
+            ],
+        );
+        assert_eq!(result.err(), Some(1));
+        assert!(
+            stderr(&host).contains("Could not start profiling: Unable to open: /no/such/file.txt"),
+            "stderr={}",
+            stderr(&host)
         );
     }
 }

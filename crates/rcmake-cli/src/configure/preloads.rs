@@ -95,11 +95,17 @@ impl ConfigureSession<'_> {
                             host,
                             &format!("loading initial cache file {}\n", script.display()),
                         );
-                        emit_cli_error(host, format!("Not a file: {}", path.display()));
+                        emit_cli_error(
+                            host,
+                            format!("Not a file: {}", path::from_native_cmake(&path)),
+                        );
                         if self.opts.view || is_file(host, &self.src.join("CMakeLists.txt")) {
                             emit_cli_error(
                                 host,
-                                format!("Error processing file: {}", path.display()),
+                                format!(
+                                    "Error processing file: {}",
+                                    path::from_native_cmake(&path)
+                                ),
                             );
                         }
                         preloads.missing = true;

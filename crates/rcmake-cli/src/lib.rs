@@ -24,11 +24,13 @@ mod make_depends;
 mod open;
 mod options;
 mod persona;
+mod preset_cmd;
 mod presets;
 mod probe_cache;
 mod profile;
 mod resource;
 mod sarif;
+mod stamp_check;
 mod system_information;
 mod verify_cmd;
 mod workflow;
@@ -315,6 +317,7 @@ fn run_cmake(
             b"explain" => return explain_cmd::run(argv.first(), args, host),
             b"fmt" => return fmt_cmd::run(argv.first(), args, host),
             b"lint" => return lint_cmd::run(argv.first(), args, host),
+            b"preset" => return preset_cmd::run(args, host.as_ref()),
             b"verify" => return verify_cmd::run(argv.first(), args, host),
             b"ctest" | b"cpack" | b"ccmake" => {
                 let (tool_name, tool) = match command.as_slice() {
@@ -404,6 +407,13 @@ fn run_cmake(
     if let Some(script) = opts.script.take() {
         return run_script(argv, &mut opts, &script, host);
     }
+    if stamp_check::is_up_to_date(
+        host.as_ref(),
+        opts.check_stamp_list.as_deref(),
+        opts.check_stamp_file.as_deref(),
+    ) {
+        return 0;
+    }
     if persona == persona::Persona::Native && opts.extensions.export_compile_commands {
         opts.cache_edits.insert(
             0,
@@ -414,6 +424,9 @@ fn run_cmake(
             }),
         );
     }
+    let preserve_warning_as_error = opts.regenerate_during_build
+        || opts.check_stamp_file.is_some()
+        || opts.check_stamp_list.is_some();
     for (ignore_key, ignore) in [
         (
             "_RCMAKE_IGNORE_LINK_WARNING_AS_ERROR",
@@ -431,7 +444,7 @@ fn run_cmake(
                     ty: Some(CacheType::Internal),
                     value: "ON".into(),
                 }));
-        } else if !opts.regenerate_during_build {
+        } else if !preserve_warning_as_error {
             opts.cache_edits
                 .push(options::CacheEdit::Remove(ignore_key.into()));
         }
@@ -1170,6 +1183,7 @@ mod tests {
             "explain",
             "fmt",
             "lint",
+            "preset",
             "verify",
             "ccmake",
             "ctest",

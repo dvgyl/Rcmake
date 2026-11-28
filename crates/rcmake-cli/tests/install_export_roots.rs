@@ -36,6 +36,7 @@ impl Fixture {
                     stderr: Output::Capture,
                     timeout: Some(Duration::from_secs(30)),
                     tee: false,
+                    default_error_mode: false,
                 },
                 1024 * 1024,
             )

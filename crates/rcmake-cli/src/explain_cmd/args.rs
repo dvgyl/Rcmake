@@ -68,14 +68,26 @@ pub(super) struct EvalOptions {
     pub(super) color: Color,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct TargetsOptions {
+    pub(super) build: Option<BString>,
+    pub(super) source: Option<BString>,
+    pub(super) config: Option<BString>,
+    pub(super) all: bool,
+    pub(super) json: bool,
+    pub(super) color: Color,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Invocation {
     Help,
     FindHelp,
     EvalHelp,
+    TargetsHelp,
     Query(Options),
     Find(FindOptions),
     Eval(EvalOptions),
+    Targets(TargetsOptions),
 }
 
 const VALUED: &[&[u8]] = &[
@@ -116,12 +128,14 @@ const EVAL_ONLY: &[&[u8]] = &[
     b"--command-config",
     b"--output-config",
 ];
+const TARGETS_ONLY: &[&[u8]] = &[b"--all", b"-S"];
 
 #[derive(Default)]
 struct Parsed {
     used: Vec<&'static [u8]>,
     positionals: Vec<BString>,
     build: Option<BString>,
+    source: Option<BString>,
     kind: Kind,
     target_value: Option<BString>,
     config: Option<BString>,
@@ -132,6 +146,8 @@ struct Parsed {
     find: Option<BString>,
     eval: Option<BString>,
     eval_property: Option<BString>,
+    targets: bool,
+    all: bool,
     call: Option<u32>,
     language: Option<BString>,
     link_language: Option<BString>,
@@ -152,6 +168,7 @@ struct Parsed {
 struct Scan {
     eval: bool,
     find: bool,
+    targets: bool,
     help: bool,
     first_positional: Option<BString>,
 }
@@ -165,6 +182,10 @@ fn flag_name(raw: &[u8]) -> (&[u8], Option<&[u8]>) {
         (b"-B", Some(rest))
     } else if raw.len() > 2 && raw.starts_with(b"-B") {
         (b"-B", raw.get(2..))
+    } else if let Some(rest) = raw.strip_prefix(b"-S=") {
+        (b"-S", Some(rest))
+    } else if raw.len() > 2 && raw.starts_with(b"-S") {
+        (b"-S", raw.get(2..))
     } else {
         (raw, None)
     }
@@ -180,13 +201,16 @@ fn scan(args: &[BString]) -> Scan {
             b"--help" | b"-h" => scan.help = true,
             b"--eval" | b"--eval-property" => scan.eval = true,
             b"--find" => scan.find = true,
+            b"--targets" => scan.targets = true,
             _ => {}
         }
     }
     let mut iter = options.peekable();
     while let Some(arg) = iter.next() {
         let (flag, attached) = flag_name(arg);
-        let valued = VALUED.contains(&flag) || (scan.eval && flag == b"--target");
+        let valued = VALUED.contains(&flag)
+            || (scan.eval && flag == b"--target")
+            || (scan.targets && flag == b"-S");
         if attached.is_none() && valued {
             iter.next_if(|next| !matches!(next.as_slice(), b"--help" | b"-h"));
         } else if !flag.starts_with(b"-") && scan.first_positional.is_none() {
@@ -200,6 +224,7 @@ fn value<'a>(
     args: &mut impl Iterator<Item = &'a BString>,
     attached: Option<&[u8]>,
     flag: &str,
+    targets_mode: bool,
 ) -> Result<BString, String> {
     let value = match attached {
         Some(value) => value,
@@ -211,7 +236,9 @@ fn value<'a>(
                 ));
             }
             // `-h` never reaches this point, because it selects the help text first.
-            Some(next @ (b"-B" | b"-h")) => {
+            // Only treat `-S` as a missing-value flag inside `--targets` mode so
+            // compiler flags such as `explain app --flag -S` remain valid.
+            Some(next) if matches!(next, b"-B" | b"-h") || (targets_mode && next == b"-S") => {
                 let next = String::from_utf8_lossy(next);
                 return Err(format!(
                     "Supply a value for {flag}. Use {flag}={next} to give {next} as the value."
@@ -257,7 +284,8 @@ fn intern(flag: &[u8]) -> &'static [u8] {
         .chain(QUERY_ONLY)
         .chain(FIND_ONLY)
         .chain(EVAL_ONLY)
-        .chain(&[b"--target".as_slice(), b"--json"])
+        .chain(TARGETS_ONLY)
+        .chain(&[b"--target".as_slice(), b"--targets", b"--json"])
         .find(|known| **known == flag)
         .copied()
         .unwrap_or(b"")
@@ -276,6 +304,8 @@ pub(super) fn parse(args: &[BString]) -> Result<Invocation, String> {
             Invocation::FindHelp
         } else if scan.eval {
             Invocation::EvalHelp
+        } else if scan.targets {
+            Invocation::TargetsHelp
         } else {
             Invocation::Help
         });
@@ -298,12 +328,20 @@ pub(super) fn parse(args: &[BString]) -> Result<Invocation, String> {
         };
         match flag {
             b"--target" if scan.eval => {
-                let consumer = value(&mut args, attached, "--target")?;
+                let consumer = value(&mut args, attached, "--target", scan.targets)?;
                 once(&mut parsed.target_value, consumer, "--target")?;
             }
             b"--target" => {
                 no_value(flag)?;
                 set_kind(&mut parsed, Kind::Target)?;
+            }
+            b"--targets" => {
+                no_value(flag)?;
+                parsed.targets = true;
+            }
+            b"--all" => {
+                no_value(flag)?;
+                parsed.all = true;
             }
             b"--var" => {
                 no_value(flag)?;
@@ -333,10 +371,12 @@ pub(super) fn parse(args: &[BString]) -> Result<Invocation, String> {
                 no_value(flag)?;
                 parsed.fresh = true;
             }
-            b"--config" => parsed.config = Some(value(&mut args, attached, "--config")?),
+            b"--config" => {
+                parsed.config = Some(value(&mut args, attached, "--config", scan.targets)?);
+            }
             b"--filter" | b"--flag" | b"--define" | b"--include" | b"--dep" => {
                 let name = String::from_utf8_lossy(flag).into_owned();
-                let text = value(&mut args, attached, &name)?;
+                let text = value(&mut args, attached, &name, scan.targets)?;
                 let kind = intern(flag);
                 if parsed.typed_flag.is_some_and(|previous| previous != kind) {
                     return Err(
@@ -355,24 +395,27 @@ pub(super) fn parse(args: &[BString]) -> Result<Invocation, String> {
                     _ => ExplainFilter::Dependency(text),
                 });
             }
-            b"--color" => parsed.color = color(&value(&mut args, attached, "--color")?)?,
-            b"-B" => parsed.build = Some(value(&mut args, attached, "-B")?),
+            b"--color" => {
+                parsed.color = color(&value(&mut args, attached, "--color", scan.targets)?)?;
+            }
+            b"-B" => parsed.build = Some(value(&mut args, attached, "-B", scan.targets)?),
+            b"-S" => parsed.source = Some(value(&mut args, attached, "-S", scan.targets)?),
             b"--find" => once(
                 &mut parsed.find,
-                value(&mut args, attached, "--find")?,
+                value(&mut args, attached, "--find", scan.targets)?,
                 "--find",
             )?,
             b"--eval" => once(
                 &mut parsed.eval,
-                value(&mut args, attached, "--eval")?,
+                value(&mut args, attached, "--eval", scan.targets)?,
                 "--eval",
             )?,
             b"--eval-property" => {
-                let property = value(&mut args, attached, "--eval-property")?;
+                let property = value(&mut args, attached, "--eval-property", scan.targets)?;
                 once(&mut parsed.eval_property, property, "--eval-property")?;
             }
             b"--call" => {
-                let text = value(&mut args, attached, "--call")?;
+                let text = value(&mut args, attached, "--call", scan.targets)?;
                 let call = std::str::from_utf8(&text)
                     .ok()
                     .and_then(|text| text.parse::<u32>().ok())
@@ -380,16 +423,27 @@ pub(super) fn parse(args: &[BString]) -> Result<Invocation, String> {
                     .ok_or("Give --call a positive number.")?;
                 parsed.call = Some(call);
             }
-            b"--lang" => parsed.language = Some(value(&mut args, attached, "--lang")?),
-            b"--link-lang" => {
-                parsed.link_language = Some(value(&mut args, attached, "--link-lang")?)
+            b"--lang" => {
+                parsed.language = Some(value(&mut args, attached, "--lang", scan.targets)?)
             }
-            b"--directory" => parsed.directory = Some(value(&mut args, attached, "--directory")?),
+            b"--link-lang" => {
+                parsed.link_language =
+                    Some(value(&mut args, attached, "--link-lang", scan.targets)?);
+            }
+            b"--directory" => {
+                parsed.directory = Some(value(&mut args, attached, "--directory", scan.targets)?);
+            }
             b"--command-config" => {
-                parsed.command_config = Some(value(&mut args, attached, "--command-config")?);
+                parsed.command_config = Some(value(
+                    &mut args,
+                    attached,
+                    "--command-config",
+                    scan.targets,
+                )?);
             }
             b"--output-config" => {
-                parsed.output_config = Some(value(&mut args, attached, "--output-config")?);
+                parsed.output_config =
+                    Some(value(&mut args, attached, "--output-config", scan.targets)?);
             }
             _ if raw.starts_with(b"-") => {
                 return Err(format!("Unknown option {arg:?}."));
@@ -420,8 +474,27 @@ fn reject(used: &[&'static [u8]], banned: &[&[u8]], mode: &str) -> Result<(), St
 fn select(parsed: Parsed, why_not: bool) -> Result<Invocation, String> {
     let find_alias = why_not && parsed.positionals.len() == 2;
     let eval = parsed.eval.is_some() || parsed.eval_property.is_some();
-    if (parsed.find.is_some() || find_alias) && eval {
-        return Err("Use one of --find, --eval, or --eval-property.".into());
+    let find = parsed.find.is_some() || find_alias;
+    let mode_count = usize::from(find) + usize::from(eval) + usize::from(parsed.targets);
+    if mode_count > 1 {
+        return Err("Use one of --find, --eval, --eval-property, or --targets.".into());
+    }
+    if parsed.targets {
+        reject(&parsed.used, QUERY_ONLY, "--targets")?;
+        reject(&parsed.used, FIND_ONLY, "--targets")?;
+        reject(&parsed.used, EVAL_ONLY, "--targets")?;
+        reject(&parsed.used, &[b"--target"], "--targets")?;
+        if !parsed.positionals.is_empty() {
+            return Err("--targets takes no positional arguments.".into());
+        }
+        return Ok(Invocation::Targets(TargetsOptions {
+            build: parsed.build,
+            source: parsed.source,
+            config: parsed.config,
+            all: parsed.all,
+            json: parsed.json,
+            color: parsed.color,
+        }));
     }
     if why_not
         && !find_alias
@@ -431,9 +504,10 @@ fn select(parsed: Parsed, why_not: bool) -> Result<Invocation, String> {
     {
         return Err("Specify one package: rcmake explain why-not <package>.".into());
     }
-    if parsed.find.is_some() || find_alias {
+    if find {
         reject(&parsed.used, QUERY_ONLY, "--find")?;
         reject(&parsed.used, EVAL_ONLY, "--find")?;
+        reject(&parsed.used, TARGETS_ONLY, "--find")?;
         reject(&parsed.used, &[b"--target", b"--config"], "--find")?;
         let package = match (parsed.find, parsed.positionals.as_slice()) {
             (Some(package), []) => package,
@@ -453,6 +527,7 @@ fn select(parsed: Parsed, why_not: bool) -> Result<Invocation, String> {
     if eval {
         reject(&parsed.used, QUERY_ONLY, "--eval")?;
         reject(&parsed.used, FIND_ONLY, "--eval")?;
+        reject(&parsed.used, TARGETS_ONLY, "--eval")?;
         if parsed.eval.is_some() && parsed.eval_property.is_some() {
             return Err("Use either --eval or --eval-property.".into());
         }
@@ -492,6 +567,7 @@ fn select(parsed: Parsed, why_not: bool) -> Result<Invocation, String> {
     }
     reject(&parsed.used, FIND_ONLY, "a target or variable query")?;
     reject(&parsed.used, EVAL_ONLY, "a target or variable query")?;
+    reject(&parsed.used, TARGETS_ONLY, "a target or variable query")?;
     let name = match parsed.positionals.as_slice() {
         [] => return Err("Specify the name of a target or variable.".into()),
         [name] => name.clone(),
@@ -733,7 +809,81 @@ mod tests {
         assert_eq!(parse_args(&["--find", "--help"]), Ok(Invocation::FindHelp));
         assert_eq!(parse_args(&["why-not", "-h"]), Ok(Invocation::FindHelp));
         assert_eq!(parse_args(&["--eval", "x", "-h"]), Ok(Invocation::EvalHelp));
+        assert_eq!(
+            parse_args(&["--targets", "--help"]),
+            Ok(Invocation::TargetsHelp)
+        );
         assert_eq!(parse_args(&["-h"]), Ok(Invocation::Help));
         assert_eq!(parse_args(&["--filter", "--help"]), Ok(Invocation::Help));
+    }
+
+    #[test]
+    fn parses_targets_mode_and_rejects_foreign_flags() {
+        assert_eq!(
+            parse_args(&[
+                "--targets",
+                "-B",
+                "build",
+                "-S",
+                "src",
+                "--config",
+                "Debug",
+                "--all",
+                "--json",
+                "--color=never",
+            ]),
+            Ok(Invocation::Targets(TargetsOptions {
+                build: Some("build".into()),
+                source: Some("src".into()),
+                config: Some("Debug".into()),
+                all: true,
+                json: true,
+                color: Color::Never,
+            }))
+        );
+        assert_eq!(
+            parse_args(&["--targets", "-Ssrc", "-Bout"]),
+            Ok(Invocation::Targets(TargetsOptions {
+                build: Some("out".into()),
+                source: Some("src".into()),
+                ..TargetsOptions::default()
+            }))
+        );
+        for invalid in [
+            &["--targets", "app"][..],
+            &["--targets", "--find", "Boost"],
+            &["--targets", "--eval", "$<CONFIG>"],
+            &["--targets", "--target"],
+            &["--targets", "--var"],
+            &["--targets=yes"],
+            &["app", "--all"],
+            &["app", "-S", "src"],
+            &["--targets", "--config", "-S", "src"],
+        ] {
+            assert!(parse_args(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn flag_filter_accepts_dash_s_compiler_flag_outside_targets_mode() {
+        assert_eq!(
+            parse_args(&["app", "--flag", "-S"]),
+            Ok(Invocation::Query(Options {
+                name: "app".into(),
+                kind: Kind::Target,
+                typed: Some(ExplainFilter::Flag("-S".into())),
+                ..Options::default()
+            }))
+        );
+        assert_eq!(
+            parse_args(&["app", "--flag", "-S", "-B", "build"]),
+            Ok(Invocation::Query(Options {
+                name: "app".into(),
+                build: Some("build".into()),
+                kind: Kind::Target,
+                typed: Some(ExplainFilter::Flag("-S".into())),
+                ..Options::default()
+            }))
+        );
     }
 }

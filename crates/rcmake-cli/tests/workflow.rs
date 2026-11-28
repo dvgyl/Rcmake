@@ -50,6 +50,7 @@ fn run(host: &NativeHost, cwd: &Path, program: &BString, args: &[&str]) -> RunOu
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(30)),
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     )

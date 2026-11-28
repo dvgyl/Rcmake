@@ -72,6 +72,7 @@ fn run(
             stderr: Output::Capture,
             timeout: Some(Duration::from_secs(120)),
             tee: false,
+            default_error_mode: false,
         },
         &mut |_, _| {},
     )

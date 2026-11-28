@@ -1,12 +1,18 @@
 //! Add instrumentation launchers to lowered custom commands.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rcmake_base::BString;
-use rcmake_host::{FileKind, Follow, Host, path};
+use rcmake_base::{BString, hash::HashAlgo};
+use rcmake_host::{FileKind, Follow, Host, WriteMode, path};
 use rcmake_model::{CustomCommandKind, ProjectModel, TargetEvent, TargetKind};
 use rcmake_resolve::{BuildStep, GenerationResult, Invocation};
+
+/// Spill custom-command output lists to a file once inline arguments exceed
+/// this byte budget or item count so Windows `cmd.exe`/`CreateProcess` and
+/// POSIX `ARG_MAX` limits are never exceeded.
+const INLINE_OUTPUT_BYTE_LIMIT: usize = 2048;
+const INLINE_OUTPUT_COUNT_LIMIT: usize = 32;
 
 pub(super) fn wrap_custom_commands(
     result: &mut GenerationResult,
@@ -27,7 +33,7 @@ pub(super) fn wrap_custom_commands(
     } else {
         return;
     };
-    let build = path::from_native(bin);
+    let build = path::from_native_cmake(bin);
     let utility_outputs: BTreeMap<_, _> = model
         .targets()
         .filter(|(_, target)| target.kind == TargetKind::Utility)
@@ -36,7 +42,7 @@ pub(super) fn wrap_custom_commands(
             let output = dir.join("CMakeFiles").join(path::to_native(&target.name));
             (
                 &target.name,
-                path::from_native(output.strip_prefix(bin).unwrap_or(&output)),
+                path::from_native_cmake(output.strip_prefix(bin).unwrap_or(&output)),
             )
         })
         .collect();
@@ -57,7 +63,13 @@ pub(super) fn wrap_custom_commands(
             }
         }
     }
-    for graph in &mut result.graphs {
+    let mut written_output_files = BTreeSet::new();
+    let mut existing_generated: BTreeSet<BString> =
+        result.metadata.generated_files.iter().cloned().collect();
+    let ctest = ctest.clone();
+    let graphs = &mut result.graphs;
+    let generated_files = &mut result.metadata.generated_files;
+    for graph in graphs {
         let mut owners = vec![None; graph.steps.len()];
         for target in &graph.targets {
             for step in &target.steps {
@@ -97,8 +109,32 @@ pub(super) fn wrap_custom_commands(
             if let Some(target) = target {
                 prefix.extend(["--target-name".into(), target.clone()]);
             }
-            for output in outputs.iter().chain(byproducts).chain(utility) {
-                prefix.extend(["--output-path".into(), output.clone()]);
+            let all_outputs: Vec<&BString> =
+                outputs.iter().chain(byproducts).chain(utility).collect();
+            let inline_bytes: usize = all_outputs
+                .iter()
+                .map(|output| output.len().saturating_add(18))
+                .sum();
+            let spilled = if inline_bytes > INLINE_OUTPUT_BYTE_LIMIT
+                || all_outputs.len() > INLINE_OUTPUT_COUNT_LIMIT
+            {
+                write_outputs_file(
+                    host,
+                    bin,
+                    &all_outputs,
+                    &mut written_output_files,
+                    &mut existing_generated,
+                    generated_files,
+                )
+            } else {
+                None
+            };
+            if let Some(file) = spilled {
+                prefix.extend(["--output-as-file-name".into(), file]);
+            } else {
+                for output in all_outputs {
+                    prefix.extend(["--output-path".into(), output.clone()]);
+                }
             }
             prefix.push("--".into());
             let mut shell_prefix = BString::default();
@@ -111,11 +147,50 @@ pub(super) fn wrap_custom_commands(
                 if events_only.is_none_or(|(before, after)| {
                     index < before || index >= command_count.saturating_sub(after)
                 }) {
-                    wrap(invocation, ctest, &prefix, &shell_prefix);
+                    wrap(invocation, &ctest, &prefix, &shell_prefix);
                 }
             }
         }
     }
+}
+
+fn write_outputs_file(
+    host: &dyn Host,
+    bin: &Path,
+    outputs: &[&BString],
+    written: &mut BTreeSet<String>,
+    existing_generated: &mut BTreeSet<BString>,
+    generated_files: &mut Vec<BString>,
+) -> Option<BString> {
+    let needs_nul = outputs.iter().any(|output| {
+        output
+            .iter()
+            .any(|&byte| matches!(byte, b',' | b'\n' | b'\r' | b'\0'))
+    });
+    let mut payload = Vec::new();
+    let delimiter = if needs_nul { b'\0' } else { b',' };
+    for (index, output) in outputs.iter().enumerate() {
+        if index > 0 {
+            payload.push(delimiter);
+        }
+        payload.extend_from_slice(output);
+    }
+    if needs_nul && outputs.len() == 1 {
+        payload.push(b'\0');
+    }
+    let digest = HashAlgo::Sha256.hex_digest(&payload);
+    let relative = BString::from(format!("CMakeFiles/c/{digest}"));
+    let dir = bin.join("CMakeFiles").join("c");
+    let full = dir.join(&digest);
+    if !written.contains(&digest) {
+        host.create_dir_all(&dir).ok()?;
+        host.write(&full, &payload, WriteMode::Truncate).ok()?;
+        written.insert(digest);
+    }
+    if existing_generated.insert(relative.clone()) {
+        generated_files.push(relative);
+    }
+    Some(path::from_native_cmake(&full))
 }
 
 fn wrap(invocation: &mut Invocation, ctest: &BString, prefix: &[BString], shell_prefix: &[u8]) {

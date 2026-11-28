@@ -125,7 +125,10 @@ fn check_scoped_rules(
             );
         }
     };
-    let makefiles = kind == GeneratorKind::UnixMakefiles;
+    let makefiles = matches!(
+        kind,
+        GeneratorKind::UnixMakefiles | GeneratorKind::NMakeMakefiles
+    );
     let languages = target.compile_units.iter().filter_map(|unit| {
         target
             .compile_groups

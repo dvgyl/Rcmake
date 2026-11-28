@@ -86,9 +86,28 @@ fn listen(
         .map(|endpoint| Box::new(endpoint) as Box<dyn rcmake_dap::transport::Listener>)
 }
 
-/// Report the missing Windows named-pipe transport. The compat persona keeps the
-/// exact CMake text.
-#[cfg(not(unix))]
+/// Make the Windows named pipe (ADR-050). The compat persona adds the `FormatMessage`
+/// line break (`\r\n`) that the Rust error text does not have. The text is the same
+/// as in CMake on English systems. On other locales, it can be different, because
+/// CMake uses `FormatMessageA` and Rust uses `FormatMessageW`.
+#[cfg(windows)]
+fn listen(
+    pipe: &std::path::Path,
+    _host: &Arc<dyn Host>,
+    persona: crate::persona::Persona,
+) -> Result<Box<dyn rcmake_dap::transport::Listener>, String> {
+    match rcmake_dap::transport::windows::WindowsEndpoint::bind(pipe) {
+        Ok(endpoint) => Ok(Box::new(endpoint)),
+        Err(reason) => Err(match persona {
+            crate::persona::Persona::Compat => format!("{reason}\r\n"),
+            crate::persona::Persona::Native => reason,
+        }),
+    }
+}
+
+/// Report the missing debugger transport. The compat persona keeps the exact CMake
+/// text.
+#[cfg(not(any(unix, windows)))]
 fn listen(
     _pipe: &std::path::Path,
     _host: &Arc<dyn Host>,
@@ -98,12 +117,12 @@ fn listen(
 }
 
 /// Reason text when the platform has no debugger pipe transport.
-#[cfg_attr(unix, allow(dead_code))]
+#[cfg_attr(any(unix, windows), allow(dead_code))]
 fn unsupported_transport_reason(persona: crate::persona::Persona) -> &'static str {
     match persona {
         crate::persona::Persona::Compat => "CMake was not built with support for --debugger",
         crate::persona::Persona::Native => {
-            "Windows named-pipe debugger transport is not yet supported in rcmake"
+            "Debugger transport is not supported on this platform in rcmake"
         }
     }
 }

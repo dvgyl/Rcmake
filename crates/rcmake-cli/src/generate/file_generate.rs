@@ -36,7 +36,7 @@ pub(super) fn write(
             model,
             *dir,
             &format!(
-                "Evaluation output file\n\n  \"{path}\"\n\ndepends on the sources of a target it is used in.  This is a dependency loop and is not allowed."
+                "Evaluation output file\n  \"{path}\"\ndepends on the sources of a target it is used in.  This is a dependency loop and is not allowed."
             ),
         ));
     }
@@ -522,5 +522,30 @@ mod tests {
         assert!(terminate_content(&request, BString::default()).is_empty());
         request.newline = FileGenerateNewline::Native;
         assert_eq!(terminate_content(&request, "value".into()), "value");
+    }
+
+    #[test]
+    fn cycle_error_uses_single_blank_lines_around_output_path() {
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/work/src".into(), "/work/build".into());
+        let err = generation_error(
+            &model,
+            DirId::ROOT,
+            "Evaluation output file\n  \"/work/build/out.cpp\"\ndepends on the sources of a target it is used in.  This is a dependency loop and is not allowed.",
+        );
+        let GenError::Invalid(text) = err else {
+            panic!("expected invalid generation error");
+        };
+        let text = text.to_string();
+        assert!(
+            text.contains(
+                "CMake Error in CMakeLists.txt:\n  Evaluation output file\n\n    \"/work/build/out.cpp\"\n\n  depends on the sources"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("\n\n\n    \"/work/build/out.cpp\""),
+            "{text}"
+        );
     }
 }

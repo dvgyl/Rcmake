@@ -228,6 +228,7 @@ impl Tasks<'_> {
                     stderr: Output::SharedWithStdout,
                     timeout: Some(Duration::from_secs(600)),
                     tee: false,
+                    default_error_mode: false,
                 },
                 &mut |_, _| {},
             )

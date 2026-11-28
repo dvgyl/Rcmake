@@ -100,7 +100,10 @@ fn read(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, S
         if err.starts_with("Could not read presets from ") {
             err
         } else {
-            format!("Could not read presets from {}:\n{err}", src.display())
+            format!(
+                "Could not read presets from {}:\n{err}",
+                rcmake_host::path::from_native_cmake(src)
+            )
         }
     })
 }
@@ -418,7 +421,13 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
                 None
             };
             if let Some(reason) = reason {
-                emit_cli_error(host, format!("{reason} in {}: \"{name}\"", src.display()));
+                emit_cli_error(
+                    host,
+                    format!(
+                        "{reason} in {}: \"{name}\"",
+                        rcmake_host::path::from_native_cmake(src)
+                    ),
+                );
                 if reason == "No such configure preset" {
                     suggest_preset(
                         host,
@@ -446,7 +455,7 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
                 } else {
                     format!(
                         "Could not read presets from {}:\n{}",
-                        src.display(),
+                        rcmake_host::path::from_native_cmake(src),
                         err.message
                     )
                 };
@@ -607,7 +616,7 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
                 host,
                 &format!(
                     "Put cmake in trace mode and redirect trace output to a file instead of stderr.\nTrace will be written to {}\n",
-                    absolute.display()
+                    rcmake_host::path::from_native_cmake(&absolute)
                 ),
             );
             cfg.redirect = Some(absolute);

@@ -9,9 +9,53 @@ use rcmake_base::BString;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Producer {
     /// `cmake`, `rcmake`, or `unknown`.
-    pub tool: &'static str,
+    pub tool: BString,
     /// Version from the cache, when known.
     pub version: Option<BString>,
+}
+
+/// Host operating system and CPU architecture captured with a snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotHost {
+    /// Operating system kernel name (for example `Darwin`, `Linux`, or `Windows`).
+    pub os: BString,
+    /// Machine architecture (for example `arm64` or `x86_64`).
+    pub arch: BString,
+}
+
+/// Cache entries to compare or retain in a portable snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheSet {
+    /// Build-relevant `CMAKE_*` entries and non-secret project options.
+    #[default]
+    Key,
+    /// Every entry that is not `INTERNAL` or `STATIC`.
+    All,
+    /// No cache entries.
+    None,
+}
+
+impl CacheSet {
+    /// Stable name used on the command line and in portable snapshots.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::All => "all",
+            Self::None => "none",
+        }
+    }
+
+    /// Parse a cache set name.
+    #[must_use]
+    pub fn parse(name: &[u8]) -> Option<Self> {
+        match name {
+            b"key" => Some(Self::Key),
+            b"all" => Some(Self::All),
+            b"none" => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 
 /// Where the data of a section came from.
@@ -39,6 +83,19 @@ impl DataSource {
             Self::Cache => "cache",
             Self::FindTrace => "find-trace",
             Self::CompilerFiles => "compiler-files",
+        }
+    }
+
+    /// Parse a data source label.
+    #[must_use]
+    pub fn parse(label: &[u8]) -> Option<Self> {
+        match label {
+            b"file-api" => Some(Self::FileApi),
+            b"compile-commands" => Some(Self::CompileCommands),
+            b"cache" => Some(Self::Cache),
+            b"find-trace" => Some(Self::FindTrace),
+            b"compiler-files" => Some(Self::CompilerFiles),
+            _ => None,
         }
     }
 }
@@ -135,6 +192,27 @@ pub enum Attribution {
     Exact,
     /// The object path names the target.
     Inferred,
+}
+
+impl Attribution {
+    /// Stable name used in reports and portable snapshots.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Inferred => "inferred",
+        }
+    }
+
+    /// Parse an attribution label.
+    #[must_use]
+    pub fn parse(label: &[u8]) -> Option<Self> {
+        match label {
+            b"exact" => Some(Self::Exact),
+            b"inferred" => Some(Self::Inferred),
+            _ => None,
+        }
+    }
 }
 
 /// One include directory.
@@ -291,18 +369,26 @@ pub struct CacheRecord {
 }
 
 /// All build settings of one build directory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuildSnapshot {
-    /// Build directory as given.
+    /// Build directory as given, or snapshot file path when loaded from a portable snapshot.
     pub path: BString,
-    /// Canonical build directory.
+    /// Canonical build directory, or `${build}` after normalization.
     pub build_root: BString,
     /// Tool and version.
     pub producer: Producer,
+    /// Host operating system and architecture captured when loading the snapshot.
+    pub host: Option<SnapshotHost>,
     /// Generator name.
     pub generator: Option<BString>,
-    /// Project source directory.
+    /// Project source directory, or `${source}` after normalization.
     pub source_root: Option<BString>,
+    /// User home directory captured for `${home}` normalization, when known.
+    pub home_root: Option<BString>,
+    /// Whether build, source, and home roots and path separators have already been normalized.
+    pub is_normalized: bool,
+    /// Cache filter applied when this snapshot was saved, or `None` for a live build directory.
+    pub saved_cache_set: Option<CacheSet>,
     /// Configurations. One empty name for a single-config build without a build type.
     pub configs: Vec<BString>,
     /// Targets by configuration and name.

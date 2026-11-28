@@ -84,7 +84,10 @@ pub(super) fn write_graphviz(
     {
         options::out(
             host.as_ref(),
-            &format!("Reading GraphViz options file: {}\n", file.display()),
+            &format!(
+                "Reading GraphViz options file: {}\n",
+                rcmake_host::path::from_native_cmake(&file)
+            ),
         );
         if settings.run_script(&file).exit_code != 0 {
             return Err(Exit::Code(1));
@@ -247,16 +250,7 @@ pub(super) fn write_graphviz(
                     }
                 },
             );
-            let suffix: String = display_name(model, root)
-                .chars()
-                .map(|c| {
-                    if matches!(c, '/' | '\\' | ':' | '*') {
-                        '_'
-                    } else {
-                        c
-                    }
-                })
-                .collect();
+            let suffix = path_safe_string(&String::from_utf8_lossy(name(model, root)));
             let mut file = path.as_os_str().to_os_string();
             file.push(format!(
                 ".{suffix}{}",
@@ -267,7 +261,10 @@ pub(super) fn write_graphviz(
     }
     options::out(
         host.as_ref(),
-        &format!("Generate graphviz: {}\n", path.display()),
+        &format!(
+            "Generate graphviz: {}\n",
+            rcmake_host::path::from_native_cmake(path)
+        ),
     );
     Ok(())
 }
@@ -397,9 +394,29 @@ fn save(host: &dyn Host, path: &Path, mut graph: String) -> Result<(), Exit> {
         .map_err(|err| Exit::Message(format!("Could not write Graphviz output: {err}")))
 }
 
+fn path_safe_string(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect()
+}
+
 fn escape(value: &[u8]) -> String {
     String::from_utf8_lossy(value)
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_safe_string;
+
+    #[test]
+    fn path_safe_string_matches_cmake_graphviz_rules() {
+        assert_eq!(path_safe_string("\"-lm\""), "-lm");
+        assert_eq!(path_safe_string("GraphicApplication"), "GraphicApplication");
+        assert_eq!(path_safe_string("Foo::Bar"), "FooBar");
+        assert_eq!(path_safe_string("a/b\\c:d*e?f<g>h|i"), "abcdefghi");
+        assert_eq!(path_safe_string("lib.foo-bar_1"), "lib.foo-bar_1");
+    }
 }

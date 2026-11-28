@@ -85,10 +85,15 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, ParseError> {
         };
         let var: (&[u8], BString) = match flag {
             b"--config" => (b"CMAKE_INSTALL_CONFIG_NAME", value()?.into()),
-            b"--prefix" => (
-                b"CMAKE_INSTALL_PREFIX",
-                path::from_native_cmake(&resolve_cli_path(host, value()?)),
-            ),
+            b"--prefix" => {
+                let raw = value()?;
+                let prefix = if raw.starts_with(b"/") {
+                    rcmake_base::path_lex::Lexical::new(raw).normalize()
+                } else {
+                    path::from_native_cmake(&resolve_cli_path(host, raw))
+                };
+                (b"CMAKE_INSTALL_PREFIX", prefix)
+            }
             b"--strip" if inline.is_none() => (b"CMAKE_INSTALL_DO_STRIP", "1".into()),
             b"--default-directory-permissions" => (
                 b"CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS",
@@ -297,7 +302,7 @@ fn install(
             arg.extend_from_slice(value);
             script_args.push(arg);
         }
-        script_args.extend(["-P".into(), path::from_native(&script)]);
+        script_args.extend(["-P".into(), path::from_native_cmake(&script)]);
         let mut interp = new_interp_with_paths(
             &cfg_opts,
             RunMode::Script,
@@ -360,5 +365,23 @@ mod tests {
             parse(&args, &PureHost::default()),
             Err(ParseError::Usage(_))
         ));
+    }
+
+    #[test]
+    fn install_prefix_preserves_cmake_root_style_paths() {
+        let host = PureHost::default();
+        let args: Vec<BString> = ["build", "--prefix", "/var/test"]
+            .into_iter()
+            .map(BString::from)
+            .collect();
+        let opts = match parse(&args, &host) {
+            Ok(opts) => opts,
+            Err(ParseError::Usage(message)) => panic!("usage error: {message}"),
+            Err(ParseError::Permissions) => panic!("permissions error"),
+        };
+        assert_eq!(
+            opts.vars.get(b"CMAKE_INSTALL_PREFIX".as_slice()),
+            Some(&BString::from("/var/test"))
+        );
     }
 }

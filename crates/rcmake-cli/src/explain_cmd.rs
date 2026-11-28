@@ -27,13 +27,15 @@ Usage: rcmake explain <name> [-B <build-dir>] [--target | --var]
        rcmake explain <target> --flag|--define|--include|--dep <val> [options]
        rcmake explain --find <package> | why-not <package> [options]
        rcmake explain --eval <expression> [options]
+       rcmake explain --targets [-B <build-dir>] [-S <source-dir>] [--config <cfg>] [--all] [--json]
 
 Show where a target gets its build settings or where a variable gets its value.
 
   -B <build-dir>   Read CMakeCache.txt from this directory. Default: current directory.
   --target         Look up a target or alias.
+  --targets        List project targets with their type and relative source directory.
   --var            Look up a variable.
-  --config <cfg>   Select a target configuration. Implies --target.
+  --config <cfg>   Select a target configuration. Implies --target (except with --targets).
   --filter <val>   Select an exact target value or compiler flag. Implies --target.
   --flag <flag>    Show where a compile or link flag comes from. Implies --target.
                    Use --flag=<flag> for a flag that starts with --.
@@ -45,7 +47,7 @@ Show where a target gets its build settings or where a variable gets its value.
   --json           Write one JSON report to standard output.
   --verbose        Show full values and call stacks in terminal output.
   --color=<mode>   Set terminal color. Default: auto.
-  -h, --help       Show this help. Use with --find or --eval for their help.
+  -h, --help       Show this help. Use with --find, --eval, or --targets for their help.
 
 The filter options --filter, --flag, --define, --include, and --dep exclude each other.
 
@@ -55,6 +57,7 @@ Examples
   rcmake explain app --define USE_SSL=1
   rcmake explain app --dep zlib
   rcmake explain CMAKE_CXX_FLAGS --json
+  rcmake explain --targets -B build
 
 Exit status
   0  Found the item. A target selection can be empty.
@@ -70,6 +73,7 @@ const CONFIGURE_FIRST: &str = "Run configure first, or pass -B <build-dir>.";
 mod args;
 mod eval;
 mod find;
+mod targets;
 
 use args::{Color, Invocation, Kind, Options, parse};
 
@@ -90,8 +94,13 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
             host.write_out(Stream::Stdout, eval::HELP.as_bytes());
             return 0;
         }
+        Ok(Invocation::TargetsHelp) => {
+            host.write_out(Stream::Stdout, targets::HELP.as_bytes());
+            return 0;
+        }
         Ok(Invocation::Find(options)) => return find::run(argv0, &options, &host),
         Ok(Invocation::Eval(options)) => return eval::run(argv0, &options, &host),
+        Ok(Invocation::Targets(options)) => return targets::run(argv0, &options, &host),
         Ok(Invocation::Query(options)) => options,
         Err(message) => {
             return error(

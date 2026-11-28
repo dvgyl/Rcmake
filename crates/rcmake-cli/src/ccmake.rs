@@ -15,7 +15,7 @@ use rcmake_host::{Host, Stream};
 use crate::persona::Persona;
 use crate::{Tool, help};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use session::run_with_terminal;
 
 /// Entry point for the `ccmake` tool persona.
@@ -29,7 +29,7 @@ pub(crate) fn run(argv: &[BString], persona: Persona, host: Arc<dyn Host>) -> i3
         return code;
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         use std::io::IsTerminal as _;
 
@@ -37,7 +37,7 @@ pub(crate) fn run(argv: &[BString], persona: Persona, host: Arc<dyn Host>) -> i3
             host.write_out(Stream::Stderr, ERR_INIT_FAILED.as_bytes());
             return 1;
         }
-        let mut terminal = match rcmake_ccmake::terminal::native::NativeTerminal::open() {
+        let mut terminal = match rcmake_ccmake::terminal::NativeTerminal::open() {
             Ok(term) => term,
             Err(_) => {
                 host.write_out(Stream::Stderr, ERR_INIT_FAILED.as_bytes());
@@ -47,12 +47,12 @@ pub(crate) fn run(argv: &[BString], persona: Persona, host: Arc<dyn Host>) -> i3
         run_with_terminal(argv, persona, host, &mut terminal)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         if persona == Persona::Native {
             host.write_out(
                 Stream::Stderr,
-                b"rcmake ccmake: the interactive cache editor TUI is only available on Unix platforms.\n",
+                b"rcmake ccmake: the interactive cache editor TUI is only available on Unix and Windows platforms.\n",
             );
         } else {
             host.write_out(Stream::Stderr, ERR_INIT_FAILED.as_bytes());
@@ -61,7 +61,7 @@ pub(crate) fn run(argv: &[BString], persona: Persona, host: Arc<dyn Host>) -> i3
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 mod session {
     use std::collections::BTreeSet;
     use std::io;
@@ -1022,6 +1022,7 @@ execute_process(COMMAND /tools/probe)
                 stderr,
                 timeout: None,
                 tee,
+                default_error_mode: false,
             }
         }
 

@@ -31,7 +31,7 @@ fn stderr(host: &PureHost) -> String {
 
 #[test]
 fn capabilities_follow_the_transport() {
-    assert_eq!(capabilities_supported(), cfg!(unix));
+    assert_eq!(capabilities_supported(), cfg!(any(unix, windows)));
 }
 
 #[test]
@@ -207,6 +207,6 @@ fn unsupported_transport_text_depends_on_the_persona() {
     );
     assert_eq!(
         unsupported_transport_reason(Persona::Native),
-        "Windows named-pipe debugger transport is not yet supported in rcmake"
+        "Debugger transport is not supported on this platform in rcmake"
     );
 }

@@ -9,6 +9,7 @@ pub(super) fn parse<'a>(
     opts: &mut Options,
     host: &dyn Host,
     profile_format: &mut Option<&'a [u8]>,
+    profile_output_raw: &mut Option<&'a [u8]>,
 ) -> Result<bool, String> {
     match arg.flag {
         b"--debugger" if arg.inline.is_none() => {
@@ -78,10 +79,9 @@ pub(super) fn parse<'a>(
             *profile_format = (!format.is_empty()).then_some(format);
         }
         b"--profiling-output" => {
-            opts.profile_output = Some(resolve_cli_path(
-                host,
-                profile_value(arg, "No path specified for --profiling-output")?,
-            ));
+            let raw = profile_value(arg, "No path specified for --profiling-output")?;
+            *profile_output_raw = Some(raw);
+            opts.profile_output = Some(resolve_cli_path(host, raw));
         }
         _ => return Ok(false),
     }
@@ -99,6 +99,7 @@ pub(super) fn validate_profile(
     host: &dyn Host,
     opts: &Options,
     profile_format: Option<&[u8]>,
+    profile_output_raw: Option<&[u8]>,
 ) -> Result<(), String> {
     if profile_format.is_some() || opts.profile_output.is_some() {
         let error = match (profile_format, &opts.profile_output) {
@@ -106,10 +107,11 @@ pub(super) fn validate_profile(
                 .write(path, b"[\n]\n", WriteMode::Truncate)
                 .err()
                 .map(|_| {
-                    format!(
-                        "Could not start profiling: Unable to open: {}",
-                        path.display()
-                    )
+                    let rendered = profile_output_raw.map_or_else(
+                        || rcmake_host::path::from_native_cmake(path),
+                        rcmake_base::BString::from,
+                    );
+                    format!("Could not start profiling: Unable to open: {rendered}")
                 }),
             (Some(_), None) => {
                 Some("--profiling-format specified but no --profiling-output!".into())

@@ -57,8 +57,11 @@ pub(crate) fn load(host: &dyn Host, dir: &Path) -> HostResult<Cache> {
                     Stream::Stderr,
                     format!(
                         "CMake Error: Parse error in cache file {} on line {}. Offending entry: {}\n",
-                        path.display(), index + 1, String::from_utf8_lossy(line)
-                    ).as_bytes(),
+                        rcmake_host::path::from_native_cmake(&path),
+                        index + 1,
+                        String::from_utf8_lossy(line)
+                    )
+                    .as_bytes(),
                 );
             }
             continue;
@@ -782,6 +785,25 @@ MULTI-ADVANCED:INTERNAL=1
         assert_ne!(
             first_mtime, third_mtime,
             "modified CMakeCache.txt save must update mtime"
+        );
+    }
+
+    #[test]
+    fn load_reports_parse_error_with_cmake_forward_slashes() {
+        let host = PureHost::default();
+        host.create_dir_all(Path::new("/b")).unwrap_or_default();
+        host.write(
+            Path::new("/b/CMakeCache.txt"),
+            b"BAD ENTRY\n",
+            rcmake_host::WriteMode::Truncate,
+        )
+        .unwrap_or_default();
+        let _ = load(&host, Path::new("/b")).unwrap_or_default();
+        let stderr =
+            String::from_utf8_lossy(&host.stream_bytes(rcmake_host::Stream::Stderr)).into_owned();
+        assert!(
+            stderr.contains("Parse error in cache file /b/CMakeCache.txt on line 1."),
+            "{stderr}"
         );
     }
 }

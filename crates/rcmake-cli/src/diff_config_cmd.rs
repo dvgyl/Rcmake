@@ -9,8 +9,9 @@ use std::sync::Arc;
 use rcmake_api::Freshness;
 use rcmake_base::BString;
 use rcmake_buildinfo::{
-    CacheSet, DiffOptions, PackageObservation, QUERY_FILES, Section, TraceCall, TraceInput,
-    compare, load, render_json, render_text, validate,
+    BuildSnapshot, CacheSet, DiffOptions, PackageObservation, QUERY_FILES, SaveOptions, Section,
+    SnapshotError, TraceCall, TraceInput, compare, load, load_snapshot_file, render_json,
+    render_text, save_snapshot_file, validate,
 };
 use rcmake_host::{FileKind, Follow, Host, Stream, WriteMode};
 use rcmake_presets::{EnvSnapshot, PresetKind};
@@ -19,23 +20,29 @@ use crate::configure::find_hints;
 use crate::resolve_cli_path;
 
 const HELP: &str = "\
-Usage: rcmake diff-config <build-a> <build-b> [options]
+Usage: rcmake diff-config <a-dir-or-snapshot> <b-dir-or-snapshot> [options]
        rcmake diff-config --preset <a> --preset <b> [-S <source-dir>] [options]
+       rcmake diff-config --save <file> (<build-dir> | --preset <name>) [options]
        rcmake diff-config --prepare <build-dir>...
 
-Compare the build settings of two configured build directories.
-The directories can come from cmake or rcmake. rcmake reads them and never runs cmake.
+Compare the build settings of two configured build directories or portable snapshots.
+Build directories can come from cmake or rcmake. rcmake reads them and never runs cmake.
 
+  --save <file>         Save a normalized portable JSON snapshot of one build
+                        directory (or --preset) to <file>, then exit.
   --preset <name>       Use the binary directory of a configure preset.
-                        Give it twice, or mix it with one build directory.
+                        Give it twice, mix it with one build directory or snapshot,
+                        or pair it with --save.
   -S <source-dir>       Read presets from this directory. Default: current directory.
   --config <a>[:<b>]    Compare these configurations.
   --target <name>       Compare only this target. Repeat to add more.
   --only <sections>     Compare only these sections, separated by commas:
                         targets, compile, link, toolchain, packages, cache.
-  --cache <set>         Cache entries to compare: key, all, none. Default: key.
-  --no-normalize        Keep absolute paths. Do not replace build and source roots.
-  --prepare             Create File API query files in each directory, then exit.
+  --cache <set>         Cache entries to compare or save: key, all, none. Default: key.
+  --no-normalize        Keep absolute paths. Do not replace build, source, and home
+                        roots. Cannot be used with --save or snapshot files.
+  --prepare             Create File API query files in each directory, then exit
+                        (or prepare before --save).
   --json                Write one JSON report to standard output.
   --color=<mode>        Set terminal color. Default: auto.
   -h, --help            Show this help.
@@ -46,22 +53,31 @@ is unavailable.
 
 Examples
   rcmake diff-config build-main build-pr
+  rcmake diff-config --save baseline.json build-main
+  rcmake diff-config baseline.json build-pr
   rcmake diff-config --preset debug --preset release --only compile
   rcmake diff-config build-gcc build-clang --json > diff.json
   rcmake diff-config --prepare build-a build-b
 
 Exit status
-  0  No differences, and every requested section had complete evidence.
+  0  No differences, and every requested section had complete evidence (or --save /
+     --prepare succeeded).
   1  Differences found.
   2  The evidence is incomplete for a requested section, so parity is not
      proved. Also invalid arguments, an unknown target or configuration, or an
-     unreadable build directory. Use --only to limit the compared sections.
+     unreadable build directory or snapshot file. Use --only to limit sections.
 ";
+
+#[derive(Debug, PartialEq, Eq)]
+enum Operand {
+    Path(BString),
+    Preset(BString),
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Options {
-    dirs: Vec<BString>,
-    presets: Vec<BString>,
+    operands: Vec<Operand>,
+    save: Option<BString>,
     source: Option<BString>,
     config: Option<(BString, BString)>,
     targets: Vec<BString>,
@@ -108,7 +124,7 @@ fn parse(args: &[BString]) -> Result<Invocation, String> {
     while let Some(arg) = iter.next() {
         let raw = arg.as_slice();
         if raw == b"--" {
-            options.dirs.extend(iter.cloned());
+            options.operands.extend(iter.cloned().map(Operand::Path));
             break;
         }
         let (flag, attached) = if raw.starts_with(b"--") {
@@ -121,9 +137,12 @@ fn parse(args: &[BString]) -> Result<Invocation, String> {
         };
         match flag {
             b"-h" | b"--help" => return Ok(Invocation::Help),
+            b"--save" => {
+                options.save = Some(value(&mut iter, attached, "--save")?);
+            }
             b"--preset" => options
-                .presets
-                .push(value(&mut iter, attached, "--preset")?),
+                .operands
+                .push(Operand::Preset(value(&mut iter, attached, "--preset")?)),
             b"-S" => options.source = Some(value(&mut iter, attached, "-S")?),
             b"--config" => {
                 let text = value(&mut iter, attached, "--config")?;
@@ -183,15 +202,42 @@ fn parse(args: &[BString]) -> Result<Invocation, String> {
                 };
             }
             _ if raw.starts_with(b"-") => return Err(format!("Unknown option {arg:?}.")),
-            _ => options.dirs.push(arg.clone()),
+            _ => options.operands.push(Operand::Path(arg.clone())),
         }
     }
-    if options.prepare {
-        if options.dirs.is_empty() || !options.presets.is_empty() {
+    if options.save.is_some() {
+        if !options.normalize {
+            return Err(
+                "--no-normalize cannot be used with --save because snapshots are normalized when saved."
+                    .into(),
+            );
+        }
+        if options.config.is_some() {
+            return Err("--config cannot be used with --save.".into());
+        }
+        if !options.targets.is_empty() {
+            return Err("--target cannot be used with --save.".into());
+        }
+        if options.only.is_some() {
+            return Err("--only cannot be used with --save.".into());
+        }
+        if options.json {
+            return Err("--json cannot be used with --save.".into());
+        }
+        if options.operands.len() != 1 {
+            return Err("Give one build directory or one --preset to --save.".into());
+        }
+    } else if options.prepare {
+        if options.operands.is_empty()
+            || options
+                .operands
+                .iter()
+                .any(|operand| matches!(operand, Operand::Preset(_)))
+        {
             return Err("Give one or more build directories to --prepare.".into());
         }
-    } else if options.dirs.len() + options.presets.len() != 2 {
-        return Err("Give two build directories, two presets, or one of each.".into());
+    } else if options.operands.len() != 2 {
+        return Err("Give two build directories or snapshots, two presets, or one of each.".into());
     }
     Ok(Invocation::Run(options))
 }
@@ -346,6 +392,48 @@ fn quoted(dir: &[u8]) -> String {
     out
 }
 
+struct LoadedOperand {
+    snapshot: BuildSnapshot,
+    from_file: bool,
+}
+
+fn load_operand(host: &dyn Host, path: &Path) -> Result<LoadedOperand, String> {
+    match host.metadata(path, Follow::Yes) {
+        Ok(meta) if meta.kind == FileKind::File => match load_snapshot_file(host, path) {
+            Ok(snapshot) => Ok(LoadedOperand {
+                snapshot,
+                from_file: true,
+            }),
+            Err(SnapshotError::NotASnapshot) => Err(format!(
+                "{} is a file, not a build directory or an rcmake-config-snapshot file.",
+                path.display()
+            )),
+            Err(err) => Err(format!("{}: {err}", path.display())),
+        },
+        Ok(meta) if meta.kind == FileKind::Dir => load(host, path, trace_input(host, path))
+            .map(|snapshot| LoadedOperand {
+                snapshot,
+                from_file: false,
+            })
+            .map_err(|err| err.to_string()),
+        Ok(_) => Err(format!(
+            "{} is not a build directory or a snapshot file.",
+            path.display()
+        )),
+        Err(_) => Err(format!(
+            "{} is not a configured build directory or snapshot file.",
+            path.display()
+        )),
+    }
+}
+
+fn resolve_operand(host: &dyn Host, source: &Path, operand: &Operand) -> Result<PathBuf, String> {
+    match operand {
+        Operand::Preset(name) => preset_dir(host, source, name),
+        Operand::Path(raw) => Ok(resolve_cli_path(host, raw)),
+    }
+}
+
 /// Execute `rcmake diff-config`.
 pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>) -> i32 {
     let host = host.as_ref();
@@ -357,8 +445,58 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
         Ok(Invocation::Run(options)) => options,
         Err(message) => return error(host, &format!("{message} Run rcmake diff-config --help.")),
     };
+    let source = options
+        .source
+        .as_ref()
+        .map_or_else(|| host.initial_cwd(), |dir| resolve_cli_path(host, dir));
+    if let Some(save_arg) = &options.save {
+        let [operand] = options.operands.as_slice() else {
+            return error(host, "Give one build directory or one --preset to --save.");
+        };
+        let dir = match resolve_operand(host, &source, operand) {
+            Ok(dir) => dir,
+            Err(message) => return error(host, &message),
+        };
+        if options.prepare {
+            match prepare(host, &dir) {
+                Ok(created) => {
+                    for file in created {
+                        host.write_out(
+                            Stream::Stdout,
+                            format!("Created {}\n", file.display()).as_bytes(),
+                        );
+                    }
+                }
+                Err(message) => return error(host, &message),
+            }
+        }
+        let snapshot = match load(host, &dir, trace_input(host, &dir)) {
+            Ok(snapshot) => snapshot,
+            Err(err) => return error(host, &err.to_string()),
+        };
+        let output = resolve_cli_path(host, save_arg);
+        let save_opts = SaveOptions {
+            cache: options.cache,
+        };
+        if let Err(err) = save_snapshot_file(host, &output, &snapshot, &save_opts) {
+            return error(host, &err.to_string());
+        }
+        host.write_out(
+            Stream::Stdout,
+            format!("Saved snapshot to {}\n", output.display()).as_bytes(),
+        );
+        return 0;
+    }
     if options.prepare {
-        for dir in &options.dirs {
+        let dirs: Vec<&BString> = options
+            .operands
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::Path(dir) => Some(dir),
+                Operand::Preset(_) => None,
+            })
+            .collect();
+        for dir in &dirs {
             let path = resolve_cli_path(host, dir);
             match prepare(host, &path) {
                 Ok(created) => {
@@ -372,8 +510,7 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
                 Err(message) => return error(host, &message),
             }
         }
-        let commands: Vec<String> = options
-            .dirs
+        let commands: Vec<String> = dirs
             .iter()
             .map(|dir| format!("rcmake -B {}", quoted(dir)))
             .collect();
@@ -387,28 +524,27 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
         );
         return 0;
     }
-    let source = options
-        .source
-        .as_ref()
-        .map_or_else(|| host.initial_cwd(), |dir| resolve_cli_path(host, dir));
-    let mut dirs = Vec::new();
-    for name in &options.presets {
-        match preset_dir(host, &source, name) {
-            Ok(dir) => dirs.push(dir),
+    let mut loaded = Vec::new();
+    for operand in &options.operands {
+        let path = match resolve_operand(host, &source, operand) {
+            Ok(path) => path,
+            Err(message) => return error(host, &message),
+        };
+        match load_operand(host, &path) {
+            Ok(item) => loaded.push(item),
             Err(message) => return error(host, &message),
         }
     }
-    dirs.extend(options.dirs.iter().map(|dir| resolve_cli_path(host, dir)));
-    let mut snapshots = Vec::new();
-    for dir in &dirs {
-        match load(host, dir, trace_input(host, dir)) {
-            Ok(snapshot) => snapshots.push(snapshot),
-            Err(err) => return error(host, &err.to_string()),
-        }
-    }
-    let [a, b] = snapshots.as_slice() else {
-        return error(host, "Give two build directories.");
+    let [a_item, b_item] = loaded.as_slice() else {
+        return error(host, "Give two build directories or snapshots.");
     };
+    if !options.normalize && (a_item.from_file || b_item.from_file) {
+        return error(
+            host,
+            "--no-normalize cannot be used with a snapshot file because snapshots are normalized when saved.",
+        );
+    }
+    let (a, b) = (&a_item.snapshot, &b_item.snapshot);
     let sections: std::collections::BTreeSet<Section> = options.only.map_or_else(
         || Section::ALL.into_iter().collect(),
         |sections| sections.into_iter().collect(),
@@ -417,14 +553,18 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
     let needs_file_api = sections
         .iter()
         .any(|section| matches!(section, Section::Targets | Section::Compile | Section::Link));
-    for snapshot in [a, b] {
-        if needs_file_api && !snapshot.evidence(Section::Compile).complete() && !options.json {
+    for item in [a_item, b_item] {
+        if !item.from_file
+            && needs_file_api
+            && !item.snapshot.evidence(Section::Compile).complete()
+            && !options.json
+        {
             host.write_out(
                 Stream::Stderr,
                 format!(
                     "note: {} has no current File API reply. For exact data, run: rcmake diff-config --prepare {}\n      then configure it again with cmake or rcmake.\n",
-                    String::from_utf8_lossy(&snapshot.path),
-                    String::from_utf8_lossy(&snapshot.path)
+                    String::from_utf8_lossy(&item.snapshot.path),
+                    String::from_utf8_lossy(&item.snapshot.path)
                 )
                 .as_bytes(),
             );
@@ -659,5 +799,234 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn parses_save_mode_and_rejects_conflicting_flags() {
+        assert!(matches!(
+            parse_args(&["--save", "out.json", "build-a"]),
+            Ok(Invocation::Run(_))
+        ));
+        assert!(matches!(
+            parse_args(&["--save=out.json", "--preset", "debug", "-S", "/src"]),
+            Ok(Invocation::Run(_))
+        ));
+        assert!(matches!(
+            parse_args(&[
+                "--save",
+                "out.json",
+                "--prepare",
+                "--cache",
+                "all",
+                "build-a"
+            ]),
+            Ok(Invocation::Run(_))
+        ));
+        for bad in [
+            &["--save", "out.json"][..],
+            &["--save", "out.json", "a", "b"],
+            &["--save", "out.json", "a", "--no-normalize"],
+            &["--save", "out.json", "a", "--json"],
+            &["--save", "out.json", "a", "--only", "cache"],
+            &["--save", "out.json", "a", "--target", "app"],
+            &["--save", "out.json", "a", "--config", "Debug"],
+        ] {
+            assert!(parse_args(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn save_and_compare_snapshot_vs_snapshot_and_snapshot_vs_live() {
+        let host = Arc::new(PureHost::default());
+        host.env_set(b"HOME", Some(b"/Users/alice"));
+        let cache_a = "\
+CMAKE_HOME_DIRECTORY:INTERNAL=/Users/alice/proj\n\
+CMAKE_BUILD_TYPE:STRING=Debug\n\
+API_KEY:STRING=secret-token\n\
+MY_OPT:BOOL=ON\n";
+        let cache_b = "\
+CMAKE_HOME_DIRECTORY:INTERNAL=/Users/alice/proj\n\
+CMAKE_BUILD_TYPE:STRING=Debug\n\
+API_KEY:STRING=different-secret\n\
+MY_OPT:BOOL=ON\n";
+        host.seed_file(
+            Path::new("/Users/alice/build-a/CMakeCache.txt"),
+            cache_a.as_bytes(),
+        )
+        .expect("seed a");
+        host.seed_file(
+            Path::new("/Users/alice/build-b/CMakeCache.txt"),
+            cache_b.as_bytes(),
+        )
+        .expect("seed b");
+
+        let run_args = |args: &[&str]| {
+            run(
+                None,
+                &args.iter().copied().map(BString::from).collect::<Vec<_>>(),
+                host.clone(),
+            )
+        };
+
+        // Save snapshot without .json extension to verify marker-based detection (not extension).
+        assert_eq!(
+            run_args(&["--save", "/snaps/baseline", "/Users/alice/build-a"]),
+            0
+        );
+        assert_eq!(
+            run_args(&["--save", "/snaps/second.snap", "/Users/alice/build-b"]),
+            0
+        );
+        let saved_bytes = host
+            .read(
+                Path::new("/snaps/baseline"),
+                rcmake_host::ReadRange::All { limit: 1 << 20 },
+            )
+            .expect("read snapshot");
+        assert!(
+            !saved_bytes.contains_str("secret-token"),
+            "default --cache key must not persist API_KEY"
+        );
+        assert!(
+            !saved_bytes.contains_str("/Users/alice"),
+            "saved snapshot must not leak home directory"
+        );
+
+        // snapshot vs snapshot == 0 on complete section (--only cache).
+        assert_eq!(
+            run_args(&["/snaps/baseline", "/snaps/second.snap", "--only", "cache"]),
+            0
+        );
+        // snapshot vs live build dir == 0 on complete section.
+        assert_eq!(
+            run_args(&["/snaps/baseline", "/Users/alice/build-a", "--only", "cache"]),
+            0
+        );
+        // live build dir vs snapshot == 0 on complete section.
+        assert_eq!(
+            run_args(&["/Users/alice/build-a", "/snaps/baseline", "--only", "cache"]),
+            0
+        );
+        // Unavailable sections (no File API) preserved from save time -> exit 2!
+        assert_eq!(run_args(&["/snaps/baseline", "/snaps/second.snap"]), 2);
+
+        // --no-normalize combined with a snapshot operand -> exit 2 usage error!
+        assert_eq!(
+            run_args(&[
+                "/snaps/baseline",
+                "/Users/alice/build-a",
+                "--only",
+                "cache",
+                "--no-normalize"
+            ]),
+            2
+        );
+        assert_eq!(
+            run_args(&[
+                "/Users/alice/build-a",
+                "/snaps/baseline",
+                "--only",
+                "cache",
+                "--no-normalize"
+            ]),
+            2
+        );
+        assert_eq!(
+            run_args(&[
+                "--save",
+                "/snaps/nope",
+                "/Users/alice/build-a",
+                "--no-normalize"
+            ]),
+            2
+        );
+
+        // Non-snapshot .json file is rejected cleanly with exit 2.
+        host.seed_file(Path::new("/snaps/not_a_snapshot.json"), br#"{"hello":1}"#)
+            .expect("seed json");
+        assert_eq!(
+            run_args(&[
+                "/snaps/not_a_snapshot.json",
+                "/Users/alice/build-a",
+                "--only",
+                "cache"
+            ]),
+            2
+        );
+    }
+
+    #[test]
+    fn save_supports_preset_prepare_and_cache_all() {
+        let host = Arc::new(PureHost::default());
+        host.seed_file(
+            Path::new("/src/CMakePresets.json"),
+            br#"{
+                "version": 3,
+                "configurePresets": [
+                    {"name": "dev", "binaryDir": "/builds/dev"}
+                ]
+            }"#,
+        )
+        .expect("seed presets");
+        host.seed_file(
+            Path::new("/builds/dev/CMakeCache.txt"),
+            b"CMAKE_HOME_DIRECTORY:INTERNAL=/src\nCMAKE_BUILD_TYPE:STRING=Debug\nAPI_KEY:STRING=kept-on-all\n",
+        )
+        .expect("seed cache");
+
+        let run_args = |args: &[&str]| {
+            run(
+                None,
+                &args.iter().copied().map(BString::from).collect::<Vec<_>>(),
+                host.clone(),
+            )
+        };
+
+        assert_eq!(
+            run_args(&[
+                "--save",
+                "/out/dev.json",
+                "--preset",
+                "dev",
+                "-S",
+                "/src",
+                "--prepare",
+                "--cache",
+                "all"
+            ]),
+            0
+        );
+        // --prepare created the 4 File API query files.
+        for file in QUERY_FILES {
+            assert!(
+                host.metadata(
+                    &Path::new("/builds/dev/.cmake/api/v1/query").join(file),
+                    Follow::No
+                )
+                .is_ok()
+            );
+        }
+        // --cache all kept API_KEY.
+        let bytes = host
+            .read(
+                Path::new("/out/dev.json"),
+                rcmake_host::ReadRange::All { limit: 1 << 20 },
+            )
+            .expect("read");
+        assert!(bytes.contains_str("kept-on-all"));
+        assert_eq!(
+            run_args(&[
+                "/out/dev.json",
+                "--preset",
+                "dev",
+                "-S",
+                "/src",
+                "--only",
+                "cache",
+                "--cache",
+                "all"
+            ]),
+            0
+        );
     }
 }

@@ -98,7 +98,7 @@ pub(crate) fn write(
             host,
             format!(
                 "Failed to write SARIF output to \"{}\": {err}",
-                output.display()
+                path::from_native_cmake(output)
             ),
         );
         return false;
@@ -224,9 +224,6 @@ fn dir_uri_from_cmake(normalized: &[u8]) -> BString {
     if let Some(unc) = normalized.strip_prefix(b"//") {
         uri.extend_from_slice(unc);
     } else {
-        if !normalized.starts_with(b"/") {
-            uri.push(b'/');
-        }
         uri.extend_from_slice(normalized);
     }
     if !uri.ends_with(b"/") {
@@ -292,8 +289,8 @@ mod tests {
     fn dir_uri_formats_unix_windows_drive_and_unc_paths() {
         assert_eq!(dir_uri_from_cmake(b"/work/src"), "file:///work/src/");
         assert_eq!(dir_uri_from_cmake(b"/"), "file:///");
-        assert_eq!(dir_uri_from_cmake(b"C:/work/src"), "file:///C:/work/src/");
-        assert_eq!(dir_uri_from_cmake(b"C:/"), "file:///C:/");
+        assert_eq!(dir_uri_from_cmake(b"C:/work/src"), "file://C:/work/src/");
+        assert_eq!(dir_uri_from_cmake(b"C:/"), "file://C:/");
         assert_eq!(
             dir_uri_from_cmake(b"//server/share/src"),
             "file://server/share/src/"

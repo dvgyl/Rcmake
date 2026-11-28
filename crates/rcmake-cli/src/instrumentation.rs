@@ -60,7 +60,7 @@ impl InstrumentationStep {
         let snippet = Snippet {
             role,
             command: instrumentation_command(argv),
-            working_dir: path::from_native(&host.initial_cwd()),
+            working_dir: path::from_native_cmake(&host.initial_cwd()),
             result,
             time_start: self.time_start,
             duration: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -139,7 +139,32 @@ fn instrumentation_content(host: &dyn Host, data: &Path) -> Result<Option<BStrin
             left.strip_suffix(b".json")
                 .cmp(&right.strip_suffix(b".json"))
         })
-        .map(|name| path::from_native(&Path::new("content").join(path::to_native(&name)))))
+        .map(|name| path::from_native_cmake(&Path::new("content").join(path::to_native(&name)))))
+}
+
+struct EnvGuard<'a> {
+    host: &'a dyn Host,
+    key: &'static [u8],
+    previous: Option<BString>,
+}
+
+impl<'a> EnvGuard<'a> {
+    fn set(host: &'a dyn Host, key: &'static [u8], value: &[u8]) -> Self {
+        let previous = host.env_get(key);
+        host.env_set(key, Some(value));
+        Self {
+            host,
+            key,
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvGuard<'_> {
+    fn drop(&mut self) {
+        self.host
+            .env_set(self.key, self.previous.as_ref().map(|v| v.as_slice()));
+    }
 }
 
 pub(crate) fn sample_instrumentation(queries: &[Query]) -> bool {
@@ -174,16 +199,58 @@ pub(crate) fn instrument_lifecycle(
         emit_cli_error(host, err.to_string());
         return 1;
     }
-    let step = InstrumentationStep::start(host, sample_instrumentation(&queries));
+    let _in_cmake_build = (role == SnippetRole::CMakeBuild)
+        .then(|| EnvGuard::set(host, rcmake_instrument::IN_CMAKE_BUILD_ENV, b"1"));
     let injected = rcmake_instrument::injected_interrupt(host);
-    let (exit, code) = match (injected, role) {
-        (Some(signal), SnippetRole::CMakeInstall) => (CommandExit::Signal(signal), 1),
-        (Some(signal), SnippetRole::CMakeBuild) => (CommandExit::Signal(signal), run().code()),
-        _ => {
-            let exit = run();
-            let code = exit.code();
-            (exit, code)
+    if let Some(signal) = injected
+        && matches!(role, SnippetRole::CMakeInstall | SnippetRole::CMakeBuild)
+    {
+        let step = InstrumentationStep::start(host, sample_instrumentation(&queries));
+        let (exit, code) = if role == SnippetRole::CMakeInstall {
+            (CommandExit::Signal(signal), 1)
+        } else {
+            (CommandExit::Signal(signal), run().code())
+        };
+        if let Err(err) = step.record(host, build_dir, argv, role, &exit) {
+            emit_cli_error(host, err.to_string());
+            return if code == 0 { 1 } else { code };
         }
+        return code;
+    }
+
+    let step = std::sync::Mutex::new(Some(InstrumentationStep::start(
+        host,
+        sample_instrumentation(&queries),
+    )));
+    let take_step = || {
+        step.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    };
+    let guard_interrupt = matches!(role, SnippetRole::CMakeBuild | SnippetRole::CMakeInstall);
+    let guarded = rcmake_instrument::interrupt::guard_and_flush(
+        guard_interrupt,
+        |signal| {
+            if let Some(step) = take_step() {
+                let _ = step.record(host, build_dir, argv, role, &CommandExit::Signal(signal));
+            }
+        },
+        run,
+    );
+    if let Some(signal) = guarded.signal {
+        if let Some(step) = take_step()
+            && let Err(err) = step.record(host, build_dir, argv, role, &CommandExit::Signal(signal))
+        {
+            emit_cli_error(host, err.to_string());
+        }
+        rcmake_instrument::interrupt::raise(signal);
+        return 128_i32.saturating_add(signal);
+    }
+
+    let exit = guarded.value;
+    let code = exit.code();
+    let Some(step) = take_step() else {
+        return code;
     };
     if let Err(err) = step
         .record(host, build_dir, argv, role, &exit)
