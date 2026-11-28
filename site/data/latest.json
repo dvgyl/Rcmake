@@ -1,7 +1,7 @@
 {
   "$schema": "./dashboard.schema.json",
   "schemaVersion": 1,
-  "generatedAt": "2026-11-28T05:25:04Z",
+  "generatedAt": "2026-11-28T05:28:00Z",
   "commit": "2a16da12e77c7d0c982fbe075db05873b9785e9e",
   "rcmakeVersion": "0.2.1",
   "targetCmakeVersion": "4.5.1",
@@ -300,7 +300,7 @@
       "reposTotal": 79,
       "reposPassed": 31,
       "passRate": 39.24,
-      "policy": "Blind holdout corpus. The manifest stays unopened during development, and dashboard reports and receipts publish only aggregate pass rates and failure category counts.",
+      "policy": "Blind holdout corpus. Holdout entries are never inspected during development, and dashboard reports and receipts publish only aggregate pass rates and failure category counts.",
       "note": "Repository counts from the blind holdout report.",
       "categories": [
         {

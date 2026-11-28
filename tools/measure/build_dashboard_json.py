@@ -1176,7 +1176,7 @@ def merge_holdout(track, path, identity=(None, None, False)):
             aggregate,
             sealed=True,
             policy=(
-                "Blind holdout corpus. The manifest stays unopened during development, "
+                "Blind holdout corpus. Holdout entries are never inspected during development, "
                 "and dashboard reports and receipts publish only aggregate pass rates and failure category counts."
             ),
             note="Repository counts from the blind holdout report.",

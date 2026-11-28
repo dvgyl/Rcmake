@@ -78,7 +78,7 @@ You can also try `rcmake` in the [browser playground](https://rcmake.github.io/r
 | 3-OS CI (`ubuntu-24.04`, `macos-15`, `windows-2025`) and corpus smoke (6 jobs) | <!-- METRIC:ci_jobs -->6 of 6 jobs green<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, macOS arm64 (371 of 463 suites) | <!-- METRIC:runcmake_macos -->99.33% (348 / 371 suites, 9,641 / 9,706 cases)<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, Linux (362 of 463 suites) | <!-- METRIC:runcmake_linux -->99.33% (341 / 362 suites, 9,310 / 9,373 cases)<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Windows (122 of 367 suites completed, shard 3 of 3) | <!-- METRIC:runcmake_windows -->89.19% (68 / 367 suites, 2,401 / 2,692 cases)<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Windows (115 complete and 7 incomplete of 122 reported of 367 suites, shard 3 of 3) | <!-- METRIC:runcmake_windows -->89.19% (68 / 367 suites, 2,401 / 2,692 cases)<!-- /METRIC --> |
 | Independent black-box differential suite (20 scenarios, 679 checks) | <!-- METRIC:independent_scenarios -->20 / 20 scenarios (679 / 679 checks passed)<!-- /METRIC --> |
 | Large C++ projects, L1 configure, cache, File API, and graph-edge parity (10 projects) | <!-- METRIC:large_projects_l1 -->2 / 10 passed<!-- /METRIC --> |
 | Large C++ projects, L2 Ninja dry-run command parity (10 projects) | <!-- METRIC:large_projects_l2 -->10 / 10 passed<!-- /METRIC --> |

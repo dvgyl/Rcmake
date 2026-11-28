@@ -129,7 +129,7 @@ Differential runs also surfaced five subtle edge cases. `qtbase` parsed `try_com
 | 3-OS CI and corpus smoke | `ubuntu-24.04`, `macos-15`, `windows-2025` | <!-- METRIC:ci_jobs -->6 of 6 jobs green<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, macOS arm64 | 371 suites (`all-macos`) | <!-- METRIC:runcmake_macos -->99.33% (348 / 371 suites, 9,641 / 9,706 cases)<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, Linux | 362 suites (`linux`) | <!-- METRIC:runcmake_linux -->99.33% (341 / 362 suites, 9,310 / 9,373 cases)<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Windows | 122 of 367 suites completed (`windows`, shard 3 of 3) | <!-- METRIC:runcmake_windows -->89.19% (68 / 367 suites, 2,401 / 2,692 cases)<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Windows | 115 complete and 7 incomplete of 122 reported of 367 suites (`windows`, shard 3 of 3) | <!-- METRIC:runcmake_windows -->89.19% (68 / 367 suites, 2,401 / 2,692 cases)<!-- /METRIC --> |
 | Upstream Core-62 conformance | 62 core suites (`core`) | <!-- METRIC:runcmake_core62 -->97.61% (46 / 62 suites at 100%, 8,539 / 8,748 cases)<!-- /METRIC --> |
 | Upstream policies | 35 policy suites for the 161 policies `CMP0066` to `CMP0226` | <!-- METRIC:runcmake_policies -->97.75% (30 / 35 suites, 911 / 932 cases)<!-- /METRIC --> |
 | Independent black-box suite | 20 scenarios, 679 checks | <!-- METRIC:independent_scenarios -->20 / 20 scenarios (679 / 679 checks passed)<!-- /METRIC --> |
