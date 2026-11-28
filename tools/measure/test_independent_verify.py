@@ -503,38 +503,67 @@ class ExtraHelperTest(TempDirTest):
         def gen(name: str, extra: list[str], toolset: bool = False) -> dict:
             return {"extraGenerators": extra, "name": name, "platformSupport": False, "toolsetSupport": toolset}
 
-        common = {"fileApi": {"requests": []}, "instrumentation": {"apiVersion": 1}, "serverMode": False,
-                  "tls": True, "version": {"string": "4.5.1"}}
-        oracle = common | {"debugger": True, "generators": [
+        common = {"debugger": True, "fileApi": {"requests": []}, "instrumentation": {"apiVersion": 1},
+                  "serverMode": False, "tls": True, "version": {"string": "4.5.1"}}
+        oracle = common | {"generators": [
             gen("Ninja Multi-Config", ["Kate"]), gen("Watcom WMake", []), gen("FASTBuild", []),
-            gen("Xcode", [], True), gen("Ninja", ["CodeBlocks"]), gen("Unix Makefiles", ["Kate"]),
+            gen("NMake Makefiles", ["CodeBlocks"]), gen("Xcode", [], True),
+            gen("Ninja", ["CodeBlocks"]), gen("Unix Makefiles", ["Kate"]),
             gen("Visual Studio 17 2022", [])]}
-        rcmake = common | {"debugger": False, "generators": [
-            gen("Unix Makefiles", []), gen("Ninja", []), gen("Ninja Multi-Config", []), gen("Xcode", [], True),
+        rcmake = common | {"generators": [
+            gen("Unix Makefiles", []), gen("Ninja", []), gen("Ninja Multi-Config", []),
+            gen("NMake Makefiles", []), gen("Xcode", [], True),
             gen("Visual Studio 17 2022", [])]}
-        self.assertEqual(iv.supported_capabilities(oracle), iv.supported_capabilities(rcmake))
-        self.assertEqual([g["name"] for g in iv.supported_capabilities(oracle)["generators"]],
-                         ["Ninja", "Ninja Multi-Config", "Unix Makefiles", "Visual Studio 17 2022", "Xcode"])
-        for key, value in (("tls", False), ("version", {"string": "4.5.0"}), ("fileApi", {}),
-                           ("instrumentation", {}), ("serverMode", True)):
+        filtered_oracle = iv.supported_capabilities(oracle)
+        filtered_rcmake = iv.supported_capabilities(rcmake)
+        self.assertEqual(filtered_oracle, filtered_rcmake)
+        self.assertTrue(filtered_oracle["debugger"])
+        self.assertEqual([g["name"] for g in filtered_oracle["generators"]],
+                         ["NMake Makefiles", "Ninja", "Ninja Multi-Config", "Unix Makefiles",
+                          "Visual Studio 17 2022", "Xcode"])
+        for key, value in (("debugger", False), ("tls", False), ("version", {"string": "4.5.0"}),
+                           ("fileApi", {}), ("instrumentation", {}), ("serverMode", True)):
             self.assertNotEqual(
                 iv.supported_capabilities(rcmake | {key: value}),
-                iv.supported_capabilities(oracle),
+                filtered_oracle,
                 f"{key} must stay strict in supported_capabilities",
             )
-        no_xcode = rcmake | {"generators": rcmake["generators"][:3]}
+        no_xcode = rcmake | {"generators": [g for g in rcmake["generators"] if g["name"] != "Xcode"]}
         self.assertNotEqual(
             iv.supported_capabilities(no_xcode),
-            iv.supported_capabilities(oracle),
+            filtered_oracle,
             "missing supported generator must differ",
         )
-        no_toolset = rcmake | {"generators": rcmake["generators"][:3] + [gen("Xcode", [])]}
+        no_nmake = rcmake | {"generators": [g for g in rcmake["generators"] if g["name"] != "NMake Makefiles"]}
+        self.assertNotEqual(
+            iv.supported_capabilities(no_nmake),
+            filtered_oracle,
+            "missing NMake Makefiles generator must differ",
+        )
+        no_toolset = rcmake | {"generators": [
+            gen("Xcode", []) if g["name"] == "Xcode" else g for g in rcmake["generators"]
+        ]}
         self.assertNotEqual(
             iv.supported_capabilities(no_toolset),
-            iv.supported_capabilities(oracle),
+            filtered_oracle,
             "generator toolsetSupport detail must stay strict",
         )
         self.assertEqual(iv.supported_capabilities({}), {})
+
+    def test_supported_capabilities_debugger_mismatch_fails(self) -> None:
+        base = {"debugger": True, "fileApi": {"requests": []}, "generators": [],
+                "serverMode": False, "tls": True, "version": {"string": "4.5.1"}}
+        without_debugger = {key: value for key, value in base.items() if key != "debugger"}
+        self.assertNotEqual(
+            iv.supported_capabilities(base),
+            iv.supported_capabilities(base | {"debugger": False}),
+            "debugger capability mismatch (True vs False) must fail parity",
+        )
+        self.assertNotEqual(
+            iv.supported_capabilities(base),
+            iv.supported_capabilities(without_debugger),
+            "missing debugger capability key must fail parity",
+        )
 
     def test_backtrace_chain(self) -> None:
         graph = {"commands": ["add_executable", "include"], "files": ["CMakeLists.txt", "x.cmake"],

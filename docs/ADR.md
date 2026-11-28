@@ -52,6 +52,8 @@ We verified each decision below against the pinned CMake 4.5.1 oracle.
 - [ADR-046 Stale CMakeCache.txt drift tracking and portable probe-cache exchange](#adr-046-stale-cmakecachetxt-drift-tracking-and-portable-probe-cache-exchange)
 - [ADR-047 Unified version banner and native build-time regeneration persona](#adr-047-unified-version-banner-and-native-build-time-regeneration-persona)
 - [ADR-048 Windows launcher shim and compressed LSP catalog](#adr-048-windows-launcher-shim-and-compressed-lsp-catalog)
+- [ADR-049 Native Windows ccmake console backend](#adr-049-native-windows-ccmake-console-backend)
+- [ADR-050 Windows named-pipe DAP transport](#adr-050-windows-named-pipe-dap-transport)
 
 ---
 
@@ -781,6 +783,8 @@ Each top-level invocation owns at most one `DebugServer` session started after `
 
 Because the connected client is untrusted, `rcmake-dap` uses a dedicated nonblocking outbound writer thread, bounded wire frames (1 KiB header, 16 MiB body), compact-JSON response budgets (8 MiB), bounded breakpoints, and canonical source-key breakpoint calibration. On macOS and Linux, `UnixEndpoint` listens on a Unix domain socket and removes the socket path after accepting the client. Windows named-pipe transport requires a vetted safe wrapper and is deferred. Until then, Windows builds report `"debugger": false` in `-E capabilities` and reject `--debugger*` flags.
 
+Amended on 2026-11-28 by ADR-050. Windows builds now have a named-pipe transport, report `"debugger": true` in `-E capabilities`, and accept the `--debugger*` options.
+
 Related source files are [DAP server](../crates/rcmake-dap/src/lib.rs), [DAP session](../crates/rcmake-dap/src/session.rs), [response budgets](../crates/rcmake-dap/src/budget.rs), [breakpoints](../crates/rcmake-dap/src/breakpoints.rs), [Unix socket transport](../crates/rcmake-dap/src/transport/unix.rs), and [CLI debugger lifecycle](../crates/rcmake-cli/src/debugger.rs).
 
 ---
@@ -878,3 +882,123 @@ The engine strips that prefix only when launched through `rcmake` with all five 
 Compress the static LSP reference catalog at build time in `crates/rcmake-lsp/build.rs` with a small clean-room LZSS encoder and decode it lazily at runtime in `crates/rcmake-lsp/src/catalog.rs` under strict decompressed-size and entry-count bounds, keeping `--no-default-features` and `wasm32-unknown-unknown` builds intact. Keep hot configure and hashing crates (`sha2`, `zstd`, `rcmake-cps`, `rcmake-instrument`, `rcmake-presets`) at `opt-level = 3` while applying `opt-level = "z"` selectively to cold packaging and language-tool crates.
 
 Related source files are [launcher shim](../crates/rcmake-shim/src/main.rs), [engine entrypoint](../crates/rcmake-cli/src/main.rs), [CLI driver](../crates/rcmake-cli/src/lib.rs), [LSP catalog encoder](../crates/rcmake-lsp/build.rs), [LSP catalog decoder](../crates/rcmake-lsp/src/catalog.rs), and [Windows installer](../scripts/install.ps1).
+
+Amended on 2026-11-28 by ADR-049. The launcher allowlist is now `cmake`, `ctest`, `cpack`, `ccmake`, and `rcmake-lsp`. The engine accepts `--rcmake-internal-shim-tool=ccmake` and runs the `ccmake` persona. Windows release archives, the ecosystem staging jobs, and `scripts/install.ps1 -AliasCmake` install `ccmake.exe` as the fifth copy of the shim, after `cmake.exe`, `ctest.exe`, `cpack.exe`, and `rcmake-lsp.exe`. With `rcmake.exe`, a Windows archive now has six executables that start the engine. If an archive has no `ccmake.exe` shim, `scripts/install.ps1 -AliasCmake` makes `ccmake.exe` from `rcmake.exe` (hardlink, with a copy as the fallback), as it does for the other aliases.
+
+---
+
+## ADR-049 Native Windows ccmake console backend
+
+Accepted on 2026-11-28.
+
+ADR-040 deferred Windows terminal support for `ccmake`. Add `crates/rcmake-ccmake/src/terminal/windows.rs`, a Windows console backend for the existing `Terminal` trait. The backend uses VT (virtual terminal) sequences, so the renderer, the key decoder, and the state machine are the same on Windows and on Unix. `rcmake_ccmake::terminal::NativeTerminal` names the POSIX backend on Unix and the console backend on Windows, and `rcmake-cli` uses that name on both platforms.
+
+Use the safe `winapi_util::console` wrappers (`mode`, `set_mode`, and `screen_buffer_info`) for all console calls. `rcmake-host` already locks `winapi-util` 0.1.11, so the change adds no new crate and no new `Cargo.lock` package. The crate keeps `#![forbid(unsafe_code)]`.
+
+The backend changes the console modes as follows:
+
+- The output mode adds `ENABLE_PROCESSED_OUTPUT` (`0x0001`), `ENABLE_VIRTUAL_TERMINAL_PROCESSING` (`0x0004`), and `DISABLE_NEWLINE_AUTO_RETURN` (`0x0008`). `SetConsoleMode` requires processed output when VT processing is on. `DISABLE_NEWLINE_AUTO_RETURN` gives VT-style delayed wrap, so a write to the last cell of the screen does not scroll the screen.
+- The input mode removes `ENABLE_LINE_INPUT`, `ENABLE_ECHO_INPUT`, and `ENABLE_PROCESSED_INPUT`, and adds `ENABLE_VIRTUAL_TERMINAL_INPUT` (`0x0200`). Arrow keys then arrive as `ESC [` sequences, Enter arrives as `\r`, and Ctrl+C arrives as byte `0x03`. These bytes are the same as in the POSIX raw mode.
+
+The backend saves both original modes before it changes a mode. A failure during `enter_raw` restores every mode that it already changed. `leave_raw` and `Drop` leave the alternate screen first, while VT processing is still on, and then restore both modes. Release builds use `panic = "abort"` (ADR-034), so a chained panic hook also restores the console, as in the POSIX backend. The panic hook, `leave_raw`, and `Drop` take one shared state slot, so only the first of them restores. After an unwinding panic (for example in `cargo test`), `Drop` therefore does not write the alternate screen exit sequence to a console that has no VT processing.
+
+The Windows console has no equivalent of the POSIX `VMIN=0` and `VTIME=2` timed read. A background thread reads standard input and sends each chunk through a bounded `std::sync::mpsc::sync_channel`. `Terminal::read` calls `recv_timeout` with a 200 ms tick and returns `Ok(0)` when no input arrives. The event loop polls `screen_buffer_info().window_rect()` on each tick to find a window resize. One process-wide reader serves all terminal values. A blocked console read cannot be cancelled without `CancelIoEx`, which needs `unsafe` FFI, so a session gate controls the reader instead. The reader starts a new read only while a raw session is active, because a console read that starts in line mode keeps line editing until Enter. The reader stamps each chunk with the session that was active when the read completed. `Terminal::read` discards a chunk from an earlier session or from a time without a session, and `enter_raw` discards all buffered input, so keys from one session never reach the next session.
+
+The Rust standard library removes a trailing Ctrl+Z from console input, so a console read can return zero bytes while the console is still open. After an empty read, the reader asks for the console mode of standard input. If the call succeeds, the console is open, and the reader waits 10 ms and reads again. If the call fails, the reader reports end of input. Thus Ctrl+Z never stops the reader, and `q` and Ctrl+C always arrive.
+
+`NativeTerminal::open` rejects a handle that has no console mode, for example an MSYS2 pty pipe that `IsTerminal` reports as a terminal. `ccmake` then prints the CMake initialization error and exits with code 1.
+
+`CMAKE_EDIT_COMMAND` needs no change. Configure already looks for `ccmake.exe` and `cmake-gui.exe` next to `cmake.exe` when the executable has the `.exe` extension, and the Windows packages now ship `ccmake.exe`.
+
+Related source files are [Windows console backend](../crates/rcmake-ccmake/src/terminal/windows.rs), [terminal trait](../crates/rcmake-ccmake/src/terminal.rs), [native Unix terminal](../crates/rcmake-ccmake/src/terminal/native.rs), [CLI ccmake driver](../crates/rcmake-cli/src/ccmake.rs), [configure phases](../crates/rcmake-cli/src/configure.rs), [engine entrypoint](../crates/rcmake-cli/src/main.rs), [launcher shim](../crates/rcmake-shim/src/main.rs), and [Windows installer](../scripts/install.ps1).
+
+---
+
+## ADR-050 Windows named-pipe DAP transport
+
+Accepted on 2026-11-28.
+
+ADR-041 deferred the Windows transport of `--debugger`. Add `crates/rcmake-dap/src/transport/windows.rs`. On Windows, `--debugger --debugger-pipe \\.\pipe\<name>` now starts the same DAP session as on Unix. `rcmake_dap::TRANSPORT_SUPPORTED` is `cfg!(any(unix, windows))`, so `-E capabilities` reports `"debugger": true` on Windows. VS Code CMake Tools and other DAP clients connect with their usual pipe names.
+
+Use the safe `tokio::net::windows::named_pipe` wrapper (`tokio`, `MIT`) for the Win32 calls. `rcmake-dap` keeps `#![forbid(unsafe_code)]`. `tokio` is a Windows-only dependency with the `net`, `rt`, `sync`, and `time` features and no default features. Unix builds do not compile it.
+
+`WindowsEndpoint::bind` makes the pipe with the settings of CMake 4.5.1 `cmDebuggerPipeConnection_WIN32`:
+
+- `first_pipe_instance(true)` (`FILE_FLAG_FIRST_PIPE_INSTANCE`). If a pipe with the name exists, the call fails. Thus `rcmake` never becomes a second instance of a pipe that another process made first (pipe squatting), and the run stops with an error. This setting does not control which pipe the IDE opens.
+- `max_instances(1)`. A second client cannot connect.
+- `reject_remote_clients(true)` (`PIPE_REJECT_REMOTE_CLIENTS`). Only local clients can connect.
+- `pipe_mode(PipeMode::Byte)` (`PIPE_TYPE_BYTE | PIPE_READMODE_BYTE`), and 16 KiB input and output buffers.
+- The default security descriptor, as in CMake (a `NULL` `SECURITY_ATTRIBUTES`). A custom DACL (discretionary access control list) needs `create_with_security_attributes_raw`, which is `unsafe`. `SECURITY.md` records this limit.
+
+Before the Win32 call, `validate_pipe_name` checks the name. The name must start with `\\.\pipe\` (ASCII case is ignored, and `/` is equal to `\`), must have a name after the prefix, must have no more than 256 UTF-16 code units, and must have no NUL unit. CMake passes the name to `CreateNamedPipeA` without a check, so a NUL byte cuts the name there. A rejected name gives the `ERROR_INVALID_NAME` text. A failed bind gives the CMake text `Internal Error with <name>: <system message>`. The compat persona adds the `\r\n` that `FormatMessage` puts at the end of the system message. The Rust standard library gets the message from `FormatMessageW` and removes the line break. CMake uses `FormatMessageA`. On English Windows systems, such as the CI runners, the bytes are the same as in CMake. On other locales, the message text or its encoding can be different.
+
+The session uses blocking `Read` and `Write` halves on its own threads. One transport thread runs a current-thread Tokio runtime (`enable_io`, `enable_time`) that owns the pipe. Two independent tasks connect the pipe to the session through bounded channels:
+
+- The inbound task reads chunks of up to 16 KiB and sends them through a channel of four chunks. The client end of stream closes the channel, and the session reader then reads the end of the stream.
+- The outbound task writes each request of the session writer and then acknowledges the request. A write finishes only after the pipe accepts its last byte. The pipe has one overlapped write at a time, so the task waits until the pipe accepts an empty write. The whole write has the 30-second limit of the Unix transport (`tokio::time::timeout`), so a client that does not read ends the session.
+
+A silent client thus never blocks a write, and a blocked write never blocks a read. `Connection::shutdown` sends a stop signal. The transport thread stops both tasks and closes the pipe. A closed pipe cancels its pending read but not a pending write. Thus, if a write can be incomplete (a timed-out write, or a write that the stop interrupts), the transport first calls `disconnect()`, so that the write fails. The transport does not disconnect in other cases, because `DisconnectNamedPipe` also discards the bytes that the client did not read, for example the `disconnect` response. Then the I/O driver runs for 50 ms, so that the cancelled operations complete and the pipe handle closes before the runtime ends. A blocked session read returns the end of the stream, and a later write returns `BrokenPipe`. Shutdown waits up to 5 seconds for the transport thread.
+
+CMake 4.5.1 has no write limit on Windows. The limit is an `rcmake` hardening, as on Unix.
+
+Tests in `transport/windows.rs` check the name rules on all platforms. On Windows, the tests also check that a second pipe with the same name fails, that a write completes while a read waits, that shutdown ends a waiting read and closes the client, that a write larger than the pipe buffer waits for the client, and a full DAP `initialize`, `configurationDone`, and `disconnect` session through a `tokio` `ClientOptions` client.
+
+Related source files are [Windows pipe transport](../crates/rcmake-dap/src/transport/windows.rs), [transport traits](../crates/rcmake-dap/src/transport.rs), [Unix socket transport](../crates/rcmake-dap/src/transport/unix.rs), [DAP server](../crates/rcmake-dap/src/lib.rs), [CLI debugger lifecycle](../crates/rcmake-cli/src/debugger.rs), and [debugger options](../crates/rcmake-cli/src/options/debug.rs).
+
+---
+
+## ADR-051 Portable single-file cross-machine diff-config snapshots
+
+Accepted on 2026-11-28.
+
+Extend `crates/rcmake-buildinfo` (building on ADR-043) with a portable single-file JSON snapshot codec (`rcmake-config-snapshot`, major version `1`, minor version `0`) so developers and CI jobs can capture a build tree's configuration with `rcmake diff-config --save` and diff it against another snapshot or live build tree on a different machine without copying the build directory.
+
+Before serialization, `prepare_for_save` normalizes paths into `${home}`, `${build}`, and `${source}` placeholders with forward-slash separators, preserves non-UTF-8 `BString` values losslessly, keeps per-section `Evidence` intact subject to the selected `--cache` mode (marking comparable cache evidence unavailable under `--cache none`), and interns deduplicated `CompileSettings` records through `CompileSettingsTable` so large projects stay compact. Output is deterministic UTF-8 JSON with sorted object keys, LF line endings, and no wall-clock timestamps.
+
+By default, saved snapshots retain only key cache variables (`CacheSet::Key`) and redact secret-like cache variable names detected across uppercase, snake_case, and camelCase/acronym token boundaries (`is_secret_cache_name`) unless `--cache all` is explicitly requested. Decoding enforces strict untrusted-input budgets: 64 MiB maximum file size (`MAX_SNAPSHOT_BYTES`), JSON nesting depth 32 (`MAX_SNAPSHOT_JSON_DEPTH`), 256 MiB expanded compile-settings budget (`MAX_EXPANDED_COMPILE_BYTES`), bounded per-section entry counts, and rejection of comments or duplicate JSON keys.
+
+Related source files are [portable snapshot codec](../crates/rcmake-buildinfo/src/portable.rs), [diff engine](../crates/rcmake-buildinfo/src/diff.rs), [snapshot model](../crates/rcmake-buildinfo/src/snapshot.rs), [diff renderer](../crates/rcmake-buildinfo/src/render.rs), and [diff-config CLI](../crates/rcmake-cli/src/diff_config_cmd.rs).
+
+---
+
+## ADR-052 Native package manager distribution and manifest CI gate
+
+Accepted on 2026-11-28.
+
+Ship deterministic package manager manifests for Homebrew (`packaging/homebrew/rcmake.rb`), Scoop (`packaging/scoop/rcmake.json`), and WinGet schema `1.9.0` multi-file manifests (`packaging/winget/Rcmake.Rcmake.yaml`, `Rcmake.Rcmake.installer.yaml`, and `Rcmake.Rcmake.locale.en-US.yaml`), generated from a release version and `SHA256SUMS.txt` by `scripts/generate-manifests.py`.
+
+Every package installs the full release archive layout (including `bin/` and `share/cmake-4.5/`) so `discover_cmake_root` resolves bundled CMake 4.5.1 modules relative to the installed binary. By default, each package exposes only the non-conflicting `rcmake`, `rcmake-lsp`, and `rcmake-verify` commands on `PATH` (Homebrew via `libexec` + `bin.install_symlink`, Scoop via `bin`, WinGet via `NestedInstallerFiles` portable command aliases), keeping `cmake`, `ctest`, `cpack`, and `ccmake` inside the package's private `bin/` directory so existing upstream CMake installations stay intact.
+
+`scripts/generate-manifests.py` validates semantic versions, archive filenames, and SHA-256 checksum completeness, writes atomically with UTF-8 LF formatting, and provides `--check` for drift detection. `.github/workflows/release.yml` runs `scripts/generate-manifests.py` directly from the verified `SHA256SUMS.txt`, validates Ruby, JSON, and YAML syntax, uploads `dist/manifests` as an artifact, runs a Windows `validate-winget` job (`winget validate --manifest dist/manifests/winget`), and gates the tag-only GitHub Release publication job on `validate-winget`.
+
+Related source files are [manifest generator](../scripts/generate-manifests.py), [packaging guide](../packaging/README.md), [Homebrew formula](../packaging/homebrew/rcmake.rb), [Scoop manifest](../packaging/scoop/rcmake.json), [WinGet version manifest](../packaging/winget/Rcmake.Rcmake.yaml), [WinGet installer manifest](../packaging/winget/Rcmake.Rcmake.installer.yaml), [WinGet locale manifest](../packaging/winget/Rcmake.Rcmake.locale.en-US.yaml), and [release workflow](../.github/workflows/release.yml).
+
+---
+
+## ADR-053 Native NMake Makefiles generator on Windows
+
+Accepted on 2026-11-28.
+
+Extend `crates/rcmake-gen-make` (`#![forbid(unsafe_code)]`) with `MakeDialect::NMake` alongside `MakeDialect::Unix` so `rcmake` supports the `NMake Makefiles` single-configuration generator on Windows without duplicating the build-graph lowering or makefile planner.
+
+The NMake dialect encodes Microsoft `nmake` and Windows `cmd.exe` rules directly in the shared generator:
+
+- **Target and word quoting:** Single-letter ASCII alphabetic targets emit a space before `:` (`a : ...`) so `nmake` never parses them as a drive letter, target/prerequisite paths containing `nmake` metacharacters are double-quoted, and `$` is escaped as `$$`.
+- **Windows shell and `%` escaping:** Recipe arguments use `cmd.exe` double-quoting (`quote_cmd`), `nmake` recipes double `%` to `%%` in recursive invocations, directory creation and cleanup use `$(CMAKE_COMMAND) -E make_directory` / `-E rm -f` / `-E rm -rf` instead of POSIX `mkdir`/`rm`, and step commands execute as separate recipe lines rather than POSIX `&&` chains, while subdirectory wrapper targets use `cd /d <root> && $(MAKE) ...` to invoke root makefiles.
+- **Recursive `$(MAKE)` and build invocation:** Makefiles use `!IFNDEF` / `MAKE_SILENT = /nologo`, omit GNU `.PHONY` / `.NOTPARALLEL` directives, and invoke recursive builds via `$(MAKE) $(MAKE_SILENT) -f <file> -$(MAKEFLAGS) VERBOSE=$(VERBOSE) <target>`. `cmake --build` (`build_commands_nmake`) runs `nmake /nologo -f Makefile [VERBOSE=1]` and ignores `-j` parallel job flags because `nmake` is single-threaded.
+
+Related source files are [Makefile generator](../crates/rcmake-gen-make/src/lib.rs), [Makefile build planner](../crates/rcmake-gen-make/src/build.rs), [Makefile recipes](../crates/rcmake-gen-make/src/recipe.rs), [Makefile progress](../crates/rcmake-gen-make/src/progress.rs), [Makefile subdirectories](../crates/rcmake-gen-make/src/subdirectories.rs), [generator options](../crates/rcmake-cli/src/options/generator.rs), [generator dispatch](../crates/rcmake-cli/src/generate.rs), and [CLI build driver](../crates/rcmake-cli/src/build.rs).
+
+---
+
+## ADR-054 Persona-gated developer experience commands and typo hints
+
+Accepted on 2026-11-28.
+
+Add three native-only developer experience features strictly gated behind `Persona::Native` (`rcmake`) so compatibility personas (`cmake`, `ctest`, `cpack`, `ccmake`, and `RCMAKE_ORACLE_MODE=1`) preserve exact CMake 4.5.1 CLI, stdout, stderr, and exit-code parity:
+
+1. **`rcmake preset show <name>` (`rcmake-preset-show-v1`).** Resolves `CMakePresets.json` / `CMakeUserPresets.json` include chains, `inherits` merges, macro and `$env{}` expansions, and condition evaluations across `configure`, `build`, `test`, `package`, and `workflow` presets without configuring or writing files. Disabled presets are reported explicitly, sensitive env and cache values are redacted by default (opt-in via `--show-secrets`), and `--json` emits machine-readable output.
+2. **`rcmake explain --targets` (`rcmake-explain-targets-v1`).** Lists project targets with their type and relative source directory, reading a fresh File API codemodel reply when up to date or falling back to an in-memory overlay evaluation without spawning subprocesses or mutating the build tree. Supports `--config`, `--all` (including imported, utility, and synthetic targets), and `--json`, with bounded reply and target caps.
+3. **Native-only unused `-D` typo hints.** When configure emits the `unused-cli` warning or error under `Persona::Native`, `configure/unused_cli.rs` checks unused variable names (capped at 128 bytes) against non-internal cache variables and a curated list of documented CMake variables using bounded Levenshtein distance (1 for length 3, 2 for length 4+), printing `hint: <name> is unused. Did you mean <best>?` only when a single unique closest match exists. Compatibility personas disable hints (`allow_hints = false`) so stderr matches upstream CMake byte-for-byte.
+
+Related source files are [preset show CLI](../crates/rcmake-cli/src/preset_cmd.rs), [explain targets CLI](../crates/rcmake-cli/src/explain_cmd/targets.rs), [explain argument parser](../crates/rcmake-cli/src/explain_cmd/args.rs), [unused CLI hints](../crates/rcmake-cli/src/configure/unused_cli.rs), [persona resolution](../crates/rcmake-cli/src/persona.rs), and [CLI driver](../crates/rcmake-cli/src/lib.rs).

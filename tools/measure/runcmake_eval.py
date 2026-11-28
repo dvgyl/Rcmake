@@ -116,7 +116,7 @@ WINDOWS_ENVIRONMENT = (
     "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "HOMEDRIVE", "HOMEPATH",
     "VCINSTALLDIR", "VCToolsInstallDir", "VSINSTALLDIR", "VisualStudioVersion",
     "VS160COMNTOOLS", "VS170COMNTOOLS", "VS180COMNTOOLS",
-    "WindowsSdkDir", "WindowsSDKVersion", "DOTNET_ROOT", "WIX",
+    "WindowsSdkDir", "WindowsSDKVersion", "DOTNET_ROOT", "MSBuildSDKsPath", "WIX",
 )
 COMPLETE = "-- runcmake_eval: suite complete"
 CASE_RESULT = re.compile(

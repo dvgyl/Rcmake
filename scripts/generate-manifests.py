@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
+"""Generate and verify Homebrew, Scoop, and WinGet manifests from SHA256SUMS.txt."""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+DEFAULT_REPO = "rcmake/rcmake"
+DEFAULT_HOMEPAGE = "https://rcmake.github.io/rcmake/"
+DEFAULT_OUT_DIR = Path(__file__).resolve().parents[1] / "packaging"
+
+SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+HOMEPAGE_RE = re.compile(r"^https://[^\s\"'<>\\]+$")
+CHECKSUM_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})[ \t]+\*?(\S+)$")
+
+WINGET_SCHEMA_VERSION = "1.9.0"
+WINGET_ID = "Rcmake.Rcmake"
+CMAKE_COMPAT_VERSION = "4.5.1"
+CMAKE_DATA_SUBDIR = "share/cmake-4.5"
+
+TARGETS = {
+    "macos_arm64": ("aarch64-apple-darwin", "tar.gz"),
+    "linux_x64": ("x86_64-unknown-linux-gnu", "tar.gz"),
+    "linux_arm64": ("aarch64-unknown-linux-gnu", "tar.gz"),
+    "windows_x64": ("x86_64-pc-windows-msvc", "zip"),
+}
+
+
+class ManifestError(ValueError):
+    """Raised when generator inputs are missing, malformed, or inconsistent."""
+
+
+def normalize_version(raw: str) -> str:
+    """Validate and normalize a release version string (stripping an optional leading 'v')."""
+    value = raw.strip()
+    if value.startswith("v"):
+        value = value[1:]
+    if not SEMVER_RE.fullmatch(value):
+        raise ManifestError(
+            f"Invalid version {raw!r}. Expected semantic version such as '0.2.2' or 'v0.2.2'."
+        )
+    return value
+
+
+def validate_repo(repo: str) -> str:
+    """Validate a GitHub 'owner/repo' slug."""
+    value = repo.strip()
+    if not REPO_RE.fullmatch(value):
+        raise ManifestError(f"Invalid GitHub repository {repo!r}. Expected '<owner>/<repo>'.")
+    return value
+
+
+def validate_homepage(homepage: str) -> str:
+    """Validate an HTTPS homepage URL."""
+    value = homepage.strip()
+    if not HOMEPAGE_RE.fullmatch(value):
+        raise ManifestError(f"Invalid homepage URL {homepage!r}. Expected an https:// URL.")
+    return value
+
+
+def archive_name(version: str, target_key: str) -> str:
+    """Return the canonical release archive filename for a target key."""
+    triple, ext = TARGETS[target_key]
+    return f"rcmake-{version}-{triple}.{ext}"
+
+
+def parse_checksums(text: str) -> dict[str, str]:
+    """Parse SHA256SUMS.txt into a mapping of archive filename -> lowercase sha256."""
+    entries: dict[str, str] = {}
+    for lineno, raw_line in enumerate(text.splitlines(), 1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        match = CHECKSUM_LINE_RE.fullmatch(stripped)
+        if not match:
+            raise ManifestError(
+                f"Malformed checksum entry at line {lineno}: {raw_line!r}. "
+                "Expected '<64-hex-sha256>  <filename>'."
+            )
+        digest = match.group(1).lower()
+        filename = match.group(2)
+        if "/" in filename or "\\" in filename or filename in {".", ".."}:
+            raise ManifestError(
+                f"Invalid archive filename {filename!r} at line {lineno}: "
+                "expected a bare filename with no directory separators."
+            )
+        if filename in entries:
+            raise ManifestError(f"Duplicate checksum entry for {filename!r} at line {lineno}.")
+        entries[filename] = digest
+    if not entries:
+        raise ManifestError("Checksums file is empty.")
+    return entries
+
+
+def resolve_target_hashes(version: str, checksums: dict[str, str]) -> dict[str, str]:
+    """Extract and verify SHA-256 digests for all required release archives."""
+    missing: list[str] = []
+    resolved: dict[str, str] = {}
+    for key in TARGETS:
+        filename = archive_name(version, key)
+        digest = checksums.get(filename)
+        if digest is None:
+            missing.append(filename)
+        else:
+            resolved[key] = digest
+    if missing:
+        joined = ", ".join(missing)
+        raise ManifestError(
+            f"Missing required SHA-256 checksum(s) for version {version}: {joined}."
+        )
+    return resolved
+
+
+def download_url(repo: str, version: str, filename: str) -> str:
+    """Build the GitHub Release asset download URL."""
+    return f"https://github.com/{repo}/releases/download/v{version}/{filename}"
+
+
+def render_homebrew(
+    version: str,
+    hashes: dict[str, str],
+    *,
+    repo: str = DEFAULT_REPO,
+    homepage: str = DEFAULT_HOMEPAGE,
+) -> str:
+    """Render the Homebrew Ruby formula (ADR-052 libexec layout)."""
+    macos_arm_url = download_url(repo, version, archive_name(version, "macos_arm64"))
+    linux_x64_url = download_url(repo, version, archive_name(version, "linux_x64"))
+    linux_arm_url = download_url(repo, version, archive_name(version, "linux_arm64"))
+    return (
+        "# SPDX-License-Identifier: MIT OR Apache-2.0\n"
+        "# Generated by scripts/generate-manifests.py — do not edit by hand.\n"
+        "\n"
+        "class Rcmake < Formula\n"
+        f'  desc "Native Rust drop-in replacement for CMake {CMAKE_COMPAT_VERSION}"\n'
+        f'  homepage "{homepage}"\n'
+        f'  version "{version}"\n'
+        '  license any_of: ["MIT", "Apache-2.0"]\n'
+        "\n"
+        "  livecheck do\n"
+        "    url :stable\n"
+        "    strategy :github_latest\n"
+        "  end\n"
+        "\n"
+        "  on_macos do\n"
+        "    depends_on arch: :arm64\n"
+        "\n"
+        "    on_arm do\n"
+        f'      url "{macos_arm_url}"\n'
+        f'      sha256 "{hashes["macos_arm64"]}"\n'
+        "    end\n"
+        "  end\n"
+        "\n"
+        "  on_linux do\n"
+        "    on_intel do\n"
+        f'      url "{linux_x64_url}"\n'
+        f'      sha256 "{hashes["linux_x64"]}"\n'
+        "    end\n"
+        "\n"
+        "    on_arm do\n"
+        f'      url "{linux_arm_url}"\n'
+        f'      sha256 "{hashes["linux_arm64"]}"\n'
+        "    end\n"
+        "  end\n"
+        "\n"
+        "  def install\n"
+        '    libexec.install Dir["*"]\n'
+        "\n"
+        '    bin.install_symlink libexec/"bin/rcmake"\n'
+        '    bin.install_symlink libexec/"bin/rcmake-lsp"\n'
+        '    bin.install_symlink libexec/"bin/rcmake-verify"\n'
+        "\n"
+        '    man1.install_symlink libexec/"share/man/man1/rcmake.1"\n'
+        '    bash_completion.install_symlink libexec/"share/bash-completion/completions/rcmake"\n'
+        '    zsh_completion.install_symlink libexec/"share/zsh/site-functions/_rcmake"\n'
+        '    fish_completion.install_symlink libexec/"share/fish/vendor_completions.d/rcmake.fish"\n'
+        "  end\n"
+        "\n"
+        "  def caveats\n"
+        "    <<~EOS\n"
+        "      rcmake, rcmake-lsp, and rcmake-verify are linked into #{HOMEBREW_PREFIX}/bin\n"
+        "      so this formula does not conflict with Homebrew's cmake formula.\n"
+        "\n"
+        "      To use drop-in cmake, ctest, cpack, and ccmake replacements, prepend the\n"
+        "      bundled compatibility bin directory to PATH:\n"
+        '        export PATH="#{opt_libexec}/bin:$PATH"\n'
+        "    EOS\n"
+        "  end\n"
+        "\n"
+        "  test do\n"
+        '    version_output = shell_output("#{bin}/rcmake --version")\n'
+        f'    assert_match "cmake version {CMAKE_COMPAT_VERSION}", version_output\n'
+        '    assert_match "rcmake #{version}", version_output\n'
+        '    assert_match "rcmake-verify #{version}", shell_output("#{bin}/rcmake-verify --version")\n'
+        "\n"
+        '    (testpath/"CMakeLists.txt").write <<~\'CMAKE\'\n'
+        "      cmake_minimum_required(VERSION 4.5)\n"
+        "      project(HomebrewSmoke LANGUAGES NONE)\n"
+        '      file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cmake-root.txt" "${CMAKE_ROOT}")\n'
+        "    CMAKE\n"
+        "\n"
+        '    system bin/"rcmake", "-S", testpath, "-B", testpath/"build", "-G", "Unix Makefiles"\n'
+        f'    assert_equal (libexec/"{CMAKE_DATA_SUBDIR}").realpath.to_s,\n'
+        '                 Pathname.new((testpath/"build/cmake-root.txt").read.strip).realpath.to_s\n'
+        "  end\n"
+        "end\n"
+    )
+
+
+def render_scoop(
+    version: str,
+    hashes: dict[str, str],
+    *,
+    repo: str = DEFAULT_REPO,
+    homepage: str = DEFAULT_HOMEPAGE,
+) -> str:
+    """Render the Scoop bucket JSON manifest."""
+    win_archive = archive_name(version, "windows_x64")
+    win_dir = f"rcmake-{version}-x86_64-pc-windows-msvc"
+    manifest = {
+        "version": version,
+        "description": f"Native Rust drop-in replacement for CMake {CMAKE_COMPAT_VERSION}",
+        "homepage": homepage,
+        "license": "MIT OR Apache-2.0",
+        "architecture": {
+            "64bit": {
+                "url": download_url(repo, version, win_archive),
+                "hash": hashes["windows_x64"],
+                "extract_dir": win_dir,
+            }
+        },
+        "bin": [
+            "bin/rcmake.exe",
+            "bin/rcmake-lsp.exe",
+            "bin/rcmake-verify.exe",
+        ],
+        "notes": [
+            "rcmake, rcmake-lsp, and rcmake-verify are shimmed on PATH so Scoop's cmake package stays intact.",
+            'To use drop-in cmake, ctest, cpack, and ccmake replacements, prepend "$dir\\bin" to PATH.',
+        ],
+        "checkver": {
+            "github": f"https://github.com/{repo}",
+        },
+        "autoupdate": {
+            "architecture": {
+                "64bit": {
+                    "url": f"https://github.com/{repo}/releases/download/v$version/rcmake-$version-x86_64-pc-windows-msvc.zip",
+                    "extract_dir": "rcmake-$version-x86_64-pc-windows-msvc",
+                }
+            },
+            "hash": {
+                "url": "$baseurl/SHA256SUMS.txt",
+            },
+        },
+    }
+    return json.dumps(manifest, indent=2) + "\n"
+
+
+def render_winget_version(version: str) -> str:
+    """Render the WinGet version manifest."""
+    return (
+        "# SPDX-License-Identifier: MIT OR Apache-2.0\n"
+        "# Generated by scripts/generate-manifests.py — do not edit by hand.\n"
+        f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.{WINGET_SCHEMA_VERSION}.schema.json\n"
+        "\n"
+        f"PackageIdentifier: {WINGET_ID}\n"
+        f"PackageVersion: {version}\n"
+        "DefaultLocale: en-US\n"
+        "ManifestType: version\n"
+        f"ManifestVersion: {WINGET_SCHEMA_VERSION}\n"
+    )
+
+
+def render_winget_installer(
+    version: str,
+    hashes: dict[str, str],
+    *,
+    repo: str = DEFAULT_REPO,
+) -> str:
+    """Render the WinGet installer manifest."""
+    win_archive = archive_name(version, "windows_x64")
+    win_dir = f"rcmake-{version}-x86_64-pc-windows-msvc"
+    win_url = download_url(repo, version, win_archive)
+    win_sha_upper = hashes["windows_x64"].upper()
+    return (
+        "# SPDX-License-Identifier: MIT OR Apache-2.0\n"
+        "# Generated by scripts/generate-manifests.py — do not edit by hand.\n"
+        f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{WINGET_SCHEMA_VERSION}.schema.json\n"
+        "\n"
+        f"PackageIdentifier: {WINGET_ID}\n"
+        f"PackageVersion: {version}\n"
+        "InstallerType: zip\n"
+        "NestedInstallerType: portable\n"
+        "NestedInstallerFiles:\n"
+        f"  - RelativeFilePath: {win_dir}\\bin\\rcmake.exe\n"
+        "    PortableCommandAlias: rcmake\n"
+        f"  - RelativeFilePath: {win_dir}\\bin\\rcmake-lsp.exe\n"
+        "    PortableCommandAlias: rcmake-lsp\n"
+        f"  - RelativeFilePath: {win_dir}\\bin\\rcmake-verify.exe\n"
+        "    PortableCommandAlias: rcmake-verify\n"
+        "Installers:\n"
+        "  - Architecture: x64\n"
+        f"    InstallerUrl: {win_url}\n"
+        f"    InstallerSha256: {win_sha_upper}\n"
+        "ManifestType: installer\n"
+        f"ManifestVersion: {WINGET_SCHEMA_VERSION}\n"
+    )
+
+
+def render_winget_locale(
+    version: str,
+    *,
+    repo: str = DEFAULT_REPO,
+    homepage: str = DEFAULT_HOMEPAGE,
+) -> str:
+    """Render the WinGet en-US defaultLocale manifest."""
+    owner = repo.split("/", 1)[0]
+    return (
+        "# SPDX-License-Identifier: MIT OR Apache-2.0\n"
+        "# Generated by scripts/generate-manifests.py — do not edit by hand.\n"
+        f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.{WINGET_SCHEMA_VERSION}.schema.json\n"
+        "\n"
+        f"PackageIdentifier: {WINGET_ID}\n"
+        f"PackageVersion: {version}\n"
+        "PackageLocale: en-US\n"
+        "Publisher: Rcmake Contributors\n"
+        f"PublisherUrl: https://github.com/{owner}\n"
+        f"PublisherSupportUrl: https://github.com/{repo}/issues\n"
+        "PackageName: rcmake\n"
+        f"PackageUrl: {homepage}\n"
+        "License: MIT OR Apache-2.0\n"
+        f"LicenseUrl: https://github.com/{repo}/blob/v{version}/LICENSE-MIT\n"
+        "Copyright: Copyright (c) Rcmake Contributors\n"
+        f"ShortDescription: Native Rust drop-in replacement for CMake {CMAKE_COMPAT_VERSION}\n"
+        "Description: >-\n"
+        f"  rcmake is an independent reimplementation of CMake {CMAKE_COMPAT_VERSION} in safe Rust.\n"
+        "  It ships cmake, ctest, cpack, and the rcmake-lsp language server alongside\n"
+        "  the isolated rcmake-verify parity checker and bundled CMake 4.5.1 modules.\n"
+        "  Default portable aliases expose rcmake, rcmake-lsp, and rcmake-verify\n"
+        "  without conflicting with an existing CMake installation.\n"
+        "Moniker: rcmake\n"
+        "Tags:\n"
+        "  - build-system\n"
+        "  - c\n"
+        "  - cmake\n"
+        "  - cpp\n"
+        "  - cpack\n"
+        "  - ctest\n"
+        "  - lsp\n"
+        "  - ninja\n"
+        "  - rust\n"
+        f"ReleaseNotesUrl: https://github.com/{repo}/releases/tag/v{version}\n"
+        "Documentations:\n"
+        "  - DocumentLabel: Documentation\n"
+        f"    DocumentUrl: {homepage}\n"
+        "ManifestType: defaultLocale\n"
+        f"ManifestVersion: {WINGET_SCHEMA_VERSION}\n"
+    )
+
+
+def render_all(
+    version: str,
+    checksums: dict[str, str],
+    *,
+    repo: str = DEFAULT_REPO,
+    homepage: str = DEFAULT_HOMEPAGE,
+) -> dict[Path, str]:
+    """Render all package manager manifests keyed by path relative to out_dir."""
+    norm_version = normalize_version(version)
+    norm_repo = validate_repo(repo)
+    norm_homepage = validate_homepage(homepage)
+    hashes = resolve_target_hashes(norm_version, checksums)
+    return {
+        Path("homebrew/rcmake.rb"): render_homebrew(
+            norm_version, hashes, repo=norm_repo, homepage=norm_homepage
+        ),
+        Path("scoop/rcmake.json"): render_scoop(
+            norm_version, hashes, repo=norm_repo, homepage=norm_homepage
+        ),
+        Path(f"winget/{WINGET_ID}.yaml"): render_winget_version(norm_version),
+        Path(f"winget/{WINGET_ID}.installer.yaml"): render_winget_installer(
+            norm_version, hashes, repo=norm_repo
+        ),
+        Path(f"winget/{WINGET_ID}.locale.en-US.yaml"): render_winget_locale(
+            norm_version, repo=norm_repo, homepage=norm_homepage
+        ),
+    }
+
+
+def write_atomic(path: Path, content: str) -> None:
+    """Write UTF-8 LF text to path atomically with 0644 permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            handle.write(content)
+        os.chmod(temp_name, 0o644)
+        os.replace(temp_name, path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            Path(temp_name).unlink(missing_ok=True)
+
+
+def check_manifests(out_dir: Path, rendered: dict[Path, str]) -> list[str]:
+    """Compare rendered manifests against files on disk; return drift descriptions."""
+    drifts: list[str] = []
+    for rel, expected in sorted(rendered.items()):
+        dest = out_dir / rel
+        if not dest.is_file():
+            drifts.append(f"Missing manifest: {dest}")
+            continue
+        with dest.open("r", encoding="utf-8", newline="") as handle:
+            actual = handle.read()
+        if actual != expected:
+            diff = "".join(
+                difflib.unified_diff(
+                    actual.splitlines(keepends=True),
+                    expected.splitlines(keepends=True),
+                    fromfile=f"a/{rel.as_posix()}",
+                    tofile=f"b/{rel.as_posix()}",
+                )
+            )
+            drifts.append(f"Manifest drift in {dest}:\n{diff}")
+    return drifts
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--version",
+        required=True,
+        help="Release semantic version (e.g. 0.2.2 or v0.2.2).",
+    )
+    parser.add_argument(
+        "--checksums",
+        required=True,
+        type=Path,
+        help="Path to SHA256SUMS.txt containing SHA-256 sums for all release archives.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=DEFAULT_OUT_DIR,
+        help=f"Output packaging directory (default: {DEFAULT_OUT_DIR}).",
+    )
+    parser.add_argument(
+        "--repo",
+        default=DEFAULT_REPO,
+        help=f"GitHub owner/repo slug (default: {DEFAULT_REPO}).",
+    )
+    parser.add_argument(
+        "--homepage",
+        default=DEFAULT_HOMEPAGE,
+        help=f"Project homepage URL (default: {DEFAULT_HOMEPAGE}).",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Verify that manifests in --out-dir match generated output without writing.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if not args.checksums.is_file():
+            raise ManifestError(f"Checksums file does not exist: {args.checksums}")
+        checksum_text = args.checksums.read_text(encoding="utf-8")
+        checksums = parse_checksums(checksum_text)
+        rendered = render_all(
+            args.version,
+            checksums,
+            repo=args.repo,
+            homepage=args.homepage,
+        )
+    except (ManifestError, OSError, UnicodeDecodeError) as exc:
+        print(f"generate-manifests.py: {exc}", file=sys.stderr)
+        return 1
+
+    if args.check:
+        drifts = check_manifests(args.out_dir, rendered)
+        if drifts:
+            for item in drifts:
+                print(item, file=sys.stderr)
+            return 1
+        print(f"Verified {len(rendered)} package manifests in {args.out_dir}.")
+        return 0
+
+    for rel, content in sorted(rendered.items()):
+        write_atomic(args.out_dir / rel, content)
+    print(f"Generated {len(rendered)} package manifests in {args.out_dir}.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

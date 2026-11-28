@@ -173,7 +173,7 @@ jobs:
           New-Item -ItemType Directory -Path target/stage/bin -Force | Out-Null
           Copy-Item target/release/rcmake.exe target/stage/bin/rcmake.exe
           Copy-Item target/release/rcmake-shim.exe target/stage/bin/rcmake-shim.exe
-          foreach ($tool in 'cmake', 'ctest', 'cpack', 'rcmake-lsp') {
+          foreach ($tool in 'cmake', 'ctest', 'cpack', 'ccmake', 'rcmake-lsp') {
             Copy-Item target/release/rcmake-shim.exe "target/stage/bin/$tool.exe"
           }
           & target/stage/bin/rcmake.exe --version
@@ -733,9 +733,18 @@ jobs:
               if revision != pin["commit"]:
                   raise ValueError(f"The source commit changed to {revision}.")
               return subprocess.check_output(
-                  [*git, "status", "--porcelain", "--ignored", "--ignore-submodules=none"],
+                  [*git, "status", "--porcelain", "--ignored=traditional", "--untracked-files=all", "--ignore-submodules=none"],
                   timeout=120, text=True,
               )
+
+          def split_source_status(status):
+              ignored, dirty = set(), []
+              for line in status.splitlines():
+                  if line.startswith("!! "):
+                      ignored.add(line)
+                  elif line:
+                      dirty.append(line)
+              return ignored, dirty
 
           def reset_source():
               run([*git, "checkout", pin["commit"], "--", "."], 120)
@@ -852,6 +861,8 @@ jobs:
                   checks.update(dry_run="fail", dry_run_error=str(error))
               return observed
 
+          source_statuses = {}
+
           def run_lane(name, cmake):
               checks = result["checks"][name] = {}
               before = source_status()
@@ -867,7 +878,18 @@ jobs:
               finally:
                   after = source_status()
                   (report / f"{name}-source-status.txt").write_text(after, encoding="utf-8")
-                  checks["source_clean"] = not after
+                  ignored, dirty = split_source_status(after)
+                  source_statuses[name] = (ignored, dirty)
+                  if name == "oracle":
+                      checks["source_clean"] = not dirty
+                  else:
+                      oracle_ignored = source_statuses.get("oracle", (set(), []))[0]
+                      extra_ignored = sorted(ignored - oracle_ignored)
+                      checks["source_clean"] = not dirty and not extra_ignored
+                      if extra_ignored:
+                          checks["source_extra_ignored"] = extra_ignored
+                  if dirty:
+                      checks["source_dirty"] = dirty
                   save_result()
                   if full:
                       for directory in (build, install):
@@ -1011,7 +1033,7 @@ jobs:
             if [[ -f target/stage/bin/rcmake-shim.exe ]]; then
               alias_src=target/stage/bin/rcmake-shim.exe
             fi
-            for tool in cmake ctest cpack rcmake-lsp; do
+            for tool in cmake ctest cpack ccmake rcmake-lsp; do
               cp "$alias_src" "target/stage/bin/$tool.exe"
             done
             cp -R modules/cmake-4.5 target/stage/share/
@@ -1211,6 +1233,109 @@ jobs:
         with:
           arch: x64
           vsversion: "2022"
+      - name: Configure .NET SDK for MSBuild 17
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msbuildVersionLines = @(& MSBuild.exe -nologo -version)
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild.exe -version failed with exit code $LASTEXITCODE." }
+          $msbuildVersionRaw = ($msbuildVersionLines | Select-Object -Last 1).ToString().Trim()
+          if ($msbuildVersionRaw -notmatch '^(\d+)\.') {
+            throw "Unable to parse MSBuild version from: $msbuildVersionRaw"
+          }
+          $msbuildMajor = [int]$Matches[1]
+          $dotnet = Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'
+          if (-not (Test-Path -LiteralPath $dotnet)) {
+            $cmd = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+            if (-not $cmd) { throw 'x64 dotnet.exe is missing.' }
+            $dotnet = $cmd.Source
+          }
+          $sdkLines = @(& $dotnet --list-sdks)
+          if ($LASTEXITCODE -ne 0) { throw "dotnet --list-sdks failed with exit code $LASTEXITCODE." }
+          $allowedMajors = if ($msbuildMajor -ge 18) { @(8, 9, 10) } else { @(8, 9) }
+          $x86Root = ${env:ProgramFiles(x86)}
+          $candidates = @(foreach ($line in $sdkLines) {
+            if ($line -match '^\s*(\d+)\.(\d+)\.(\d+)(-[^\s]+)?\s+\[(.+)\]\s*$') {
+              $major = [int]$Matches[1]
+              $minor = [int]$Matches[2]
+              $patch = [int]$Matches[3]
+              $prerelease = $Matches[4]
+              $verStr = "$major.$minor.$patch$prerelease"
+              $sdkBase = $Matches[5].Trim()
+              if ($x86Root -and $sdkBase.StartsWith($x86Root, [StringComparison]::OrdinalIgnoreCase)) { continue }
+              if ($major -notin $allowedMajors) { continue }
+              $sdksPath = Join-Path (Join-Path $sdkBase $verStr) 'Sdks'
+              $netSdkProps = Join-Path $sdksPath 'Microsoft.NET.Sdk\Sdk\Sdk.props'
+              if (Test-Path -LiteralPath $netSdkProps) {
+                [PSCustomObject]@{
+                  Major      = $major
+                  Minor      = $minor
+                  Patch      = $patch
+                  IsStable   = [int]([string]::IsNullOrEmpty($prerelease))
+                  Version    = $verStr
+                  SdksPath   = $sdksPath
+                  DotnetRoot = Split-Path -Path $sdkBase -Parent
+                }
+              }
+            }
+          }) | Sort-Object -Property @{Expression = 'Major'; Descending = $true},
+                                     @{Expression = 'Minor'; Descending = $true},
+                                     @{Expression = 'Patch'; Descending = $true},
+                                     @{Expression = 'IsStable'; Descending = $true}
+          if (-not $candidates) {
+            throw "No compatible x64 .NET SDK ($($allowedMajors -join '/')) with Microsoft.NET.Sdk found for MSBuild $msbuildVersionRaw. Installed SDKs:`n$($sdkLines -join "`n")"
+          }
+          $selected = $null
+          $lastError = ''
+          $probeDir = Join-Path $env:RUNNER_TEMP ("msbuild-sdk-probe-" + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+          try {
+            foreach ($cand in $candidates) {
+              $probeProj = Join-Path $probeDir "probe-$($cand.Major).csproj"
+              $probeXml = "<Project Sdk=`"Microsoft.NET.Sdk`"><PropertyGroup><TargetFramework>net$($cand.Major).0</TargetFramework></PropertyGroup><Target Name=`"Ping`"><Message Importance=`"High`" Text=`"PROBE_SDK=`$(NETCoreSdkVersion)|`$(MicrosoftNETBuildTasksDirectoryRoot)`" /></Target></Project>"
+              Set-Content -LiteralPath $probeProj -Value $probeXml -Encoding utf8
+              $prevSdks = $env:MSBuildSDKsPath
+              $prevDotnetRoot = $env:DOTNET_ROOT
+              try {
+                $env:MSBuildSDKsPath = $cand.SdksPath
+                if (-not $env:DOTNET_ROOT) { $env:DOTNET_ROOT = $cand.DotnetRoot }
+                $output = @(& MSBuild.exe $probeProj /nologo /t:Ping /v:minimal 2>&1)
+                if ($LASTEXITCODE -eq 0) {
+                  $probeLine = $output | ForEach-Object { $_.ToString().Trim() } |
+                    Where-Object { $_ -like 'PROBE_SDK=*' } | Select-Object -Last 1
+                  if ($probeLine -and $probeLine -match '^PROBE_SDK=([^|]+)\|(.+)$') {
+                    $resolvedVer = $Matches[1].Trim()
+                    $resolvedTasksRoot = $Matches[2].Trim()
+                    $expectedSdksRoot = [IO.Path]::GetFullPath($cand.SdksPath).TrimEnd('\', '/') + '\'
+                    $actualTasksFull = [IO.Path]::GetFullPath($resolvedTasksRoot)
+                    if ($resolvedVer -ieq $cand.Version -and
+                        $actualTasksFull.StartsWith($expectedSdksRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                      $selected = $cand
+                      break
+                    }
+                    $lastError = "MSBuild resolved SDK $resolvedVer ($actualTasksFull), expected $($cand.Version) under $expectedSdksRoot."
+                  } else {
+                    $lastError = "MSBuild Ping succeeded without PROBE_SDK marker. Output:`n$(($output | Out-String).Trim())"
+                  }
+                } else {
+                  $lastError = ($output | Out-String).Trim()
+                }
+              } finally {
+                if ($null -eq $prevSdks) { Remove-Item Env:MSBuildSDKsPath -ErrorAction SilentlyContinue } else { $env:MSBuildSDKsPath = $prevSdks }
+                if ($null -eq $prevDotnetRoot) { Remove-Item Env:DOTNET_ROOT -ErrorAction SilentlyContinue } else { $env:DOTNET_ROOT = $prevDotnetRoot }
+              }
+            }
+          } finally {
+            Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $selected) {
+            throw "MSBuild $msbuildVersionRaw could not load Microsoft.NET.Sdk from any candidate SDK. Last output:`n$lastError"
+          }
+          "MSBuildSDKsPath=$($selected.SdksPath)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not $env:DOTNET_ROOT) {
+            "DOTNET_ROOT=$($selected.DotnetRoot)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          Write-Host "Configured MSBuild $msbuildVersionRaw with .NET SDK $($selected.Version) (MSBuildSDKsPath=$($selected.SdksPath))."
       - name: Install Windows build and packaging tools
         shell: pwsh
         run: |

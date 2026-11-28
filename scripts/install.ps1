@@ -29,8 +29,8 @@ Options:
   -Prefix <dir>      Installation root (default: %LOCALAPPDATA%\rcmake).
   -Archive <path>    Install a local .zip archive. The script checks
                      <path>.sha256 if that file exists.
-  -AliasCmake        Also create cmake.exe, ctest.exe, and cpack.exe aliases
-                     from rcmake.exe (hardlink, falling back to copy).
+  -AliasCmake        Also create cmake.exe, ctest.exe, cpack.exe, and ccmake.exe
+                     aliases from rcmake.exe (hardlink, falling back to copy).
   -Force             Allow replacement of unmarked share\cmake-4.5 data.
                      With -AliasCmake, also replace existing aliases.
   -Uninstall         Remove rcmake.exe, rcmake-lsp.exe, rcmake-verify.exe, rcmake-owned aliases,
@@ -258,7 +258,7 @@ function Expand-RcmakeArchive {
 
             $relParts = @($parts[1..($parts.Length - 1)])
             $relPosix = $relParts -join '/'
-            $isBinary = ($relPosix -ceq 'bin/rcmake.exe') -or ($relPosix -ceq 'bin/rcmake-lsp.exe') -or ($relPosix -ceq 'bin/rcmake-verify.exe') -or ($relPosix -ceq 'bin/cmake.exe') -or ($relPosix -ceq 'bin/ctest.exe') -or ($relPosix -ceq 'bin/cpack.exe')
+            $isBinary = ($relPosix -ceq 'bin/rcmake.exe') -or ($relPosix -ceq 'bin/rcmake-lsp.exe') -or ($relPosix -ceq 'bin/rcmake-verify.exe') -or ($relPosix -ceq 'bin/cmake.exe') -or ($relPosix -ceq 'bin/ctest.exe') -or ($relPosix -ceq 'bin/cpack.exe') -or ($relPosix -ceq 'bin/ccmake.exe')
             $isData = ($relPosix -ceq 'share/cmake-4.5') -or $relPosix.StartsWith('share/cmake-4.5/', [StringComparison]::Ordinal)
             $isCompletion = ($relPosix -ceq 'share/rcmake/completions/rcmake.ps1')
             $isDocFile = ($relPosix -ceq 'LICENSE-APACHE') -or ($relPosix -ceq 'LICENSE-MIT') -or ($relPosix -ceq 'THIRD_PARTY_NOTICES.md')
@@ -437,7 +437,7 @@ $completionPath = Join-Path $completionDir 'rcmake.ps1'
 $rcmakePath = Join-Path $binDir 'rcmake.exe'
 $lspPath = Join-Path $binDir 'rcmake-lsp.exe'
 $verifyPath = Join-Path $binDir 'rcmake-verify.exe'
-$tools = @('cmake.exe', 'ctest.exe', 'cpack.exe')
+$tools = @('cmake.exe', 'ctest.exe', 'cpack.exe', 'ccmake.exe')
 
 function Get-MarkerSha256 {
     param(

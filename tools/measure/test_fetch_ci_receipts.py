@@ -630,7 +630,7 @@ class EcosystemWorkflowParityTests(unittest.TestCase):
         self.assertIn("needs: build-release-linux", self.jobs["runcmake-linux-shards"])
         self.assertIn("needs: build-release-macos", self.jobs["runcmake-macos-shards"])
         self.assertIn("needs: build-release-windows", self.jobs["runcmake-windows-shards"])
-        self.assertIn("for tool in cmake ctest cpack rcmake-lsp; do", self.jobs["runcmake-linux-shards"])
+        self.assertIn("for tool in cmake ctest cpack ccmake rcmake-lsp; do", self.jobs["runcmake-linux-shards"])
         self.assertIn("CI_BINARY: rcmake-release-ubuntu-24.04", self.jobs["runcmake-linux-shards"])
         self.assertIn("CI_BINARY: rcmake-release-macos-15", self.jobs["runcmake-macos-shards"])
         self.assertIn("CI_BINARY: rcmake-release-windows-2025", self.jobs["runcmake-windows-shards"])

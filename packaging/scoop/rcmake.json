@@ -1,0 +1,36 @@
+{
+  "version": "0.2.1",
+  "description": "Native Rust drop-in replacement for CMake 4.5.1",
+  "homepage": "https://rcmake.github.io/rcmake/",
+  "license": "MIT OR Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/rcmake/rcmake/releases/download/v0.2.1/rcmake-0.2.1-x86_64-pc-windows-msvc.zip",
+      "hash": "802759ec7abd5b5bb33c05c9debdab03c8a75ef23c7d590905d9fa8b999a9559",
+      "extract_dir": "rcmake-0.2.1-x86_64-pc-windows-msvc"
+    }
+  },
+  "bin": [
+    "bin/rcmake.exe",
+    "bin/rcmake-lsp.exe",
+    "bin/rcmake-verify.exe"
+  ],
+  "notes": [
+    "rcmake, rcmake-lsp, and rcmake-verify are shimmed on PATH so Scoop's cmake package stays intact.",
+    "To use drop-in cmake, ctest, cpack, and ccmake replacements, prepend \"$dir\\bin\" to PATH."
+  ],
+  "checkver": {
+    "github": "https://github.com/rcmake/rcmake"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/rcmake/rcmake/releases/download/v$version/rcmake-$version-x86_64-pc-windows-msvc.zip",
+        "extract_dir": "rcmake-$version-x86_64-pc-windows-msvc"
+      }
+    },
+    "hash": {
+      "url": "$baseurl/SHA256SUMS.txt"
+    }
+  }
+}

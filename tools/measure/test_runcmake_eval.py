@@ -345,6 +345,7 @@ class VisualStudioRegistrationTests(unittest.TestCase):
             "TEMP", "TMP", "WINDIR", "ALLUSERSPROFILE", "CommonProgramFiles", "CommonProgramFiles(x86)",
             "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "HOMEDRIVE", "HOMEPATH",
             "VSINSTALLDIR", "VisualStudioVersion", "VS160COMNTOOLS", "VS170COMNTOOLS", "VS180COMNTOOLS",
+            "DOTNET_ROOT", "MSBuildSDKsPath",
         }
         self.assertEqual(required - set(runcmake_eval.WINDOWS_ENVIRONMENT), set())
 

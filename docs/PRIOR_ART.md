@@ -80,14 +80,14 @@ All 40 workspace crates use `MIT OR Apache-2.0` and enforce `#![forbid(unsafe_co
 | `rcmake-cps` | Common Package Specification 0.15.0 reader, validator, and writer |
 | `rcmake-ctest` | Test discovery, parallel scheduling, jobserver access, and reporting |
 | `rcmake-cxxmodules` | C++20 named module dependency scanning, `dyndep`, and module maps |
-| `rcmake-dap` | CMake 4.5.1 `--debugger` Debug Adapter Protocol server on Unix sockets |
+| `rcmake-dap` | CMake 4.5.1 `--debugger` Debug Adapter Protocol server on Unix sockets and Windows named pipes |
 | `rcmake-diag` | Diagnostics, backtraces, SARIF 2.1.0, and policy registry |
 | `rcmake-eval` | Script interpreter, scopes, control flow, replay checkpoints, and debug hooks |
 | `rcmake-expr` | Variable expansion, escape decoding, and `if()` condition evaluation |
 | `rcmake-fetch` | FetchContent archive cache, Git mirrors, and lockfiles |
 | `rcmake-fortran` | Pure-Rust Fortran source scanning and `.mod` dependency collation with no disk access |
 | `rcmake-gen-common` | Shared File API, multi-config `compile_commands.json`, install, CTest, and export outputs |
-| `rcmake-gen-make` | `Unix Makefiles` generator |
+| `rcmake-gen-make` | `Unix Makefiles` and `NMake Makefiles` generators |
 | `rcmake-gen-ninja` | `Ninja` and `Ninja Multi-Config` generators |
 | `rcmake-gen-vs` | `Visual Studio 17 2022` and `18 2026` generators |
 | `rcmake-gen-xcode` | `Xcode` project and scheme generator |
@@ -116,5 +116,9 @@ All 40 workspace crates use `MIT OR Apache-2.0` and enforce `#![forbid(unsafe_co
 | `sevenz-rust2` | `0.25.0` | `Apache-2.0` | Read 7-Zip headers and encode or decode standard compression methods |
 | `ppmd-turbo` | `0.2.2` | `Apache-2.0` | Encode and decode PPMd blocks in 7-Zip archives |
 | `crc32fast` | `1.5.5` | `MIT OR Apache-2.0` | Compute CRC-32 checksums in 7-Zip PPMd archives |
+| `tokio` | `1.48.0` | `MIT` | Safe Windows `--debugger` named-pipe transport (ADR-050) and Windows `Ctrl+C`/`Ctrl+Break` instrumentation interrupt handling |
+| `mio` | `1.2.5` | `MIT` | Run the I/O completion port of the `tokio` named-pipe wrapper (ADR-050) |
+| `socket2` | `0.6.5` | `MIT OR Apache-2.0` | Transitive Windows networking helper pulled by `tokio` `net` feature (ADR-050) |
+| `signal-hook-registry` | `1.4.8` | `Apache-2.0 OR MIT` | Transitive signal registry dependency of `tokio` `signal` feature |
 
 See the [7-Zip format specification](https://github.com/ip7z/7zip/blob/main/DOC/7zFormat.txt) for PPMd container headers.

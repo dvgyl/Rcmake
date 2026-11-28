@@ -720,19 +720,20 @@ HASH_ALGOS = ("md5", "sha1", "sha224", "sha256", "sha384", "sha512")
 
 # The generators that Rcmake implements. Rcmake has no Watcom WMake, no
 # FASTBuild, and no legacy extra generators (CodeBlocks, Kate, ...).
-RCMAKE_GENERATORS = ("Ninja", "Ninja Multi-Config", "Unix Makefiles", "Xcode")
+RCMAKE_GENERATORS = ("Ninja", "Ninja Multi-Config", "Unix Makefiles", "NMake Makefiles", "Xcode")
 
 
 def supported_capabilities(data: Any) -> Any:
     """Return "cmake -E capabilities" output without the parts Rcmake omits by design.
 
-    Rcmake has no DAP debugger ("debugger") and no extra generators. Only
-    the generators that Rcmake implements stay, sorted by name. Visual
-    Studio generators stay too. All other members stay as they are.
+    Rcmake omits legacy extra generators ("extraGenerators") and unimplemented
+    generators (Watcom WMake, FASTBuild, etc.). Only the generators that Rcmake
+    implements stay, sorted by name. Visual Studio generators stay too. All
+    other members (including "debugger") stay as they are.
     """
     if not isinstance(data, Mapping):
         return data
-    out = {key: value for key, value in data.items() if key != "debugger"}
+    out = dict(data)
     if isinstance(data.get("generators"), list):
         gens = [{key: value for key, value in gen.items() if key != "extraGenerators"}
                 for gen in data["generators"] if isinstance(gen, Mapping)

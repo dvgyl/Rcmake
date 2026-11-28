@@ -120,7 +120,7 @@ jobs:
           try {
             New-Item -ItemType Directory -Path "$package/bin", "$package/share/rcmake/completions", "$package/third_party", 'dist' -Force | Out-Null
             Copy-Item "$binaries/rcmake.exe" "$package/bin/rcmake.exe"
-            foreach ($tool in 'cmake', 'ctest', 'cpack', 'rcmake-lsp') {
+            foreach ($tool in 'cmake', 'ctest', 'cpack', 'ccmake', 'rcmake-lsp') {
               Copy-Item "$binaries/rcmake-shim.exe" "$package/bin/$tool.exe"
             }
             Copy-Item "$binaries/rcmake-verify.exe" "$package/bin/rcmake-verify.exe"
@@ -181,13 +181,13 @@ jobs:
             dist/rcmake-${{ steps.version.outputs.value }}-${{ matrix.target }}.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}.sha256
           if-no-files-found: error
 
-  release:
-    name: Verify packages and publish
+  prepare-release:
+    name: Verify packages and generate manifests
     needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
@@ -223,6 +223,18 @@ jobs:
             printf '%s\n' "$checksum" | diff -u "$archive.sha256" - >&2
             printf '%s\n' "$checksum"
           done | LC_ALL=C sort -k2 > SHA256SUMS.txt
+      - name: Generate and validate package manager manifests
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          python3 scripts/generate-manifests.py \
+            --version "$RELEASE_VERSION" \
+            --checksums dist/SHA256SUMS.txt \
+            --out-dir dist/manifests
+          ruby -c dist/manifests/homebrew/rcmake.rb
+          python3 -m json.tool dist/manifests/scoop/rcmake.json >/dev/null
+          ruby -ryaml -e 'ARGV.each { |f| data = YAML.safe_load_file(f); abort("Expected YAML mapping in #{f}") unless data.is_a?(Hash) }' dist/manifests/winget/*.yaml
       # Users check a download with: gh attestation verify <file> --repo rcmake/rcmake
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
@@ -239,8 +251,44 @@ jobs:
             dist/*.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
+      - uses: actions/upload-artifact@v6
+        with:
+          name: manifests
+          path: dist/manifests
+          if-no-files-found: error
+
+  validate-winget:
+    name: Validate WinGet manifests
+    needs: prepare-release
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: manifests
+          path: dist/manifests
+      - name: Validate WinGet manifests
+        shell: pwsh
+        run: |
+          winget validate --manifest dist/manifests/winget
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  release:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [prepare-release, validate-winget]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: release
+          path: dist
       - name: Attach archives to the GitHub Release
-        if: github.ref_type == 'tag'
         working-directory: dist
         shell: bash
         env:
